@@ -17,7 +17,7 @@ use libc::{
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::mem;
 use std::os::unix::io::{FromRawFd, RawFd};
 

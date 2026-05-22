@@ -23,10 +23,10 @@ use crate::sandbox::{
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncRead};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 const FIRECRACKER_READY_RETRIES: u32 = 50;
 const FIRECRACKER_READY_DELAY_MS: u64 = 100;
@@ -69,44 +69,55 @@ pub async fn start_firecracker(
 ) -> Result<FirecrackerHandle> {
     let run_dir = std::env::temp_dir()
         .join(format!("crucible-fc-{}", &config.run_id));
-    std::fs::create_dir_all(&run_dir)
-        .context("create firecracker run dir")?;
 
     let api_socket = run_dir.join("api.sock");
     let vsock_path = run_dir.join("vsock.sock");
     let workspace_ext4 = run_dir.join("workspace.ext4");
 
-    let tap_name = format!("tap-{}", &config.run_id[..8]);
+    let tap_name = format!("tap-{}", &config.run_id[..config.run_id.len().min(8)]);
+
+    // Clean up any leftover state from a previous crashed run.
+    let _ = delete_tap(&tap_name).await;
+    let _ = std::fs::remove_dir_all(&run_dir);
+    std::fs::create_dir_all(&run_dir).context("create firecracker run dir")?;
 
     // 1. Create TAP device.
+    eprintln!("[fc] creating TAP device {tap_name}");
     create_tap(&tap_name).await.context("create TAP device")?;
 
     // 2. Create workspace ext4 image.
+    eprintln!("[fc] creating workspace ext4 ({} MiB)", config.workspace_disk_mib);
     create_workspace_ext4(&workspace_ext4, config.workspace_disk_mib)
         .await
         .context("create workspace ext4")?;
 
     // 3. Create vsock listener UDS for stdout and stderr BEFORE starting VM,
     //    because the guest connects immediately after init runs.
+    eprintln!("[fc] binding vsock listeners at {}", vsock_path.display());
     let stdout_listener = UnixListener::bind(vsock_socket_path(&vsock_path, VSOCK_STDOUT_PORT))
         .context("bind stdout vsock listener")?;
     let stderr_listener = UnixListener::bind(vsock_socket_path(&vsock_path, VSOCK_STDERR_PORT))
         .context("bind stderr vsock listener")?;
 
-    // 4. Spawn Firecracker.
+    // 4. Spawn Firecracker — redirect its stderr to our stderr so boot errors are visible.
+    let fc_log = run_dir.join("firecracker.log");
+    eprintln!("[fc] spawning firecracker (log: {})", fc_log.display());
     let process = Command::new(firecracker_bin)
         .args(["--api-sock", &api_socket.to_string_lossy()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&fc_log).context("create fc log")?)
         .spawn()
         .context("spawn firecracker")?;
 
     // Wait for API socket to appear.
+    eprintln!("[fc] waiting for API socket…");
     wait_for_api_socket(&api_socket).await
         .context("Firecracker API socket did not appear")?;
+    eprintln!("[fc] API socket ready");
 
     // 5. Configure VM via REST API.
+    eprintln!("[fc] configuring VM…");
     configure_vm(
         &api_socket,
         config,
@@ -119,19 +130,31 @@ pub async fn start_firecracker(
     .context("configure Firecracker VM")?;
 
     // 6. Start the VM.
+    eprintln!("[fc] sending InstanceStart…");
     fc_put(&api_socket, "/actions", &serde_json::to_string(&FcActionStart::default()).unwrap())
         .await
         .context("Firecracker InstanceStart")?;
+    eprintln!("[fc] VM started — waiting for guest to connect vsock…");
 
-    // 7. Accept stdout and stderr connections from the guest.
-    //    These arrive after crucible-init boots.
-    let (stdout, _) = stdout_listener.accept().await.context("accept stdout vsock")?;
-    let (stderr, _) = stderr_listener.accept().await.context("accept stderr vsock")?;
+    // 7. Accept stdout and stderr connections from the guest (30 s timeout each).
+    let (stdout, _) = timeout(Duration::from_secs(30), stdout_listener.accept())
+        .await
+        .context("timeout waiting for guest stdout vsock connection")?
+        .context("accept stdout vsock")?;
+    eprintln!("[fc] stdout vsock connected");
+
+    let (stderr, _) = timeout(Duration::from_secs(10), stderr_listener.accept())
+        .await
+        .context("timeout waiting for guest stderr vsock connection")?
+        .context("accept stderr vsock")?;
+    eprintln!("[fc] stderr vsock connected");
 
     // 8. Connect host→guest for control (send CONNECT {port}\n).
+    eprintln!("[fc] connecting control vsock…");
     let control = connect_host_to_guest(&vsock_path, VSOCK_CONTROL_PORT)
         .await
         .context("connect control vsock")?;
+    eprintln!("[fc] control vsock connected");
 
     Ok(FirecrackerHandle {
         stdout,
@@ -237,7 +260,8 @@ async fn configure_vm(
 }
 
 /// Minimal HTTP PUT over Firecracker's Unix API socket.
-/// Sends `Connection: close` so we can use `read_to_end` after the response.
+/// Reads the response by parsing headers (up to \r\n\r\n) then reading
+/// exactly Content-Length bytes — works with HTTP/1.1 keep-alive.
 async fn fc_put(socket: &Path, path: &str, body: &str) -> Result<()> {
     let mut stream = UnixStream::connect(socket)
         .await
@@ -248,7 +272,7 @@ async fn fc_put(socket: &Path, path: &str, body: &str) -> Result<()> {
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {len}\r\n\
-         Connection: close\r\n\
+         Accept: application/json\r\n\
          \r\n\
          {body}",
         len = body.len()
@@ -256,36 +280,67 @@ async fn fc_put(socket: &Path, path: &str, body: &str) -> Result<()> {
     stream.write_all(request.as_bytes()).await?;
     stream.flush().await?;
 
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
+    let (status, content_length, header_bytes) = read_http_headers(&mut stream)
+        .await
+        .with_context(|| format!("read Firecracker response headers for PUT {path}"))?;
 
-    let status = parse_http_status(&response)
-        .with_context(|| format!("parse Firecracker response for PUT {path}"))?;
+    let resp_body = if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        stream.read_exact(&mut buf).await?;
+        String::from_utf8_lossy(&buf).into_owned()
+    } else {
+        String::new()
+    };
 
     if status >= 400 {
-        let body = response_body(&response);
-        bail!("Firecracker PUT {path} returned HTTP {status}: {body}");
+        let preview = if resp_body.is_empty() {
+            String::from_utf8_lossy(&header_bytes).into_owned()
+        } else {
+            resp_body
+        };
+        bail!("Firecracker PUT {path} returned HTTP {status}: {preview}");
     }
     Ok(())
 }
 
-fn parse_http_status(response: &[u8]) -> Result<u16> {
-    let text = std::str::from_utf8(response).context("response is not UTF-8")?;
-    let line = text.lines().next().ok_or_else(|| anyhow!("empty response"))?;
-    let code = line
+/// Read HTTP response headers byte-by-byte until `\r\n\r\n`.
+/// Returns (status_code, content_length, raw_header_bytes).
+async fn read_http_headers(stream: &mut UnixStream) -> Result<(u16, usize, Vec<u8>)> {
+    let mut buf = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).await.context("reading response byte")?;
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 8192 {
+            bail!("HTTP headers exceeded 8 KiB");
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.lines();
+
+    let status_line = lines.next().ok_or_else(|| anyhow!("empty HTTP response"))?;
+    let status = status_line
         .split_whitespace()
         .nth(1)
-        .ok_or_else(|| anyhow!("no status code in: {line}"))?;
-    code.parse::<u16>().context("parse status code")
-}
+        .ok_or_else(|| anyhow!("no status code in: {status_line}"))?
+        .parse::<u16>()
+        .context("parse HTTP status code")?;
 
-fn response_body(response: &[u8]) -> String {
-    let text = String::from_utf8_lossy(response);
-    if let Some(pos) = text.find("\r\n\r\n") {
-        text[pos + 4..].to_string()
-    } else {
-        String::new()
-    }
+    let content_length = lines
+        .filter_map(|l| {
+            let lower = l.to_ascii_lowercase();
+            lower.starts_with("content-length:").then(|| {
+                l.splitn(2, ':').nth(1).unwrap_or("").trim().parse::<usize>().ok()
+            }).flatten()
+        })
+        .next()
+        .unwrap_or(0);
+
+    Ok((status, content_length, buf))
 }
 
 // ─── Host→guest vsock control connection ──────────────────────────────────
