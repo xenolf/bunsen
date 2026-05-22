@@ -24,6 +24,7 @@ enum ControlCmd {
     Kill,
     Pause,
     Resume,
+    Timeout,
 }
 
 fn parse_cmd(line: &str) -> Option<ControlCmd> {
@@ -106,6 +107,14 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
         }
     });
 
+    // Wall-clock timeout: SIGKILL after the limit, regardless of state
+    let wall_clock = spec.wall_clock_seconds;
+    let timeout_tx = cmd_tx.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(wall_clock)).await;
+        let _ = timeout_tx.send(ControlCmd::Timeout).await;
+    });
+
     let grace = spec.stop_grace_seconds;
     let mut done_count = 0usize;
     // Track whether a terminal command was issued and what reason to use
@@ -147,6 +156,10 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
                             // Grace period expired — escalate; this overrides "stopped" to "killed"
                             let _ = cmd_tx2.send(ControlCmd::Kill).await;
                         });
+                    }
+                    Some(ControlCmd::Timeout) => {
+                        initiated_reason = Some("timeout");
+                        signal_pgid(pgid, Signal::SIGKILL);
                     }
                     Some(ControlCmd::Pause) => {
                         signal_pgid(pgid, Signal::SIGSTOP);

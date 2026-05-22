@@ -172,6 +172,63 @@ async def test_stop_ends_run():
 
 
 @pytest.mark.asyncio
+async def test_wall_clock_timeout_fires():
+    """wall_clock_seconds=2 stub emits RunEnded(reason='timeout') within a few seconds."""
+    import crucible
+    from crucible._events import RunEnded
+    import time
+
+    spec = {"adapter": "black-box", "cmd": ["sleep", "60"], "wall-clock-seconds": 2}
+    t0 = time.monotonic()
+    events = []
+    async with crucible.run(spec, _core_bin=stub_bin("timeout")) as run:
+        async for event in run.events:
+            events.append(event)
+    elapsed = time.monotonic() - t0
+
+    run_ended = next((e for e in events if isinstance(e, RunEnded)), None)
+    assert run_ended is not None
+    assert run_ended.reason == "timeout"
+    assert 1.5 <= elapsed < 5.0, f"Expected timeout in 1.5–5s, got {elapsed:.2f}s"
+
+
+@pytest.mark.asyncio
+async def test_agent_exits_before_wall_clock():
+    """Agent that exits quickly produces agent_exit, not timeout."""
+    import crucible
+    from crucible._events import RunEnded
+
+    spec = {"adapter": "black-box", "cmd": ["echo", "hello"], "wall-clock-seconds": 30}
+    events = []
+    async with crucible.run(spec, _core_bin=stub_bin()) as run:
+        async for event in run.events:
+            events.append(event)
+
+    run_ended = next((e for e in events if isinstance(e, RunEnded)), None)
+    assert run_ended is not None
+    assert run_ended.reason == "agent_exit"
+
+
+@pytest.mark.asyncio
+async def test_kill_before_wall_clock_beats_timeout():
+    """Explicit kill() before the wall clock produces killed, not timeout."""
+    import crucible
+    from crucible._events import RunStarted, RunEnded
+
+    spec = {"adapter": "black-box", "cmd": ["sleep", "60"], "wall-clock-seconds": 30}
+    events = []
+    async with crucible.run(spec, _core_bin=stub_bin("hang")) as run:
+        async for event in run.events:
+            events.append(event)
+            if isinstance(event, RunStarted):
+                await run.kill()
+
+    run_ended = next((e for e in events if isinstance(e, RunEnded)), None)
+    assert run_ended is not None
+    assert run_ended.reason == "killed"
+
+
+@pytest.mark.asyncio
 async def test_cancel_kills_subprocess():
     """Cancelling the context manager kills the subprocess cleanly."""
     import crucible
