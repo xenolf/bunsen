@@ -41,6 +41,21 @@ if mode == "unknown_event":
           "type": "run_ended", "reason": "agent_exit", "exit_code": 0})
     sys.exit(0)
 
+if mode == "redact":
+    # Emit an output event whose text contains a raw secret value.
+    # The stub itself does NOT redact; in the real binary this would be
+    # redacted before reaching the Python library.  This mode is used to
+    # verify that the Python library doesn't accidentally re-expose secrets
+    # stored in the spec — it intentionally echoes them to test repr safety.
+    emit({**base, "seq": 0, "ts": "2026-01-01T00:00:00.000Z",
+          "type": "run_started", "adapter": "black-box", "workspace_path": WORKSPACE,
+          "transcript_path": TRANSCRIPT})
+    emit({**base, "seq": 1, "ts": "2026-01-01T00:00:01.000Z",
+          "type": "output", "stream": "stdout", "text": "sk-abc123\n"})
+    emit({**base, "seq": 2, "ts": "2026-01-01T00:00:02.000Z",
+          "type": "run_ended", "reason": "agent_exit", "exit_code": 0})
+    sys.exit(0)
+
 # Normal mode: run_started + 2 outputs + run_ended
 emit({**base, "seq": 0, "ts": "2026-01-01T00:00:00.000Z",
       "type": "run_started", "adapter": "black-box", "workspace_path": WORKSPACE,

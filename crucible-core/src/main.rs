@@ -1,6 +1,7 @@
 mod adapter;
 mod encoder;
 mod events;
+mod redactor;
 mod run_dir;
 mod run_spec;
 mod supervisor;
@@ -60,7 +61,18 @@ async fn main() {
     };
     run_dir.write_meta(&meta).ok();
 
-    let mut enc = encoder::Encoder::new(&run_id, &run_dir.transcript_path())
+    let redactor = if spec.secrets.is_empty() {
+        None
+    } else {
+        Some(
+            redactor::Redactor::new(spec.secrets.clone()).unwrap_or_else(|e| {
+                eprintln!("invalid secrets: {e}");
+                std::process::exit(1);
+            }),
+        )
+    };
+
+    let mut enc = encoder::Encoder::new(&run_id, &run_dir.transcript_path(), redactor)
         .unwrap_or_else(|e| {
             eprintln!("failed to open transcript: {e}");
             std::process::exit(1);

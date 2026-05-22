@@ -9,6 +9,8 @@ pub struct RunSpec {
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
+    pub secrets: HashMap<String, String>,
+    #[serde(default)]
     pub branching_strategy: Option<String>,
     #[serde(default)]
     pub host_repo_path: Option<String>,

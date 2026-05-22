@@ -96,6 +96,28 @@ def test_sync_facade_works():
 
 
 @pytest.mark.asyncio
+async def test_secret_values_not_in_run_repr():
+    """Run handle must not expose secret values via repr or public attributes."""
+    import crucible
+
+    spec = {
+        "adapter": "black-box",
+        "cmd": ["echo", "hi"],
+        "secrets": {"API_KEY": "sk-abc123"},
+    }
+    async with crucible.run(spec, _core_bin=stub_bin("redact")) as run:
+        async for _ in run.events:
+            pass
+
+    run_repr = repr(run)
+    assert "sk-abc123" not in run_repr, f"Secret value leaked in repr: {run_repr}"
+    # Public attributes should not expose secret values
+    for attr in ("id", "workspace_path", "transcript_path"):
+        val = str(getattr(run, attr, ""))
+        assert "sk-abc123" not in val, f"Secret value in run.{attr}: {val!r}"
+
+
+@pytest.mark.asyncio
 async def test_run_id_and_paths_available():
     import crucible
 
