@@ -85,9 +85,9 @@ pub async fn start_firecracker(
     eprintln!("[fc] creating TAP device {tap_name}");
     create_tap(&tap_name).await.context("create TAP device")?;
 
-    // 2. Create workspace ext4 image.
+    // 2. Create workspace ext4 image — pre-populate from host workspace dir if present.
     eprintln!("[fc] creating workspace ext4 ({} MiB)", config.workspace_disk_mib);
-    create_workspace_ext4(&workspace_ext4, config.workspace_disk_mib)
+    create_workspace_ext4_from_dir(&workspace_ext4, &config.workspace_host_path, config.workspace_disk_mib)
         .await
         .context("create workspace ext4")?;
 
@@ -396,29 +396,108 @@ async fn delete_tap(name: &str) -> Result<()> {
 
 // ─── Workspace ext4 ────────────────────────────────────────────────────────
 
-async fn create_workspace_ext4(path: &Path, size_mib: u32) -> Result<()> {
-    // Create a sparse file of the desired size.
-    let status = Command::new("dd")
-        .args([
-            "if=/dev/zero",
-            &format!("of={}", path.display()),
-            "bs=1M",
-            &format!("count={size_mib}"),
-        ])
+/// Create an ext4 workspace image, pre-populating it from `source_dir` if
+/// the directory is non-empty.  Uses `mkfs.ext4 -F -d <dir>` (no root needed)
+/// when content is present; falls back to dd + mkfs.ext4 for an empty image.
+pub async fn create_workspace_ext4_from_dir(path: &Path, source_dir: &Path, size_mib: u32) -> Result<()> {
+    let has_content = source_dir.exists() && {
+        let mut rd = tokio::fs::read_dir(source_dir).await?;
+        rd.next_entry().await?.is_some()
+    };
+
+    if has_content {
+        // mkfs.ext4 -F -d <dir> creates an image pre-populated with the dir
+        // contents, no root / loop-mount required.
+        let size_bytes = format!("{}M", size_mib);
+        let status = Command::new("mkfs.ext4")
+            .args([
+                "-F",
+                "-d", &source_dir.to_string_lossy(),
+                "-b", "4096",
+                &path.to_string_lossy(),
+                &size_bytes,
+            ])
+            .status()
+            .await
+            .context("mkfs.ext4 -d")?;
+        if !status.success() {
+            bail!("mkfs.ext4 -d failed");
+        }
+    } else {
+        // Empty image: dd + mkfs.ext4.
+        let status = Command::new("dd")
+            .args([
+                "if=/dev/zero",
+                &format!("of={}", path.display()),
+                "bs=1M",
+                &format!("count={size_mib}"),
+            ])
+            .status()
+            .await
+            .context("dd workspace")?;
+        if !status.success() {
+            bail!("dd workspace failed");
+        }
+
+        let status = Command::new("mkfs.ext4")
+            .args(["-q", &path.to_string_lossy()])
+            .status()
+            .await
+            .context("mkfs.ext4")?;
+        if !status.success() {
+            bail!("mkfs.ext4 failed");
+        }
+    }
+    Ok(())
+}
+
+/// Extract the contents of an ext4 workspace image back to `target_dir` after
+/// the VM exits, so agent writes are visible on the host.
+/// Requires root (uses losetup + mount).
+pub async fn extract_workspace_from_ext4(ext4_path: &Path, target_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Get the loop device for the ext4 image.
+    let losetup = Command::new("losetup")
+        .args(["-f", "--show", &ext4_path.to_string_lossy()])
+        .output()
+        .await
+        .context("losetup -f --show")?;
+    if !losetup.status.success() {
+        bail!("losetup failed: {}", String::from_utf8_lossy(&losetup.stderr));
+    }
+    let loop_dev = String::from_utf8_lossy(&losetup.stdout).trim().to_string();
+
+    // Mount the loop device to a temp dir.
+    let mnt = std::env::temp_dir().join(format!("crucible-mnt-{}", std::process::id()));
+    std::fs::create_dir_all(&mnt)?;
+
+    let mount_status = Command::new("mount")
+        .args(["-o", "ro", &loop_dev, &mnt.to_string_lossy()])
         .status()
         .await
-        .context("dd workspace")?;
-    if !status.success() {
-        bail!("dd workspace failed");
+        .context("mount ext4")?;
+    if !mount_status.success() {
+        // Clean up loop device before returning error.
+        Command::new("losetup").args(["-d", &loop_dev]).status().await.ok();
+        bail!("mount failed for {loop_dev}");
     }
 
-    let status = Command::new("mkfs.ext4")
-        .args(["-q", &path.to_string_lossy()])
+    // Copy contents back to target_dir.
+    let src = format!("{}/.", mnt.display());
+    let copy_status = Command::new("cp")
+        .args(["-a", &src, &target_dir.to_string_lossy()])
         .status()
         .await
-        .context("mkfs.ext4")?;
-    if !status.success() {
-        bail!("mkfs.ext4 failed");
+        .context("cp workspace back")?;
+
+    // Always unmount and detach, even on copy failure.
+    Command::new("umount").args([&mnt.to_string_lossy().to_string()]).status().await.ok();
+    Command::new("losetup").args(["-d", &loop_dev]).status().await.ok();
+    std::fs::remove_dir_all(&mnt).ok();
+
+    if !copy_status.success() {
+        bail!("cp workspace back failed");
     }
     Ok(())
 }

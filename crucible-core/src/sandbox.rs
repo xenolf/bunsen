@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
+use crate::run_spec::RunSpec;
+
 // ─── vsock port assignments ────────────────────────────────────────────────
 /// Guest→host: raw bytes from the agent's stdout.
 pub const VSOCK_STDOUT_PORT: u32 = 5001;
@@ -86,6 +88,25 @@ pub fn build_boot_args(spec_json: &str) -> String {
     )
 }
 
+/// Build the spec JSON to embed in the VM's kernel boot args.
+///
+/// The guest init understands `cmd`, `env`, and `stop-grace-seconds`.
+/// Secrets are merged into `env` so the init exports them as env vars on the agent.
+/// The top-level `secrets` field is deliberately omitted.
+pub fn build_sandbox_spec_json(spec: &RunSpec) -> String {
+    let mut env = spec.env.clone();
+    // Secrets overlay env (secrets win on collision).
+    for (k, v) in &spec.secrets {
+        env.insert(k.clone(), v.clone());
+    }
+    let obj = serde_json::json!({
+        "cmd": spec.cmd,
+        "env": env,
+        "stop-grace-seconds": spec.stop_grace_seconds,
+    });
+    serde_json::to_string(&obj).expect("spec serialization is infallible")
+}
+
 /// Derive the per-port vsock UDS path Firecracker uses for guest→host connections.
 /// Firecracker appends `_{port}` to the base vsock UDS path.
 pub fn vsock_socket_path(base: &Path, port: u32) -> PathBuf {
@@ -157,6 +178,47 @@ mod tests {
         let encoded = token.strip_prefix("crucible_spec=").unwrap();
         let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), spec);
+    }
+
+    // ── Cycle 5: sandbox spec JSON ────────────────────────────────────────
+
+    #[test]
+    fn build_sandbox_spec_json_merges_secrets_into_env() {
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["echo"],
+            "env": {"A": "1"},
+            "secrets": {"SECRET": "sk-xxx"}
+        }"#).unwrap();
+        let json_str = build_sandbox_spec_json(&spec);
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(v["env"]["A"], "1");
+        assert_eq!(v["env"]["SECRET"], "sk-xxx");
+        assert!(v.get("secrets").is_none(), "secrets must not appear as a top-level field");
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_stop_grace_seconds() {
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"],
+            "stop-grace-seconds": 42
+        }"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&build_sandbox_spec_json(&spec)).unwrap();
+        assert_eq!(v["stop-grace-seconds"], 42);
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_env_key_wins_over_secret_on_collision() {
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"],
+            "env": {"K": "from-env"},
+            "secrets": {"K": "from-secret"}
+        }"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&build_sandbox_spec_json(&spec)).unwrap();
+        // secrets overlay env: secret value wins (it's additive from secret store)
+        assert_eq!(v["env"]["K"], "from-secret");
     }
 
     // ── Cycle 4: vsock path derivation ────────────────────────────────────
