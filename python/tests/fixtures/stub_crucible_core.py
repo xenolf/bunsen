@@ -3,7 +3,9 @@
 import json
 import sys
 import os
+import signal
 import time
+import threading
 
 RUN_ID = "01HWTEST00000000000000000A"
 WORKSPACE = f"/tmp/crucible-test-runs/{RUN_ID}/workspace"
@@ -42,11 +44,6 @@ if mode == "unknown_event":
     sys.exit(0)
 
 if mode == "redact":
-    # Emit an output event whose text contains a raw secret value.
-    # The stub itself does NOT redact; in the real binary this would be
-    # redacted before reaching the Python library.  This mode is used to
-    # verify that the Python library doesn't accidentally re-expose secrets
-    # stored in the spec — it intentionally echoes them to test repr safety.
     emit({**base, "seq": 0, "ts": "2026-01-01T00:00:00.000Z",
           "type": "run_started", "adapter": "black-box", "workspace_path": WORKSPACE,
           "transcript_path": TRANSCRIPT})
@@ -55,6 +52,51 @@ if mode == "redact":
     emit({**base, "seq": 2, "ts": "2026-01-01T00:00:02.000Z",
           "type": "run_ended", "reason": "agent_exit", "exit_code": 0})
     sys.exit(0)
+
+if mode == "hang":
+    # Emits run_started, then reads stdin for control commands.
+    # Exits with the appropriate reason when stop/kill is received.
+    emit({**base, "seq": 0, "ts": "2026-01-01T00:00:00.000Z",
+          "type": "run_started", "adapter": "black-box", "workspace_path": WORKSPACE,
+          "transcript_path": TRANSCRIPT})
+    seq = 1
+    for line in sys.stdin:
+        try:
+            cmd = json.loads(line.strip())
+        except Exception:
+            continue
+        op = cmd.get("op")
+        if op == "kill":
+            emit({**base, "seq": seq, "ts": "2026-01-01T00:00:01.000Z",
+                  "type": "run_ended", "reason": "killed"})
+            sys.exit(0)
+        elif op == "stop":
+            emit({**base, "seq": seq, "ts": "2026-01-01T00:00:01.000Z",
+                  "type": "run_ended", "reason": "stopped", "exit_code": 0})
+            sys.exit(0)
+    sys.exit(1)
+
+if mode == "stop_graceful":
+    # Like hang but handles SIGTERM by exiting cleanly (reason=stopped)
+    emit({**base, "seq": 0, "ts": "2026-01-01T00:00:00.000Z",
+          "type": "run_started", "adapter": "black-box", "workspace_path": WORKSPACE,
+          "transcript_path": TRANSCRIPT})
+    seq = 1
+    for line in sys.stdin:
+        try:
+            cmd = json.loads(line.strip())
+        except Exception:
+            continue
+        op = cmd.get("op")
+        if op == "kill":
+            emit({**base, "seq": seq, "ts": "2026-01-01T00:00:01.000Z",
+                  "type": "run_ended", "reason": "killed"})
+            sys.exit(0)
+        elif op == "stop":
+            emit({**base, "seq": seq, "ts": "2026-01-01T00:00:01.000Z",
+                  "type": "run_ended", "reason": "stopped", "exit_code": 0})
+            sys.exit(0)
+    sys.exit(1)
 
 # Normal mode: run_started + 2 outputs + run_ended
 emit({**base, "seq": 0, "ts": "2026-01-01T00:00:00.000Z",

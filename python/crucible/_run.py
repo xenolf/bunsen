@@ -74,10 +74,30 @@ class Run:
             if isinstance(item, RunEnded):
                 return
 
+    async def _send_cmd(self, op: str) -> None:
+        if self._proc and self._proc.stdin and self._proc.returncode is None:
+            try:
+                self._proc.stdin.write((f'{{"op":"{op}"}}\n').encode())
+                await self._proc.stdin.drain()
+            except Exception:
+                pass
+
+    async def stop(self) -> None:
+        await self._send_cmd("stop")
+
+    async def kill(self) -> None:
+        await self._send_cmd("kill")
+
+    async def pause(self) -> None:
+        await self._send_cmd("pause")
+
+    async def resume(self) -> None:
+        await self._send_cmd("resume")
+
     async def _terminate(self) -> None:
         if self._proc and self._proc.returncode is None:
             try:
-                self._proc.kill()
+                await self.kill()
                 await asyncio.wait_for(self._proc.wait(), timeout=5.0)
             except Exception:
                 pass
@@ -141,6 +161,18 @@ class _SyncRun:
                 yield item
             except StopAsyncIteration:
                 return
+
+    def stop(self) -> None:
+        self._loop.run_until_complete(self._run.stop())
+
+    def kill(self) -> None:
+        self._loop.run_until_complete(self._run.kill())
+
+    def pause(self) -> None:
+        self._loop.run_until_complete(self._run.pause())
+
+    def resume(self) -> None:
+        self._loop.run_until_complete(self._run.resume())
 
 
 class _SyncRunContext:

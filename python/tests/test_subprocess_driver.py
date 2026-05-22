@@ -1,4 +1,5 @@
 """Tests for the Python subprocess driver against a stub crucible-core."""
+import asyncio
 import os
 import sys
 import pytest
@@ -130,3 +131,67 @@ async def test_run_id_and_paths_available():
     assert run.workspace_path is not None
     assert "workspace" in run.workspace_path
     assert run.transcript_path is not None
+
+
+@pytest.mark.asyncio
+async def test_kill_ends_run():
+    """kill() command causes the hanging stub to emit RunEnded(reason='killed')."""
+    import crucible
+    from crucible._events import RunStarted, RunEnded
+
+    spec = {"adapter": "black-box", "cmd": ["echo", "hi"], "env": {}}
+    events = []
+    async with crucible.run(spec, _core_bin=stub_bin("hang")) as run:
+        async for event in run.events:
+            events.append(event)
+            if isinstance(event, RunStarted):
+                await run.kill()
+
+    run_ended = next((e for e in events if isinstance(e, RunEnded)), None)
+    assert run_ended is not None
+    assert run_ended.reason == "killed"
+
+
+@pytest.mark.asyncio
+async def test_stop_ends_run():
+    """stop() command causes the stub to emit RunEnded(reason='stopped')."""
+    import crucible
+    from crucible._events import RunStarted, RunEnded
+
+    spec = {"adapter": "black-box", "cmd": ["echo", "hi"], "env": {}}
+    events = []
+    async with crucible.run(spec, _core_bin=stub_bin("hang")) as run:
+        async for event in run.events:
+            events.append(event)
+            if isinstance(event, RunStarted):
+                await run.stop()
+
+    run_ended = next((e for e in events if isinstance(e, RunEnded)), None)
+    assert run_ended is not None
+    assert run_ended.reason == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_cancel_kills_subprocess():
+    """Cancelling the context manager kills the subprocess cleanly."""
+    import crucible
+
+    spec = {"adapter": "black-box", "cmd": ["echo", "hi"], "env": {}}
+    proc_ref = []
+
+    async def run_and_cancel():
+        async with crucible.run(spec, _core_bin=stub_bin("hang")) as run:
+            proc_ref.append(run._proc)
+            # Cancel immediately after getting the first event
+            async for _ in run.events:
+                raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_and_cancel()
+
+    # After context exit the process must be gone
+    if proc_ref:
+        proc = proc_ref[0]
+        # Give it a moment to clean up
+        await asyncio.sleep(0.1)
+        assert proc.returncode is not None, "Subprocess must have exited after cancellation"
