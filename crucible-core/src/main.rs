@@ -147,13 +147,22 @@ async fn run_with_backend(
     enc: &mut encoder::Encoder,
     workspace_path: &std::path::Path,
 ) -> std::io::Result<()> {
+    // On Linux: use Firecracker when --kernel and --rootfs are both provided.
+    // The if-let moves kernel and rootfs so they cannot be referenced below on Linux;
+    // the cfg-guarded suppressors handle each platform independently.
     #[cfg(target_os = "linux")]
     if let (Some(kernel), Some(rootfs)) = (kernel, rootfs) {
         return run_sandbox(kernel, rootfs, firecracker_bin, spec, run_id, enc, workspace_path).await;
     }
+    // On Linux after the if-let: kernel and rootfs were moved (and dropped).
+    // Only firecracker_bin remains; suppress the unused warning.
+    #[cfg(target_os = "linux")]
+    let _ = firecracker_bin;
 
-    // Suppress unused-variable warnings on macOS.
+    // On macOS: all three were never consumed.
+    #[cfg(not(target_os = "linux"))]
     let _ = (kernel, rootfs, firecracker_bin);
+
     supervisor::run(spec, run_id, enc, workspace_path).await
 }
 
