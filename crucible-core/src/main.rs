@@ -4,9 +4,15 @@ mod events;
 mod redactor;
 mod run_dir;
 mod run_spec;
+mod sandbox;
 mod supervisor;
 mod ulid;
 mod workspace_materializer;
+
+#[cfg(target_os = "linux")]
+mod firecracker;
+#[cfg(target_os = "linux")]
+mod smoke_test;
 
 use events::{SCHEMA_VERSION, CRUCIBLE_VERSION};
 use run_dir::{RunDir, MetaJson};
@@ -15,6 +21,24 @@ use serde_json::json;
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Subcommand dispatch.
+    if args.get(1).map(|s| s.as_str()) == Some("sandbox-smoke-test") {
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(e) = smoke_test::run(&args[2..]).await {
+                eprintln!("smoke-test failed: {e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("sandbox-smoke-test: Linux + KVM required");
+            std::process::exit(1);
+        }
+    }
+
     let spec_json = parse_spec_arg(&args).unwrap_or_else(|| {
         eprintln!("usage: crucible-core --spec <json>");
         std::process::exit(1);

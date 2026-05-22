@@ -15,6 +15,8 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 aho-corasick = "1"
 nix = { version = "0.29", features = ["process", "signal"] }
+base64 = "0.22"
+anyhow = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
