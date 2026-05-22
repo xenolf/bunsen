@@ -1,4 +1,5 @@
 
+use std::path::Path;
 use std::process::Stdio;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -8,10 +9,11 @@ use crate::adapter::BlackBoxAdapter;
 use crate::encoder::Encoder;
 use crate::run_spec::RunSpec;
 
-pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder) -> std::io::Result<()> {
+pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace_path: &Path) -> std::io::Result<()> {
     let mut child = Command::new(&spec.cmd[0])
         .args(&spec.cmd[1..])
         .envs(&spec.env)
+        .current_dir(workspace_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;

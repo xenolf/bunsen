@@ -5,6 +5,7 @@ mod run_dir;
 mod run_spec;
 mod supervisor;
 mod ulid;
+mod workspace_materializer;
 
 use events::{SCHEMA_VERSION, CRUCIBLE_VERSION};
 use run_dir::{RunDir, MetaJson};
@@ -33,6 +34,19 @@ async fn main() {
 
     run_dir.write_spec(&spec_json).ok();
 
+    let workspace_path = run_dir.workspace_path();
+    workspace_materializer::materialize(
+        spec.branching_strategy.as_deref(),
+        spec.host_repo_path.as_deref(),
+        &workspace_path,
+        &run_id,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        eprintln!("failed to materialize workspace: {e}");
+        std::process::exit(1);
+    });
+
     let started_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
     let meta = MetaJson {
@@ -52,16 +66,16 @@ async fn main() {
             std::process::exit(1);
         });
 
-    let workspace_path = run_dir.workspace_path().to_string_lossy().into_owned();
+    let workspace_path_str = workspace_path.to_string_lossy().into_owned();
     let transcript_path = run_dir.transcript_path().to_string_lossy().into_owned();
 
     enc.emit("run_started", json!({
         "adapter": spec.adapter,
-        "workspace_path": workspace_path,
+        "workspace_path": workspace_path_str,
         "transcript_path": transcript_path,
     })).unwrap();
 
-    let result = supervisor::run(&spec, &run_id, &mut enc).await;
+    let result = supervisor::run(&spec, &run_id, &mut enc, &workspace_path).await;
 
     let ended_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let exit_reason = if result.is_ok() { "agent_exit" } else { "supervisor_error" };

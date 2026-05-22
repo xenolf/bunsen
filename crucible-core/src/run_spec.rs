@@ -8,6 +8,10 @@ pub struct RunSpec {
     pub cmd: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub branching_strategy: Option<String>,
+    #[serde(default)]
+    pub host_repo_path: Option<String>,
 }
 
 impl RunSpec {
