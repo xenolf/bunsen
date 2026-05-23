@@ -1,6 +1,7 @@
 mod adapter;
 mod encoder;
 mod events;
+mod oci_cache;
 mod redactor;
 mod run_dir;
 mod run_spec;
@@ -156,17 +157,29 @@ async fn run_with_backend(
     enc: &mut encoder::Encoder,
     workspace_path: &std::path::Path,
 ) -> std::io::Result<()> {
-    // On Linux: use Firecracker when --kernel and --rootfs are both provided.
-    // The if-let moves kernel and rootfs so they cannot be referenced below on Linux;
-    // the cfg-guarded suppressors handle each platform independently.
+    // On Linux: use Firecracker when --kernel is provided.
+    // Rootfs comes from --rootfs, or is pulled from spec.oci_image on first use.
     #[cfg(target_os = "linux")]
-    if let (Some(kernel), Some(rootfs)) = (kernel, rootfs) {
+    if let Some(kernel) = kernel {
+        let rootfs = match rootfs {
+            Some(p) => p,
+            None => {
+                let oci_ref = spec.oci_image.as_deref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "sandbox mode requires --rootfs or oci-image in spec",
+                    )
+                })?;
+                oci_cache::resolve_rootfs(oci_ref)
+                    .await
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))?
+            }
+        };
         return run_sandbox(kernel, rootfs, firecracker_bin, spec, run_id, enc, workspace_path).await;
     }
-    // On Linux after the if-let: kernel and rootfs were moved (and dropped).
-    // Only firecracker_bin remains; suppress the unused warning.
+    // On Linux after the if-let: kernel was moved; suppress unused warnings.
     #[cfg(target_os = "linux")]
-    let _ = firecracker_bin;
+    let _ = (rootfs, firecracker_bin);
 
     // On macOS: all three were never consumed.
     #[cfg(not(target_os = "linux"))]
@@ -258,10 +271,6 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
     CliArgs { spec, kernel, rootfs, firecracker }
 }
 
-// Keep backward-compat helper used by subcommand dispatch.
-fn parse_spec_arg(args: &[String]) -> Option<String> {
-    parse_cli_args(args).spec
-}
 
 #[cfg(test)]
 mod tests {

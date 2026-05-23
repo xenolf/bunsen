@@ -17,7 +17,12 @@ aho-corasick = "1"
 nix = { version = "0.29", features = ["process", "signal"] }
 base64 = "0.22"
 anyhow = "1"
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-tempfile = "3"

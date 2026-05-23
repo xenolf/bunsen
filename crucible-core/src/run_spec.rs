@@ -24,6 +24,8 @@ pub struct RunSpec {
     pub vcpus: u32,
     #[serde(default = "default_workspace_disk_mb")]
     pub workspace_disk_mb: u32,
+    #[serde(default)]
+    pub oci_image: Option<String>,
 }
 
 fn default_stop_grace_seconds() -> u64 { 10 }
@@ -68,5 +70,26 @@ mod tests {
         assert_eq!(spec.memory_mb, 512);
         assert_eq!(spec.vcpus, 4);
         assert_eq!(spec.workspace_disk_mb, 2048);
+    }
+
+    // Cycle 6: oci-image field is deserialized.
+    #[test]
+    fn oci_image_in_run_spec() {
+        const HEX64: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let json = format!(
+            r#"{{"adapter":"black-box","cmd":["echo"],"oci-image":"ghcr.io/x/y@sha256:{HEX64}"}}"#
+        );
+        let spec = RunSpec::from_json(&json).unwrap();
+        assert_eq!(
+            spec.oci_image.as_deref(),
+            Some(&format!("ghcr.io/x/y@sha256:{HEX64}") as &str)
+        );
+    }
+
+    // Cycle 7: oci_image is None when field is absent.
+    #[test]
+    fn oci_image_absent_in_run_spec() {
+        let spec = RunSpec::from_json(r#"{"adapter":"black-box","cmd":["echo"]}"#).unwrap();
+        assert!(spec.oci_image.is_none());
     }
 }
