@@ -200,8 +200,8 @@ async fn resolve_image_manifest(
         .ok_or_else(|| anyhow!("child manifest missing digest"))?;
 
     let url = format!(
-        "https://{}/v2/{}/manifests/{}",
-        r.registry, r.name, child_digest
+        "{}://{}/v2/{}/manifests/{}",
+        registry_scheme(&r.registry), r.registry, r.name, child_digest
     );
     let mut req = client
         .get(&url)
@@ -229,6 +229,16 @@ fn build_http_client() -> Result<reqwest::Client> {
         .user_agent("crucible-core/0.1")
         .build()
         .context("build HTTP client")
+}
+
+/// Use plain HTTP for localhost / loopback registries; HTTPS for everything else.
+pub fn registry_scheme(registry: &str) -> &'static str {
+    let host = registry.split(':').next().unwrap_or(registry);
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        "http"
+    } else {
+        "https"
+    }
 }
 
 pub fn parse_www_authenticate(www_auth: &str) -> Result<(String, String)> {
@@ -285,8 +295,8 @@ async fn pull_manifest(
     r: &OciImageRef,
 ) -> Result<(String, String, Option<String>)> {
     let url = format!(
-        "https://{}/v2/{}/manifests/{}",
-        r.registry, r.name, r.digest
+        "{}://{}/v2/{}/manifests/{}",
+        registry_scheme(&r.registry), r.registry, r.name, r.digest
     );
 
     // First attempt: no credentials.
@@ -359,7 +369,7 @@ async fn pull_blob(
     digest: &str,
     token: Option<&str>,
 ) -> Result<Vec<u8>> {
-    let url = format!("https://{}/v2/{}/blobs/{}", r.registry, r.name, digest);
+    let url = format!("{}://{}/v2/{}/blobs/{}", registry_scheme(&r.registry), r.registry, r.name, digest);
     let mut req = client.get(&url);
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
@@ -551,6 +561,16 @@ mod tests {
     fn detect_opaque_whiteout() {
         matches!(classify_whiteout(".wh..wh..opq"), WhiteoutKind::Opaque);
         assert!(matches!(classify_whiteout(".wh..wh..opq"), WhiteoutKind::Opaque));
+    }
+
+    // registry_scheme: localhost uses http, everything else uses https.
+    #[test]
+    fn localhost_uses_http_scheme() {
+        assert_eq!(registry_scheme("localhost"), "http");
+        assert_eq!(registry_scheme("localhost:5000"), "http");
+        assert_eq!(registry_scheme("127.0.0.1:5000"), "http");
+        assert_eq!(registry_scheme("ghcr.io"), "https");
+        assert_eq!(registry_scheme("registry-1.docker.io"), "https");
     }
 
     // Cycle 10: regular whiteout detection.
