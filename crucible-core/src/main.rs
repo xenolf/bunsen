@@ -17,7 +17,7 @@ mod sandbox_supervisor;
 mod smoke_test;
 
 use events::{SCHEMA_VERSION, CRUCIBLE_VERSION};
-use run_dir::{RunDir, MetaJson};
+use run_dir::{RunDir, MetaJson, ResourceLimits};
 use serde_json::json;
 
 #[tokio::main]
@@ -78,6 +78,13 @@ async fn main() {
 
     let started_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
+    let resource_limits = ResourceLimits {
+        memory_mb: spec.memory_mb,
+        vcpus: spec.vcpus,
+        workspace_disk_mb: spec.workspace_disk_mb,
+        wall_clock_seconds: spec.wall_clock_seconds,
+    };
+
     let meta = MetaJson {
         run_id: run_id.clone(),
         started_at: started_at.clone(),
@@ -86,6 +93,7 @@ async fn main() {
         schema_version: SCHEMA_VERSION,
         crucible_version: CRUCIBLE_VERSION.to_string(),
         parent_run_id: None,
+        resource_limits: Some(resource_limits.clone()),
     };
     run_dir.write_meta(&meta).ok();
 
@@ -129,6 +137,7 @@ async fn main() {
         schema_version: SCHEMA_VERSION,
         crucible_version: CRUCIBLE_VERSION.to_string(),
         parent_run_id: None,
+        resource_limits: Some(resource_limits),
     };
     run_dir.write_meta(&meta).ok();
 
@@ -187,9 +196,9 @@ async fn run_sandbox(
         rootfs_path: rootfs,
         workspace_host_path: workspace_path.to_path_buf(),
         spec_json: sandbox_spec_json,
-        vcpus: 1,
-        mem_mib: 512,
-        workspace_disk_mib: 1024,
+        vcpus: spec.vcpus,
+        mem_mib: spec.memory_mb,
+        workspace_disk_mib: spec.workspace_disk_mb,
         run_id: run_id.to_string(),
     };
 

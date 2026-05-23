@@ -18,10 +18,19 @@ pub struct RunSpec {
     pub stop_grace_seconds: u64,
     #[serde(default = "default_wall_clock_seconds")]
     pub wall_clock_seconds: u64,
+    #[serde(default = "default_memory_mb")]
+    pub memory_mb: u32,
+    #[serde(default = "default_vcpus")]
+    pub vcpus: u32,
+    #[serde(default = "default_workspace_disk_mb")]
+    pub workspace_disk_mb: u32,
 }
 
 fn default_stop_grace_seconds() -> u64 { 10 }
 fn default_wall_clock_seconds() -> u64 { 1800 }
+fn default_memory_mb() -> u32 { 4096 }
+fn default_vcpus() -> u32 { 2 }
+fn default_workspace_disk_mb() -> u32 { 10240 }
 
 impl RunSpec {
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
@@ -43,5 +52,21 @@ mod tests {
     fn explicit_wall_clock_seconds_parsed() {
         let spec = RunSpec::from_json(r#"{"adapter":"black-box","cmd":["echo"],"wall-clock-seconds":42}"#).unwrap();
         assert_eq!(spec.wall_clock_seconds, 42);
+    }
+
+    #[test]
+    fn default_resource_limits() {
+        let spec = RunSpec::from_json(r#"{"adapter":"black-box","cmd":["echo"]}"#).unwrap();
+        assert_eq!(spec.memory_mb, 4096);
+        assert_eq!(spec.vcpus, 2);
+        assert_eq!(spec.workspace_disk_mb, 10240);
+    }
+
+    #[test]
+    fn explicit_resource_limits_parsed() {
+        let spec = RunSpec::from_json(r#"{"adapter":"black-box","cmd":["echo"],"memory-mb":512,"vcpus":4,"workspace-disk-mb":2048}"#).unwrap();
+        assert_eq!(spec.memory_mb, 512);
+        assert_eq!(spec.vcpus, 4);
+        assert_eq!(spec.workspace_disk_mb, 2048);
     }
 }

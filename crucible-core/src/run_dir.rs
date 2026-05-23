@@ -1,6 +1,13 @@
 use std::path::PathBuf;
 use serde::Serialize;
 
+#[derive(Serialize, Clone)]
+pub struct ResourceLimits {
+    pub memory_mb: u32,
+    pub vcpus: u32,
+    pub workspace_disk_mb: u32,
+    pub wall_clock_seconds: u64,
+}
 
 pub struct RunDir {
     pub path: PathBuf,
@@ -19,6 +26,8 @@ pub struct MetaJson {
     pub schema_version: u32,
     pub crucible_version: String,
     pub parent_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<ResourceLimits>,
 }
 
 impl RunDir {
@@ -59,4 +68,50 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{SCHEMA_VERSION, CRUCIBLE_VERSION};
+
+    #[test]
+    fn resource_limits_serialized_in_meta() {
+        let meta = MetaJson {
+            run_id: "test-run".to_string(),
+            started_at: "2026-01-01T00:00:00.000Z".to_string(),
+            ended_at: None,
+            exit_reason: None,
+            schema_version: SCHEMA_VERSION,
+            crucible_version: CRUCIBLE_VERSION.to_string(),
+            parent_run_id: None,
+            resource_limits: Some(ResourceLimits {
+                memory_mb: 512,
+                vcpus: 1,
+                workspace_disk_mb: 1024,
+                wall_clock_seconds: 300,
+            }),
+        };
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        assert_eq!(v["resource_limits"]["memory_mb"], 512);
+        assert_eq!(v["resource_limits"]["vcpus"], 1);
+        assert_eq!(v["resource_limits"]["workspace_disk_mb"], 1024);
+        assert_eq!(v["resource_limits"]["wall_clock_seconds"], 300);
+    }
+
+    #[test]
+    fn resource_limits_absent_when_none() {
+        let meta = MetaJson {
+            run_id: "test-run".to_string(),
+            started_at: "2026-01-01T00:00:00.000Z".to_string(),
+            ended_at: None,
+            exit_reason: None,
+            schema_version: SCHEMA_VERSION,
+            crucible_version: CRUCIBLE_VERSION.to_string(),
+            parent_run_id: None,
+            resource_limits: None,
+        };
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        assert!(v.get("resource_limits").is_none());
+    }
 }
