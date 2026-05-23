@@ -69,21 +69,21 @@ pub fn run() -> ! {
     let (child_pid, stdout_r, stderr_r) = fork_exec(&spec);
     let pgid = child_pid;
 
-    // I/O relay threads.
-    {
+    // I/O relay threads — save handles so we can join before exit.
+    let stdout_thread = {
         let mut sw = unsafe { std::fs::File::from_raw_fd(stdout_vsock) };
         std::thread::spawn(move || {
             let mut r = unsafe { std::fs::File::from_raw_fd(stdout_r) };
             let _ = io::copy(&mut r, &mut sw);
-        });
-    }
-    {
+        })
+    };
+    let stderr_thread = {
         let mut sw = unsafe { std::fs::File::from_raw_fd(stderr_vsock) };
         std::thread::spawn(move || {
             let mut r = unsafe { std::fs::File::from_raw_fd(stderr_r) };
             let _ = io::copy(&mut r, &mut sw);
-        });
-    }
+        })
+    };
 
     // Control relay thread.
     let grace = spec.stop_grace_seconds;
@@ -93,6 +93,9 @@ pub fn run() -> ! {
 
     // Main thread: reap all zombies; stop when our direct child exits.
     let exit_code = wait_for_agent(child_pid);
+    // Drain relay threads before exit so all buffered output reaches the host.
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
     unsafe { libc::exit(exit_code) };
 }
 
