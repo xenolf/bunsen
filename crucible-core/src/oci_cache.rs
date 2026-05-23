@@ -120,10 +120,9 @@ pub async fn resolve_rootfs(image_ref: &str) -> Result<PathBuf> {
 async fn pull_and_flatten(r: &OciImageRef, dest: &Path) -> Result<()> {
     let client = build_http_client()?;
 
-    let token = get_bearer_token(&client, &r.registry, &r.name).await?;
-
-    let (manifest_json, actual_digest) =
-        pull_manifest(&client, r, token.as_deref()).await?;
+    // pull_manifest handles the auth challenge internally; it returns the
+    // bearer token it obtained (if any) so blob pulls can reuse it.
+    let (manifest_json, actual_digest, token) = pull_manifest(&client, r).await?;
 
     if actual_digest != r.digest {
         bail!(
@@ -137,9 +136,8 @@ async fn pull_and_flatten(r: &OciImageRef, dest: &Path) -> Result<()> {
         serde_json::from_str(&manifest_json).context("parse OCI manifest JSON")?;
 
     // Handle manifest lists (multi-arch): pick linux/amd64.
-    let (layers_manifest, manifest_for_layers) =
+    let manifest_for_layers =
         resolve_image_manifest(&client, r, token.as_deref(), &manifest).await?;
-    let _ = layers_manifest;
 
     let layers = manifest_for_layers["layers"]
         .as_array()
@@ -170,19 +168,19 @@ async fn pull_and_flatten(r: &OciImageRef, dest: &Path) -> Result<()> {
 
 /// If `manifest` is a manifest list, fetch and return the linux/amd64 image manifest.
 /// Otherwise return the manifest unchanged.
-async fn resolve_image_manifest<'a>(
+async fn resolve_image_manifest(
     client: &reqwest::Client,
     r: &OciImageRef,
     token: Option<&str>,
-    manifest: &'a serde_json::Value,
-) -> Result<(Option<String>, serde_json::Value)> {
+    manifest: &serde_json::Value,
+) -> Result<serde_json::Value> {
     let media_type = manifest["mediaType"].as_str().unwrap_or("");
     let is_list = media_type
         == "application/vnd.docker.distribution.manifest.list.v2+json"
         || media_type == "application/vnd.oci.image.index.v1+json";
 
     if !is_list {
-        return Ok((None, manifest.clone()));
+        return Ok(manifest.clone());
     }
 
     let manifests = manifest["manifests"]
@@ -216,10 +214,7 @@ async fn resolve_image_manifest<'a>(
         bail!("child manifest returned {}", resp.status());
     }
     let body = resp.text().await?;
-    let child_manifest: serde_json::Value =
-        serde_json::from_str(&body).context("parse child manifest")?;
-
-    Ok((Some(body), child_manifest))
+    serde_json::from_str(&body).context("parse child manifest")
 }
 
 const OCI_ACCEPT_HEADERS: &[&str] = &[
@@ -234,34 +229,6 @@ fn build_http_client() -> Result<reqwest::Client> {
         .user_agent("crucible-core/0.1")
         .build()
         .context("build HTTP client")
-}
-
-/// Obtain a Bearer token for the registry, if required.
-pub async fn get_bearer_token(
-    client: &reqwest::Client,
-    registry: &str,
-    name: &str,
-) -> Result<Option<String>> {
-    let probe_url = format!("https://{registry}/v2/");
-    let resp = client
-        .get(&probe_url)
-        .send()
-        .await
-        .with_context(|| format!("probe registry {registry}"))?;
-
-    if resp.status() != 401 {
-        return Ok(None); // no auth required
-    }
-
-    let www_auth = resp
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let token = fetch_token_from_challenge(client, &www_auth, name).await?;
-    Ok(Some(token))
 }
 
 pub fn parse_www_authenticate(www_auth: &str) -> Result<(String, String)> {
@@ -306,33 +273,83 @@ async fn fetch_token_from_challenge(
     Ok(token.to_string())
 }
 
+/// Pull the manifest and compute its sha256 digest.
+///
+/// Tries unauthenticated first. On 401, reads the Www-Authenticate challenge
+/// from *that* response (which contains the correct scope for this specific
+/// resource), obtains a Bearer token, then retries.
+///
+/// Returns `(manifest_json, sha256_digest, Option<bearer_token>)`.
 async fn pull_manifest(
     client: &reqwest::Client,
     r: &OciImageRef,
-    token: Option<&str>,
-) -> Result<(String, String)> {
+) -> Result<(String, String, Option<String>)> {
     let url = format!(
         "https://{}/v2/{}/manifests/{}",
         r.registry, r.name, r.digest
     );
-    let mut req = client
-        .get(&url)
-        .header("Accept", OCI_ACCEPT_HEADERS.join(", "));
-    if let Some(t) = token {
-        req = req.header("Authorization", format!("Bearer {t}"));
-    }
-    let resp = req.send().await.context("pull manifest")?;
-    if !resp.status().is_success() {
-        bail!("manifest pull returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
-    }
-    let body_bytes = resp.bytes().await.context("read manifest body")?;
 
-    // Verify digest over raw bytes.
+    // First attempt: no credentials.
+    let resp = client
+        .get(&url)
+        .header("Accept", OCI_ACCEPT_HEADERS.join(", "))
+        .send()
+        .await
+        .context("pull manifest")?;
+
+    if resp.status().is_success() {
+        let (body, digest) = read_manifest_bytes(resp).await?;
+        return Ok((body, digest, None));
+    }
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        // Extract the scope-correct challenge from *this* 401 response.
+        let www_auth = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if !www_auth.is_empty() {
+            let token = fetch_token_from_challenge(client, &www_auth, &r.name)
+                .await
+                .context("obtain Bearer token from manifest www-authenticate challenge")?;
+
+            let resp2 = client
+                .get(&url)
+                .header("Accept", OCI_ACCEPT_HEADERS.join(", "))
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .context("pull manifest (authenticated)")?;
+
+            if !resp2.status().is_success() {
+                bail!(
+                    "manifest pull returned {}: {}",
+                    resp2.status(),
+                    resp2.text().await.unwrap_or_default()
+                );
+            }
+            let (body, digest) = read_manifest_bytes(resp2).await?;
+            return Ok((body, digest, Some(token)));
+        }
+    }
+
+    bail!(
+        "manifest pull returned {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    )
+}
+
+async fn read_manifest_bytes(resp: reqwest::Response) -> Result<(String, String)> {
+    let body_bytes = resp.bytes().await.context("read manifest body")?;
     let mut hasher = Sha256::new();
     hasher.update(&body_bytes);
     let actual_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
-
-    let body_str = String::from_utf8(body_bytes.to_vec()).context("manifest is not valid UTF-8")?;
+    let body_str =
+        String::from_utf8(body_bytes.to_vec()).context("manifest is not valid UTF-8")?;
     Ok((body_str, actual_digest))
 }
 
