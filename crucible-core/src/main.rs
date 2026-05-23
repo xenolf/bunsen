@@ -1,4 +1,5 @@
 mod adapter;
+mod claude_code_adapter;
 mod encoder;
 mod events;
 mod oci_cache;
@@ -125,7 +126,8 @@ async fn main() {
     })).unwrap();
 
     // ── Dispatch: sandbox (Linux + --kernel/--rootfs) or host subprocess ───
-    let result = run_with_backend(cli.kernel, cli.rootfs, cli.firecracker, &spec, &run_id, &mut enc, &workspace_path).await;
+    let agent_history_path = run_dir.agent_history_path();
+    let result = run_with_backend(cli.kernel, cli.rootfs, cli.firecracker, &spec, &run_id, &mut enc, &workspace_path, Some(&agent_history_path)).await;
 
     let ended_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let exit_reason = if result.is_ok() { "agent_exit" } else { "supervisor_error" };
@@ -156,6 +158,7 @@ async fn run_with_backend(
     run_id: &str,
     enc: &mut encoder::Encoder,
     workspace_path: &std::path::Path,
+    agent_history_path: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
     // On Linux: use Firecracker when --kernel is provided.
     // Rootfs comes from --rootfs, or is pulled from spec.oci_image on first use.
@@ -185,7 +188,7 @@ async fn run_with_backend(
     #[cfg(not(target_os = "linux"))]
     let _ = (kernel, rootfs, firecracker_bin);
 
-    supervisor::run(spec, run_id, enc, workspace_path).await
+    supervisor::run(spec, run_id, enc, workspace_path, agent_history_path).await
 }
 
 #[cfg(target_os = "linux")]

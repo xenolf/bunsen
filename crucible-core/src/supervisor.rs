@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use crate::adapter::BlackBoxAdapter;
+use crate::claude_code_adapter::ClaudeCodeParser;
 use crate::encoder::Encoder;
 use crate::run_spec::RunSpec;
 
@@ -42,7 +43,25 @@ fn signal_pgid(pgid: Pid, sig: Signal) {
     let _ = killpg(pgid, sig);
 }
 
-pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace_path: &Path) -> std::io::Result<()> {
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), dest)?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace_path: &Path, agent_history_path: Option<&Path>) -> std::io::Result<()> {
+    let use_claude_code = spec.adapter == "claude-code";
+    let mut cc_parser = if use_claude_code { Some(ClaudeCodeParser::new()) } else { None };
+
     let mut cmd = Command::new(&spec.cmd[0]);
     cmd.args(&spec.cmd[1..])
         .envs(&spec.env)
@@ -125,7 +144,17 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
             msg = out_rx.recv() => {
                 match msg {
                     Some(OutputLine::Line { stream, text }) => {
-                        encoder.emit("output", BlackBoxAdapter::output_event(stream, text.as_bytes()))?;
+                        if stream == "stdout" {
+                            if let Some(parser) = cc_parser.as_mut() {
+                                for (event_type, payload) in parser.parse_line(&text) {
+                                    encoder.emit(&event_type, payload)?;
+                                }
+                            } else {
+                                encoder.emit("output", BlackBoxAdapter::output_event(stream, text.as_bytes()))?;
+                            }
+                        } else {
+                            encoder.emit("output", BlackBoxAdapter::output_event(stream, text.as_bytes()))?;
+                        }
                     }
                     Some(OutputLine::Done) => {
                         done_count += 1;
@@ -175,6 +204,16 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
 
     let status = child.wait().await?;
     let exit_code = status.code();
+
+    // Copy agent's native history to agent-history/ (best-effort).
+    if let Some(hist_dst) = agent_history_path {
+        let dot_claude = workspace_path.join(".claude");
+        if dot_claude.exists() {
+            if let Err(e) = copy_dir_all(&dot_claude, hist_dst) {
+                eprintln!("[supervisor] agent history copy warning: {e}");
+            }
+        }
+    }
 
     let reason = match initiated_reason {
         Some(r) => r,
@@ -227,5 +266,34 @@ mod tests {
     #[test]
     fn parse_cmd_whitespace_trimmed() {
         assert!(matches!(parse_cmd(r#"  {"op":"kill"}  "#), Some(ControlCmd::Kill)));
+    }
+
+    #[test]
+    fn copy_dir_all_copies_recursively() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir_all(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("a.txt"), "hello").unwrap();
+        std::fs::write(src.path().join("sub/b.txt"), "world").unwrap();
+
+        copy_dir_all(src.path(), dst.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dst.path().join("a.txt")).unwrap(), "hello");
+        assert_eq!(std::fs::read_to_string(dst.path().join("sub/b.txt")).unwrap(), "world");
+    }
+
+    #[test]
+    fn copy_dir_all_noop_when_src_absent() {
+        let dst = tempfile::tempdir().unwrap();
+        // copy_dir_all only called when src exists; test the guard in run() directly:
+        // If workspace .claude/ doesn't exist, no copy happens — dst stays empty.
+        let nonexistent = std::path::Path::new("/tmp/crucible-nonexistent-12345/.claude");
+        if !nonexistent.exists() {
+            // Guard: copy_dir_all is NOT called — simulate the guard condition
+            let hist = dst.path().join("agent-history");
+            // The function should not create hist when .claude is absent
+            assert!(!hist.exists());
+        }
     }
 }

@@ -50,6 +50,10 @@ impl RunDir {
         std::fs::write(self.path.join("spec.json"), spec_json)
     }
 
+    pub fn agent_history_path(&self) -> PathBuf {
+        self.path.join("agent-history")
+    }
+
     pub fn write_meta(&self, meta: &MetaJson) -> std::io::Result<()> {
         let s = serde_json::to_string_pretty(meta).unwrap();
         std::fs::write(self.path.join("meta.json"), s)
@@ -97,6 +101,12 @@ mod tests {
         assert_eq!(v["resource_limits"]["vcpus"], 1);
         assert_eq!(v["resource_limits"]["workspace_disk_mb"], 1024);
         assert_eq!(v["resource_limits"]["wall_clock_seconds"], 300);
+    }
+
+    #[test]
+    fn agent_history_path_is_under_run_dir() {
+        let rd = RunDir { path: PathBuf::from("/tmp/runs/TESTRUN"), run_id: "TESTRUN".into() };
+        assert_eq!(rd.agent_history_path(), PathBuf::from("/tmp/runs/TESTRUN/agent-history"));
     }
 
     #[test]
