@@ -9,6 +9,7 @@ mod redactor;
 mod run_dir;
 mod run_spec;
 mod sandbox;
+mod sandbox_net;
 mod supervisor;
 mod ulid;
 mod workspace_materializer;
