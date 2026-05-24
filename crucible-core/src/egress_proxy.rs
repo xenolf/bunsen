@@ -31,7 +31,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use crate::egress::{EgressPolicy, Protocol};
+use crate::egress::{denied_payload, EgressPolicy, Protocol, EVENT_TYPE};
+use crate::encoder::Encoder;
 
 /// A proxy-side denial. The Run Supervisor converts this into an
 /// `egress_denied` event via [`crate::egress::denied_payload`].
@@ -216,6 +217,16 @@ pub async fn serve_connection<C, S>(
             });
         }
     }
+}
+
+/// Translate a [`DenialEvent`] into an `egress_denied` event on the host
+/// transcript stream. The Run Supervisor calls this for each denial received
+/// on the channel returned by [`spawn_listener`].
+pub fn emit_denial(encoder: &mut Encoder, denial: &DenialEvent) -> io::Result<()> {
+    encoder.emit(
+        EVENT_TYPE,
+        denied_payload(&denial.destination, denial.protocol, &denial.reason),
+    )
 }
 
 /// Spawn a listener that accepts connections on `addr` and serves each one
@@ -518,6 +529,68 @@ mod tests {
         let s = String::from_utf8_lossy(&resp);
         assert!(s.starts_with("HTTP/1.1 502"), "got: {s}");
         assert!(rx.try_recv().is_err(), "upstream failure is not a policy denial");
+    }
+
+    #[tokio::test]
+    async fn emit_denial_writes_egress_denied_event_to_transcript() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut enc = Encoder::new("TEST01", tmp.path(), None).unwrap();
+        let denial = DenialEvent {
+            destination: "github.com".into(),
+            protocol: Protocol::Https,
+            reason: "not in allowlist".into(),
+        };
+        emit_denial(&mut enc, &denial).unwrap();
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let line = content.trim();
+        assert!(!line.is_empty(), "transcript must contain a line");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["type"], "egress_denied");
+        assert_eq!(v["destination"], "github.com");
+        assert_eq!(v["protocol"], "https");
+        assert_eq!(v["reason"], "not in allowlist");
+        assert_eq!(v["run_id"], "TEST01");
+    }
+
+    #[tokio::test]
+    async fn proxy_denial_pump_into_encoder_round_trip() {
+        // Wire the proxy → channel → emit_denial → Encoder pipeline end-to-end.
+        // Mirrors the production flow the Run Supervisor will drive: a denied
+        // CONNECT lands a DenialEvent on the channel, which the supervisor
+        // pumps into the Encoder via emit_denial.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut enc = Encoder::new("RUN02", tmp.path(), None).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let p = policy(&["api.anthropic.com"]);
+
+        let (proxy_addr, listener_handle) =
+            spawn_listener("127.0.0.1:0".parse().unwrap(), p, tx).await.unwrap();
+
+        // Client → proxy: try a non-allowed destination.
+        let mut sock = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        sock.write_all(b"CONNECT github.com:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.starts_with("HTTP/1.1 403"), "got: {resp_str}");
+
+        // Pump the denial through the supervisor-shaped helper.
+        let denial = rx.recv().await.expect("denial event");
+        emit_denial(&mut enc, &denial).unwrap();
+
+        // Tear down the listener — we're done.
+        listener_handle.abort();
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let line = content.trim();
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["type"], "egress_denied");
+        assert_eq!(v["destination"], "github.com");
+        assert_eq!(v["protocol"], "https");
+        assert_eq!(v["run_id"], "RUN02");
     }
 
     #[tokio::test]

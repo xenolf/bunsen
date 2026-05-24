@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use crate::adapter::BlackBoxAdapter;
+use crate::egress_proxy::{self, DenialEvent};
 use crate::encoder::Encoder;
 use crate::firecracker::FirecrackerHandle;
 use crate::run_spec::RunSpec;
@@ -40,6 +41,30 @@ pub async fn run(
     spec: &RunSpec,
     encoder: &mut Encoder,
 ) -> Result<()> {
+    // ── L7 egress proxy ────────────────────────────────────────────────────
+    // Spawn the per-Run forward proxy. For now we bind on 127.0.0.1:0; the
+    // veth-local IP that L3 nftables will redirect guest traffic to is a
+    // future slice. Denials land on `denied_rx` and are fused into the
+    // event stream by the main loop below.
+    let policy = spec.effective_egress_policy();
+    let (denied_tx, mut denied_rx) = mpsc::unbounded_channel::<DenialEvent>();
+    let proxy_handle = match egress_proxy::spawn_listener(
+        "127.0.0.1:0".parse().expect("static addr"),
+        policy,
+        denied_tx,
+    )
+    .await
+    {
+        Ok((addr, h)) => {
+            eprintln!("[egress] L7 proxy listening on {addr}");
+            Some(h)
+        }
+        Err(e) => {
+            eprintln!("[egress] failed to start proxy listener: {e}");
+            None
+        }
+    };
+
     // Control commands from crucible-core's stdin.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCmd>(16);
     let stdin_cmd_tx = cmd_tx.clone();
@@ -66,6 +91,7 @@ pub async fn run(
     let grace = spec.stop_grace_seconds;
     let mut stdout_done = false;
     let mut stderr_done = false;
+    let mut denial_rx_open = true;
     let mut initiated_reason: Option<&'static str> = None;
     let mut stdout_buf = vec![0u8; 4096];
     let mut stderr_buf = vec![0u8; 4096];
@@ -92,6 +118,13 @@ pub async fn run(
                         encoder.emit("output", BlackBoxAdapter::output_event("stderr", &stderr_buf[..n]))
                             .map_err(|e| anyhow::anyhow!("encoder: {e}"))?;
                     }
+                }
+            }
+            denial = denied_rx.recv(), if denial_rx_open => {
+                match denial {
+                    Some(d) => egress_proxy::emit_denial(encoder, &d)
+                        .map_err(|e| anyhow::anyhow!("encoder: {e}"))?,
+                    None => denial_rx_open = false,
                 }
             }
             cmd = cmd_rx.recv() => {
@@ -127,6 +160,17 @@ pub async fn run(
 
     // Wait for VM process to exit.
     handle.wait().await.ok();
+
+    // Drain any denials still in the channel before emitting run_ended, then
+    // tear the proxy listener down. After the VM has exited there will be no
+    // new connections, but the channel may have already-queued events.
+    while let Ok(d) = denied_rx.try_recv() {
+        egress_proxy::emit_denial(encoder, &d)
+            .map_err(|e| anyhow::anyhow!("encoder: {e}"))?;
+    }
+    if let Some(h) = proxy_handle {
+        h.abort();
+    }
 
     let reason = initiated_reason.unwrap_or("agent_exit");
     encoder.emit("run_ended", json!({ "reason": reason }))
