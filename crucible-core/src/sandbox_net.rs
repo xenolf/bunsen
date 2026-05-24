@@ -38,6 +38,16 @@ pub fn derive_run_network(run_id: &str) -> RunNetwork {
     }
 }
 
+/// Derive the host-side TAP device name for a Run.
+///
+/// Kernel interface names are capped at 15 characters (`IFNAMSIZ - 1`). With
+/// a `tap-` prefix that leaves 11 chars from `run_id`; we truncate to 8 to
+/// keep some headroom and match the format Firecracker logs expect.
+pub fn derive_tap_name(run_id: &str) -> String {
+    let suffix_len = run_id.len().min(8);
+    format!("tap-{}", &run_id[..suffix_len])
+}
+
 /// Index into the 16,384 available /30 blocks in `169.254.0.0/16`.
 /// Returns `[1, 16383]` — index 0 is reserved.
 fn subnet_index(run_id: &str) -> u32 {
@@ -153,5 +163,30 @@ mod tests {
         let n = derive_run_network("");
         assert_eq!(n.prefix_len, 30);
         assert_eq!(n.host.octets()[0], 169);
+    }
+
+    #[test]
+    fn derive_tap_name_uses_first_eight_chars_of_run_id() {
+        assert_eq!(
+            derive_tap_name("01HZXMSAMPLERUNID0000000000"),
+            "tap-01HZXMSA"
+        );
+    }
+
+    #[test]
+    fn derive_tap_name_handles_short_run_ids() {
+        assert_eq!(derive_tap_name("abc"), "tap-abc");
+        assert_eq!(derive_tap_name(""), "tap-");
+    }
+
+    #[test]
+    fn derive_tap_name_fits_in_linux_ifnamsiz() {
+        // IFNAMSIZ - 1 = 15 chars max for an interface name.
+        for input in ["a", "01HZXMSAMPLERUNID0000000000", "longer-input-string", ""] {
+            assert!(
+                derive_tap_name(input).len() <= 15,
+                "tap name for {input:?} exceeds IFNAMSIZ-1"
+            );
+        }
     }
 }

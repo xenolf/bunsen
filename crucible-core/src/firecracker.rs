@@ -20,7 +20,6 @@ use crate::sandbox::{
     FcActionStart, FcBootSource, FcDriveConfig, FcMachineConfig, FcNetworkInterface,
     FcVsockConfig, SandboxConfig, VSOCK_CONTROL_PORT, VSOCK_STDERR_PORT, VSOCK_STDOUT_PORT,
 };
-use crate::sandbox_net::derive_run_network;
 use anyhow::{anyhow, bail, Context, Result};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -76,24 +75,13 @@ pub async fn start_firecracker(
     let vsock_path = run_dir.join("vsock.sock");
     let workspace_ext4 = run_dir.join("workspace.ext4");
 
-    let tap_name = format!("tap-{}", &config.run_id[..config.run_id.len().min(8)]);
-    let net = derive_run_network(&config.run_id);
+    let tap_name = config.tap_name.clone();
 
-    // Clean up any leftover state from a previous crashed run.
-    let _ = delete_tap(&tap_name).await;
+    // Clean up any leftover run-dir state from a previous crashed run. The
+    // caller owns the TAP lifecycle (slice 10f) and has already created it
+    // bound to the per-Run host IP, which the L7 proxy is listening on.
     let _ = std::fs::remove_dir_all(&run_dir);
     std::fs::create_dir_all(&run_dir).context("create firecracker run dir")?;
-
-    // 1. Create TAP device and assign its host-side IP.
-    eprintln!(
-        "[fc] creating TAP device {tap_name} (host {host}/{prefix}, guest {guest})",
-        host = net.host,
-        prefix = net.prefix_len,
-        guest = net.guest,
-    );
-    create_tap(&tap_name, net.host, net.prefix_len)
-        .await
-        .context("create TAP device")?;
 
     // 2. Create workspace ext4 image — pre-populate from host workspace dir if present.
     eprintln!("[fc] creating workspace ext4 ({} MiB)", config.workspace_disk_mib);
@@ -383,7 +371,7 @@ async fn connect_host_to_guest(vsock_uds: &Path, port: u32) -> Result<UnixStream
 
 // ─── TAP device management ─────────────────────────────────────────────────
 
-async fn create_tap(name: &str, host_addr: Ipv4Addr, prefix_len: u8) -> Result<()> {
+pub async fn create_tap(name: &str, host_addr: Ipv4Addr, prefix_len: u8) -> Result<()> {
     let s = Command::new("ip")
         .args(["tuntap", "add", "dev", name, "mode", "tap"])
         .status()
@@ -409,7 +397,7 @@ async fn create_tap(name: &str, host_addr: Ipv4Addr, prefix_len: u8) -> Result<(
     Ok(())
 }
 
-async fn delete_tap(name: &str) -> Result<()> {
+pub async fn delete_tap(name: &str) -> Result<()> {
     Command::new("ip")
         .args(["link", "del", name])
         .status()

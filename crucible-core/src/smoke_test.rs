@@ -12,8 +12,9 @@
 //! It verifies "hello world\n" appears on the stdout vsock, then sends `stop`
 //! over the control vsock, then prints PASS.
 
-use crate::firecracker::{start_firecracker, FirecrackerHandle};
+use crate::firecracker::{create_tap, delete_tap, start_firecracker, FirecrackerHandle};
 use crate::sandbox::SandboxConfig;
+use crate::sandbox_net::{derive_run_network, derive_tap_name};
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -43,6 +44,18 @@ pub async fn run(raw_args: &[String]) -> Result<()> {
     println!("  rootfs:      {}", args.rootfs.display());
     println!("  firecracker: {}", args.firecracker.display());
 
+    let run_id = "smoke01".to_string();
+    let net = derive_run_network(&run_id);
+    let tap_name = derive_tap_name(&run_id);
+
+    // Slice 10f: the caller owns the TAP lifecycle now. Smoke test doesn't
+    // exercise the L7 proxy, but it still needs to hand a live TAP to
+    // start_firecracker so the VM can attach its network interface.
+    let _ = delete_tap(&tap_name).await;
+    create_tap(&tap_name, net.host, net.prefix_len)
+        .await
+        .context("create smoke TAP")?;
+
     let config = SandboxConfig {
         kernel_path: args.kernel,
         rootfs_path: args.rootfs,
@@ -51,7 +64,8 @@ pub async fn run(raw_args: &[String]) -> Result<()> {
         vcpus: 1,
         mem_mib: 512,
         workspace_disk_mib: 128,
-        run_id: "smoke01".to_string(),
+        run_id,
+        tap_name,
     };
 
     std::fs::create_dir_all(&config.workspace_host_path)

@@ -204,21 +204,45 @@ async fn run_sandbox(
     enc: &mut encoder::Encoder,
     workspace_path: &std::path::Path,
 ) -> std::io::Result<()> {
-    use firecracker::{create_workspace_ext4_from_dir, extract_workspace_from_ext4, start_firecracker};
+    use firecracker::{create_tap, delete_tap, extract_workspace_from_ext4, start_firecracker};
     use sandbox::SandboxConfig;
+    use sandbox_net::{derive_run_network, derive_tap_name};
     use sandbox_supervisor::EgressContext;
+    use std::net::SocketAddr;
 
     let fc_bin = firecracker_bin.unwrap_or_else(|| std::path::PathBuf::from("firecracker"));
 
+    // ── Per-Run network ────────────────────────────────────────────────────
+    // Derive the /30 IPv4 pair and TAP name from the run_id, then create the
+    // TAP and assign its host-side address. The L7 proxy will bind on that
+    // address (slice 10f) so the TAP must be up first. Any leftover TAP from
+    // a previous crashed Run with the same id is removed defensively — this
+    // mirrors the pre-cleanup behavior start_firecracker used to do.
+    let net = derive_run_network(run_id);
+    let tap_name = derive_tap_name(run_id);
+    let _ = delete_tap(&tap_name).await;
+    eprintln!(
+        "[fc] creating TAP device {tap_name} (host {host}/{prefix}, guest {guest})",
+        host = net.host,
+        prefix = net.prefix_len,
+        guest = net.guest,
+    );
+    create_tap(&tap_name, net.host, net.prefix_len)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))?;
+
     // ── L7 egress proxy ────────────────────────────────────────────────────
-    // Bind the proxy *before* building the spec JSON so the bound SocketAddr
-    // can be injected as HTTP_PROXY / HTTPS_PROXY in the guest's env. For
-    // now we bind on 127.0.0.1:0; the per-Run veth-local IP that L3 nftables
-    // will redirect guest traffic to is a future slice.
+    // Bind the proxy on the TAP host IP (port 0 → kernel-assigned) so the
+    // address injected as HTTP_PROXY / HTTPS_PROXY is reachable from inside
+    // the guest once eth0 comes up. Bind happens before build_sandbox_spec_json
+    // so the bound SocketAddr flows into the env. Listener-bind failure
+    // remains non-fatal here: a follow-up slice adds L3 nftables that make
+    // proxy presence load-bearing.
     let policy = spec.effective_egress_policy();
     let (denied_tx, denied_rx) = tokio::sync::mpsc::unbounded_channel();
+    let proxy_bind: SocketAddr = SocketAddr::from((net.host, 0));
     let (proxy_addr, proxy_handle) = match egress_proxy::spawn_listener(
-        "127.0.0.1:0".parse().expect("static addr"),
+        proxy_bind,
         policy,
         denied_tx,
     )
@@ -245,6 +269,7 @@ async fn run_sandbox(
         mem_mib: spec.memory_mb,
         workspace_disk_mib: spec.workspace_disk_mb,
         run_id: run_id.to_string(),
+        tap_name,
     };
 
     // Populate workspace ext4 from the materialized workspace directory.

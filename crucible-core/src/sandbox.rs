@@ -75,6 +75,10 @@ pub struct SandboxConfig {
     pub mem_mib: u32,
     pub workspace_disk_mib: u32,
     pub run_id: String,
+    /// Name of a TAP device the caller has already created and brought up
+    /// (slice 10f: the TAP must exist before the L7 proxy can bind on its
+    /// host-side IP, so its lifecycle is owned by the caller).
+    pub tap_name: String,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -307,6 +311,21 @@ mod tests {
             serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
         assert_eq!(v["env"]["NO_PROXY"], "localhost,127.0.0.1");
         assert_eq!(v["env"]["no_proxy"], "localhost,127.0.0.1");
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_with_link_local_proxy_addr_formats_url() {
+        // Slice 10f: the proxy binds on the per-Run TAP host IP, not loopback.
+        // Confirm a 169.254.x.x address makes it into HTTPS_PROXY verbatim.
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"]
+        }"#).unwrap();
+        let addr: SocketAddr = "169.254.42.1:34567".parse().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
+        assert_eq!(v["env"]["HTTPS_PROXY"], "http://169.254.42.1:34567");
+        assert_eq!(v["env"]["HTTP_PROXY"], "http://169.254.42.1:34567");
     }
 
     #[test]
