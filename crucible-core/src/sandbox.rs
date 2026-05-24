@@ -4,6 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 use crate::run_spec::RunSpec;
+use crate::sandbox_net::RunNetwork;
 
 // ─── vsock port assignments ────────────────────────────────────────────────
 /// Guest→host: raw bytes from the agent's stdout.
@@ -105,9 +106,10 @@ pub fn build_boot_args(spec_json: &str) -> String {
 
 /// Build the spec JSON to embed in the VM's kernel boot args.
 ///
-/// The guest init understands `cmd`, `env`, and `stop-grace-seconds`.
-/// Secrets are merged into `env` so the init exports them as env vars on the agent.
-/// The top-level `secrets` field is deliberately omitted.
+/// The guest init understands `cmd`, `env`, `stop-grace-seconds`, and
+/// (optionally) `network`. Secrets are merged into `env` so the init exports
+/// them as env vars on the agent. The top-level `secrets` field is
+/// deliberately omitted.
 ///
 /// When `proxy_addr` is `Some(addr)`, the L7 egress proxy URL is injected as
 /// `HTTP_PROXY` / `HTTPS_PROXY` (and lowercase variants) so well-behaved
@@ -115,7 +117,17 @@ pub fn build_boot_args(spec_json: &str) -> String {
 /// user-supplied value — the proxy is the security boundary, not a hint.
 /// `NO_PROXY` is set to `localhost,127.0.0.1` only when the user has not
 /// supplied their own value.
-pub fn build_sandbox_spec_json(spec: &RunSpec, proxy_addr: Option<SocketAddr>) -> String {
+///
+/// When `net` is `Some(net)`, a `network` object is added to the spec
+/// carrying the per-Run /30 pair the guest's `eth0` must configure (slice
+/// 10g). The guest init brings the link up with the supplied addresses;
+/// without this object the guest leaves `eth0` down and the injected
+/// `HTTPS_PROXY` is unreachable.
+pub fn build_sandbox_spec_json(
+    spec: &RunSpec,
+    proxy_addr: Option<SocketAddr>,
+    net: Option<RunNetwork>,
+) -> String {
     let mut env = spec.env.clone();
     // Secrets overlay env (secrets win on collision).
     for (k, v) in &spec.secrets {
@@ -133,11 +145,18 @@ pub fn build_sandbox_spec_json(spec: &RunSpec, proxy_addr: Option<SocketAddr>) -
                 .or_insert_with(|| "localhost,127.0.0.1".to_string());
         }
     }
-    let obj = serde_json::json!({
+    let mut obj = serde_json::json!({
         "cmd": spec.cmd,
         "env": env,
         "stop-grace-seconds": spec.stop_grace_seconds,
     });
+    if let Some(n) = net {
+        obj["network"] = serde_json::json!({
+            "guest-ip": n.guest.to_string(),
+            "host-ip": n.host.to_string(),
+            "prefix-len": n.prefix_len,
+        });
+    }
     serde_json::to_string(&obj).expect("spec serialization is infallible")
 }
 
@@ -224,7 +243,7 @@ mod tests {
             "env": {"A": "1"},
             "secrets": {"SECRET": "sk-xxx"}
         }"#).unwrap();
-        let json_str = build_sandbox_spec_json(&spec, None);
+        let json_str = build_sandbox_spec_json(&spec, None, None);
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["env"]["A"], "1");
         assert_eq!(v["env"]["SECRET"], "sk-xxx");
@@ -238,7 +257,7 @@ mod tests {
             "cmd": ["true"],
             "stop-grace-seconds": 42
         }"#).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&build_sandbox_spec_json(&spec, None)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&build_sandbox_spec_json(&spec, None, None)).unwrap();
         assert_eq!(v["stop-grace-seconds"], 42);
     }
 
@@ -250,7 +269,7 @@ mod tests {
             "env": {"K": "from-env"},
             "secrets": {"K": "from-secret"}
         }"#).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&build_sandbox_spec_json(&spec, None)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&build_sandbox_spec_json(&spec, None, None)).unwrap();
         // secrets overlay env: secret value wins (it's additive from secret store)
         assert_eq!(v["env"]["K"], "from-secret");
     }
@@ -264,7 +283,7 @@ mod tests {
             "cmd": ["true"]
         }"#).unwrap();
         let v: serde_json::Value =
-            serde_json::from_str(&build_sandbox_spec_json(&spec, None)).unwrap();
+            serde_json::from_str(&build_sandbox_spec_json(&spec, None, None)).unwrap();
         assert!(v["env"].get("HTTP_PROXY").is_none());
         assert!(v["env"].get("HTTPS_PROXY").is_none());
         assert!(v["env"].get("NO_PROXY").is_none());
@@ -278,7 +297,7 @@ mod tests {
         }"#).unwrap();
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let v: serde_json::Value =
-            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr), None)).unwrap();
         assert_eq!(v["env"]["HTTP_PROXY"], "http://127.0.0.1:8080");
         assert_eq!(v["env"]["HTTPS_PROXY"], "http://127.0.0.1:8080");
         assert_eq!(v["env"]["http_proxy"], "http://127.0.0.1:8080");
@@ -296,7 +315,7 @@ mod tests {
         }"#).unwrap();
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         let v: serde_json::Value =
-            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr), None)).unwrap();
         assert_eq!(v["env"]["HTTPS_PROXY"], "http://127.0.0.1:9000");
     }
 
@@ -308,7 +327,7 @@ mod tests {
         }"#).unwrap();
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let v: serde_json::Value =
-            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr), None)).unwrap();
         assert_eq!(v["env"]["NO_PROXY"], "localhost,127.0.0.1");
         assert_eq!(v["env"]["no_proxy"], "localhost,127.0.0.1");
     }
@@ -323,7 +342,7 @@ mod tests {
         }"#).unwrap();
         let addr: SocketAddr = "169.254.42.1:34567".parse().unwrap();
         let v: serde_json::Value =
-            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr), None)).unwrap();
         assert_eq!(v["env"]["HTTPS_PROXY"], "http://169.254.42.1:34567");
         assert_eq!(v["env"]["HTTP_PROXY"], "http://169.254.42.1:34567");
     }
@@ -339,8 +358,63 @@ mod tests {
         }"#).unwrap();
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let v: serde_json::Value =
-            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr), None)).unwrap();
         assert_eq!(v["env"]["NO_PROXY"], "localhost,internal.example");
+    }
+
+    // ── Cycle 10g: guest network bring-up info ────────────────────────────
+
+    #[test]
+    fn build_sandbox_spec_json_with_net_includes_network_block() {
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"]
+        }"#).unwrap();
+        let net = RunNetwork {
+            host: "169.254.42.1".parse().unwrap(),
+            guest: "169.254.42.2".parse().unwrap(),
+            prefix_len: 30,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, None, Some(net))).unwrap();
+        assert_eq!(v["network"]["guest-ip"], "169.254.42.2");
+        assert_eq!(v["network"]["host-ip"], "169.254.42.1");
+        assert_eq!(v["network"]["prefix-len"], 30);
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_without_net_omits_network_block() {
+        // The smoke-test path (and macOS host supervisor) ships no per-Run
+        // network. The guest must accept that and leave eth0 down.
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"]
+        }"#).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, None, None)).unwrap();
+        assert!(v.get("network").is_none());
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_net_and_proxy_addr_compose() {
+        // The host side wires both pieces at once: the env carries the proxy
+        // URL, the network block carries the addresses the guest needs to
+        // bring eth0 up so that URL is reachable.
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"]
+        }"#).unwrap();
+        let net = RunNetwork {
+            host: "169.254.1.1".parse().unwrap(),
+            guest: "169.254.1.2".parse().unwrap(),
+            prefix_len: 30,
+        };
+        let addr: SocketAddr = "169.254.1.1:8080".parse().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr), Some(net))).unwrap();
+        assert_eq!(v["env"]["HTTPS_PROXY"], "http://169.254.1.1:8080");
+        assert_eq!(v["network"]["host-ip"], "169.254.1.1");
+        assert_eq!(v["network"]["guest-ip"], "169.254.1.2");
     }
 
     // ── Cycle 4: vsock path derivation ────────────────────────────────────

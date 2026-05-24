@@ -23,6 +23,8 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::network::GuestNetwork;
+
 /// Toggled on at startup if the kernel cmdline contains `crucible_init_debug=1`.
 /// When false, [`dbg`] is a no-op.
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -68,6 +70,10 @@ struct InitSpec {
     env: HashMap<String, String>,
     #[serde(default = "default_grace")]
     stop_grace_seconds: u64,
+    /// Per-Run network for `eth0`. Absent on host-supervisor Runs that don't
+    /// configure a TAP (e.g. the smoke test).
+    #[serde(default)]
+    network: Option<GuestNetwork>,
 }
 
 fn default_grace() -> u64 { 10 }
@@ -86,6 +92,22 @@ pub fn run() -> ! {
         .expect("invalid spec JSON");
 
     mount_workspace();
+
+    // Bring up eth0 if the host configured a per-Run network. Failure is
+    // logged but not fatal: the L7 proxy address injected as HTTPS_PROXY
+    // will simply be unreachable, and the agent will see a connection
+    // error. The L3 enforcement layer that makes the network load-bearing
+    // is a follow-up slice.
+    if let Some(net) = spec.network.as_ref() {
+        dbg(&format!(
+            "configuring eth0: guest={} host={} prefix={}",
+            net.guest_ip, net.host_ip, net.prefix_len
+        ));
+        if let Err(e) = crate::network::configure_eth0(net) {
+            eprintln!("crucible-init: configure_eth0 failed: {e}");
+            dbg(&format!("configure_eth0 failed: {e}"));
+        }
+    }
 
     // Connect stdout/stderr before forking so sockets are ready.
     let stdout_vsock = vsock_connect(VMADDR_CID_HOST, crate::VSOCK_STDOUT_PORT)

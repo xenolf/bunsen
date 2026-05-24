@@ -1,4 +1,5 @@
 mod cmdline;
+mod network;
 
 pub const VSOCK_STDOUT_PORT: u32 = 5001;
 pub const VSOCK_STDERR_PORT: u32 = 5002;

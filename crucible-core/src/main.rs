@@ -258,7 +258,7 @@ async fn run_sandbox(
         }
     };
 
-    let sandbox_spec_json = sandbox::build_sandbox_spec_json(spec, proxy_addr);
+    let sandbox_spec_json = sandbox::build_sandbox_spec_json(spec, proxy_addr, Some(net));
 
     let config = SandboxConfig {
         kernel_path: kernel,
