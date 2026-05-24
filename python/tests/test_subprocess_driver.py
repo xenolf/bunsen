@@ -69,6 +69,24 @@ async def test_unknown_event_type_becomes_unknown_event():
 
 
 @pytest.mark.asyncio
+async def test_egress_denied_event_decoded_with_typed_fields():
+    import crucible
+    from crucible._events import EgressDenied
+
+    spec = {"adapter": "claude-code", "cmd": ["claude"]}
+    denials = []
+    async with crucible.run(spec, _core_bin=stub_bin("egress_denied")) as run:
+        async for event in run.events:
+            if isinstance(event, EgressDenied):
+                denials.append(event)
+
+    assert len(denials) == 1
+    assert denials[0].destination == "github.com"
+    assert denials[0].protocol == "https"
+    assert denials[0].reason == "not in allowlist"
+
+
+@pytest.mark.asyncio
 async def test_schema_version_too_high_raises():
     import crucible
     from crucible._events import SchemaVersionError

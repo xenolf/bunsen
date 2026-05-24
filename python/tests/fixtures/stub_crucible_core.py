@@ -64,6 +64,17 @@ if mode == "unknown_event":
           "type": "run_ended", "reason": "agent_exit", "exit_code": 0})
     sys.exit(0)
 
+if mode == "egress_denied":
+    emit({**base, "seq": 0, "ts": "2026-01-01T00:00:00.000Z",
+          "type": "run_started", "adapter": "claude-code", "workspace_path": WORKSPACE,
+          "transcript_path": TRANSCRIPT})
+    emit({**base, "seq": 1, "ts": "2026-01-01T00:00:01.000Z",
+          "type": "egress_denied", "destination": "github.com",
+          "protocol": "https", "reason": "not in allowlist"})
+    emit({**base, "seq": 2, "ts": "2026-01-01T00:00:02.000Z",
+          "type": "run_ended", "reason": "agent_exit", "exit_code": 0})
+    sys.exit(0)
+
 if mode == "redact":
     emit({**base, "seq": 0, "ts": "2026-01-01T00:00:00.000Z",
           "type": "run_started", "adapter": "black-box", "workspace_path": WORKSPACE,

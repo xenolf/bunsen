@@ -63,12 +63,24 @@ The copy is best-effort: if the directory doesn't exist, no error is raised.
 
 ## Declared egress endpoints
 
-Each Adapter declares the network endpoints it requires. These form the base Egress Policy for a Run (Slice 10 enforces them). Additional domains can be added per-Run by the User Script.
+Each Adapter declares the network endpoints it requires. These form the base Egress Policy for a Run (Slice 10 enforces them). Additional domains can be added per-Run by the User Script via the `egress-endpoints` field on the RunSpec.
+
+The effective Egress Policy is the case-insensitive union of the adapter's declared endpoints and the user-script additions. Matching is exact-FQDN (no wildcards in v1) — a Run that needs `api.github.com` must list it explicitly.
 
 | Adapter | Required endpoints |
 |---|---|
 | `claude-code` | `api.anthropic.com` |
 | `aider` | depends on configured model |
+
+Composition is implemented by `RunSpec::effective_egress_policy()` (see `crucible-core/src/egress.rs`).
+
+When a Run attempts a destination outside the policy, the enforcer emits an `egress_denied` event:
+
+```json
+{"type": "egress_denied", "destination": "github.com", "protocol": "https", "reason": "not in allowlist"}
+```
+
+`protocol` is one of `http`, `https`, `raw_tcp` (L3 nftables drop), or `dns`. Per ADR-0003 these events do *not* terminate the Run; the agent receives a normal network error and decides what to do. User Scripts that want hard-fail subscribe to `EgressDenied` and call `run.stop()`.
 
 ## OCI image
 

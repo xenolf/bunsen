@@ -41,6 +41,13 @@ class Output(_Base):
 
 
 @dataclass
+class EgressDenied(_Base):
+    destination: str = ""
+    protocol: str = ""  # "http" | "https" | "raw_tcp" | "dns"
+    reason: str = ""
+
+
+@dataclass
 class UnknownEvent(_Base):
     type: str = ""
     raw: dict = field(default_factory=dict)
@@ -52,6 +59,7 @@ _KNOWN_FIELDS: dict[str, set[str]] = {
     "run_started": {"adapter", "workspace_path", "transcript_path"},
     "run_ended": {"reason", "exit_code", "signal", "error"},
     "output": {"stream", "text"},
+    "egress_denied": {"destination", "protocol", "reason"},
 }
 
 
@@ -74,7 +82,12 @@ def decode_event(raw: dict) -> _Base:
     if known is not None:
         extra = {k: v for k, v in raw.items() if k not in _KNOWN_ENVELOPE and k not in known}
         variant_kwargs = {k: raw[k] for k in known if k in raw}
-        cls = {"run_started": RunStarted, "run_ended": RunEnded, "output": Output}[etype]
+        cls = {
+            "run_started": RunStarted,
+            "run_ended": RunEnded,
+            "output": Output,
+            "egress_denied": EgressDenied,
+        }[etype]
         return cls(**base_kwargs, extra=extra, **variant_kwargs)  # type: ignore[call-arg]
     else:
         extra_fields = {k: v for k, v in raw.items() if k not in _KNOWN_ENVELOPE}

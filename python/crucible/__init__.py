@@ -4,13 +4,13 @@ from typing import Optional
 from ._core_path import find_core_bin
 from ._run import _AsyncRunContext, _SyncRunContext
 from ._events import (
-    RunStarted, RunEnded, Output, UnknownEvent,
+    RunStarted, RunEnded, Output, EgressDenied, UnknownEvent,
     SchemaVersionError, SCHEMA_VERSION,
 )
 
 __all__ = [
     "run", "run_sync",
-    "RunStarted", "RunEnded", "Output", "UnknownEvent",
+    "RunStarted", "RunEnded", "Output", "EgressDenied", "UnknownEvent",
     "SchemaVersionError", "SCHEMA_VERSION",
 ]
 

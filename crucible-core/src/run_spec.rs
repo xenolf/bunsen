@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use crate::egress::EgressPolicy;
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct RunSpec {
@@ -26,6 +28,10 @@ pub struct RunSpec {
     pub workspace_disk_mb: u32,
     #[serde(default)]
     pub oci_image: Option<String>,
+    /// User-Script-supplied egress allowlist additions. Composed with the
+    /// adapter's declared endpoints by [`RunSpec::effective_egress_policy`].
+    #[serde(default)]
+    pub egress_endpoints: Vec<String>,
 }
 
 fn default_stop_grace_seconds() -> u64 { 10 }
@@ -37,6 +43,18 @@ fn default_workspace_disk_mb() -> u32 { 10240 }
 impl RunSpec {
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(s)
+    }
+
+    /// Compose the effective Egress Policy for this Run: the adapter's
+    /// declared required endpoints unioned with `spec.egress_endpoints`.
+    /// Unknown adapters contribute no declared endpoints — the User Script
+    /// is responsible for the entire allowlist.
+    pub fn effective_egress_policy(&self) -> EgressPolicy {
+        let adapter_declared: &[&str] = match self.adapter.as_str() {
+            "claude-code" => crate::claude_code_adapter::EGRESS_ENDPOINTS,
+            _ => &[],
+        };
+        EgressPolicy::compose(adapter_declared, &self.egress_endpoints)
     }
 }
 
@@ -91,5 +109,52 @@ mod tests {
     fn oci_image_absent_in_run_spec() {
         let spec = RunSpec::from_json(r#"{"adapter":"black-box","cmd":["echo"]}"#).unwrap();
         assert!(spec.oci_image.is_none());
+    }
+
+    // ── Slice 10a: egress endpoints ───────────────────────────────────────
+
+    #[test]
+    fn egress_endpoints_default_empty() {
+        let spec = RunSpec::from_json(r#"{"adapter":"black-box","cmd":["echo"]}"#).unwrap();
+        assert!(spec.egress_endpoints.is_empty());
+    }
+
+    #[test]
+    fn egress_endpoints_parsed_kebab_case() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"black-box","cmd":["x"],"egress-endpoints":["github.com","pypi.org"]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.egress_endpoints, vec!["github.com", "pypi.org"]);
+    }
+
+    #[test]
+    fn effective_policy_for_claude_code_includes_anthropic_default() {
+        let spec = RunSpec::from_json(r#"{"adapter":"claude-code","cmd":["claude"]}"#).unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.anthropic.com"));
+        assert!(!policy.allows("github.com"));
+    }
+
+    #[test]
+    fn effective_policy_unions_adapter_and_user_additions() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"claude-code","cmd":["claude"],"egress-endpoints":["github.com"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.anthropic.com"));
+        assert!(policy.allows("github.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_unknown_adapter_is_user_only() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"black-box","cmd":["x"],"egress-endpoints":["pypi.org"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("pypi.org"));
+        assert!(!policy.allows("api.anthropic.com"));
     }
 }
