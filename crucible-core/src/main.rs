@@ -205,9 +205,35 @@ async fn run_sandbox(
 ) -> std::io::Result<()> {
     use firecracker::{create_workspace_ext4_from_dir, extract_workspace_from_ext4, start_firecracker};
     use sandbox::SandboxConfig;
+    use sandbox_supervisor::EgressContext;
 
     let fc_bin = firecracker_bin.unwrap_or_else(|| std::path::PathBuf::from("firecracker"));
-    let sandbox_spec_json = sandbox::build_sandbox_spec_json(spec);
+
+    // ── L7 egress proxy ────────────────────────────────────────────────────
+    // Bind the proxy *before* building the spec JSON so the bound SocketAddr
+    // can be injected as HTTP_PROXY / HTTPS_PROXY in the guest's env. For
+    // now we bind on 127.0.0.1:0; the per-Run veth-local IP that L3 nftables
+    // will redirect guest traffic to is a future slice.
+    let policy = spec.effective_egress_policy();
+    let (denied_tx, denied_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (proxy_addr, proxy_handle) = match egress_proxy::spawn_listener(
+        "127.0.0.1:0".parse().expect("static addr"),
+        policy,
+        denied_tx,
+    )
+    .await
+    {
+        Ok((addr, h)) => {
+            eprintln!("[egress] L7 proxy listening on {addr}");
+            (Some(addr), Some(h))
+        }
+        Err(e) => {
+            eprintln!("[egress] failed to start proxy listener: {e}");
+            (None, None)
+        }
+    };
+
+    let sandbox_spec_json = sandbox::build_sandbox_spec_json(spec, proxy_addr);
 
     let config = SandboxConfig {
         kernel_path: kernel,
@@ -233,7 +259,11 @@ async fn run_sandbox(
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))?;
 
-    let result = sandbox_supervisor::run(&mut handle, spec, enc).await;
+    let egress_ctx = EgressContext {
+        denied_rx,
+        listener: proxy_handle,
+    };
+    let result = sandbox_supervisor::run(&mut handle, spec, enc, egress_ctx).await;
 
     // After VM exits, extract workspace files back to the host path.
     if workspace_ext4.exists() {

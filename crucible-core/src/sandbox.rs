@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -103,11 +104,30 @@ pub fn build_boot_args(spec_json: &str) -> String {
 /// The guest init understands `cmd`, `env`, and `stop-grace-seconds`.
 /// Secrets are merged into `env` so the init exports them as env vars on the agent.
 /// The top-level `secrets` field is deliberately omitted.
-pub fn build_sandbox_spec_json(spec: &RunSpec) -> String {
+///
+/// When `proxy_addr` is `Some(addr)`, the L7 egress proxy URL is injected as
+/// `HTTP_PROXY` / `HTTPS_PROXY` (and lowercase variants) so well-behaved
+/// agents route HTTP(S) through the proxy. The proxy URL overrides any
+/// user-supplied value — the proxy is the security boundary, not a hint.
+/// `NO_PROXY` is set to `localhost,127.0.0.1` only when the user has not
+/// supplied their own value.
+pub fn build_sandbox_spec_json(spec: &RunSpec, proxy_addr: Option<SocketAddr>) -> String {
     let mut env = spec.env.clone();
     // Secrets overlay env (secrets win on collision).
     for (k, v) in &spec.secrets {
         env.insert(k.clone(), v.clone());
+    }
+    if let Some(addr) = proxy_addr {
+        let url = format!("http://{addr}");
+        // Force the proxy variables — the agent must not be able to opt out.
+        for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            env.insert(k.to_string(), url.clone());
+        }
+        // Localhost bypass is a usability default; let users override.
+        for k in ["NO_PROXY", "no_proxy"] {
+            env.entry(k.to_string())
+                .or_insert_with(|| "localhost,127.0.0.1".to_string());
+        }
     }
     let obj = serde_json::json!({
         "cmd": spec.cmd,
@@ -200,7 +220,7 @@ mod tests {
             "env": {"A": "1"},
             "secrets": {"SECRET": "sk-xxx"}
         }"#).unwrap();
-        let json_str = build_sandbox_spec_json(&spec);
+        let json_str = build_sandbox_spec_json(&spec, None);
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["env"]["A"], "1");
         assert_eq!(v["env"]["SECRET"], "sk-xxx");
@@ -214,7 +234,7 @@ mod tests {
             "cmd": ["true"],
             "stop-grace-seconds": 42
         }"#).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&build_sandbox_spec_json(&spec)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&build_sandbox_spec_json(&spec, None)).unwrap();
         assert_eq!(v["stop-grace-seconds"], 42);
     }
 
@@ -226,9 +246,82 @@ mod tests {
             "env": {"K": "from-env"},
             "secrets": {"K": "from-secret"}
         }"#).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&build_sandbox_spec_json(&spec)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&build_sandbox_spec_json(&spec, None)).unwrap();
         // secrets overlay env: secret value wins (it's additive from secret store)
         assert_eq!(v["env"]["K"], "from-secret");
+    }
+
+    // ── Cycle 10d: HTTP_PROXY / HTTPS_PROXY env injection ──────────────────
+
+    #[test]
+    fn build_sandbox_spec_json_no_proxy_addr_leaves_proxy_env_unset() {
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"]
+        }"#).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, None)).unwrap();
+        assert!(v["env"].get("HTTP_PROXY").is_none());
+        assert!(v["env"].get("HTTPS_PROXY").is_none());
+        assert!(v["env"].get("NO_PROXY").is_none());
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_with_proxy_injects_http_and_https_proxy() {
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"]
+        }"#).unwrap();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
+        assert_eq!(v["env"]["HTTP_PROXY"], "http://127.0.0.1:8080");
+        assert_eq!(v["env"]["HTTPS_PROXY"], "http://127.0.0.1:8080");
+        assert_eq!(v["env"]["http_proxy"], "http://127.0.0.1:8080");
+        assert_eq!(v["env"]["https_proxy"], "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_with_proxy_overrides_user_supplied_proxy_env() {
+        // The proxy is the security boundary; an agent (or user) cannot opt
+        // out by setting HTTPS_PROXY in the spec env.
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"],
+            "env": {"HTTPS_PROXY": "http://evil.example:1"}
+        }"#).unwrap();
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
+        assert_eq!(v["env"]["HTTPS_PROXY"], "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_with_proxy_sets_default_no_proxy_when_unset() {
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"]
+        }"#).unwrap();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
+        assert_eq!(v["env"]["NO_PROXY"], "localhost,127.0.0.1");
+        assert_eq!(v["env"]["no_proxy"], "localhost,127.0.0.1");
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_with_proxy_preserves_user_no_proxy() {
+        // NO_PROXY is a usability hint, not a security control — the user
+        // can extend it (e.g. add their internal mirror).
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "black-box",
+            "cmd": ["true"],
+            "env": {"NO_PROXY": "localhost,internal.example"}
+        }"#).unwrap();
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, Some(addr))).unwrap();
+        assert_eq!(v["env"]["NO_PROXY"], "localhost,internal.example");
     }
 
     // ── Cycle 4: vsock path derivation ────────────────────────────────────

@@ -16,6 +16,16 @@ use crate::encoder::Encoder;
 use crate::firecracker::FirecrackerHandle;
 use crate::run_spec::RunSpec;
 
+/// Pre-bound L7 egress machinery handed to [`run`] by the caller. The proxy
+/// listener is bound *before* the VM starts so the bound `SocketAddr` can be
+/// injected into the guest's env (`HTTP_PROXY` / `HTTPS_PROXY`). The
+/// supervisor takes ownership of the receive half of the denial channel and
+/// the listener task handle for the duration of the Run.
+pub struct EgressContext {
+    pub denied_rx: mpsc::UnboundedReceiver<DenialEvent>,
+    pub listener: Option<tokio::task::JoinHandle<()>>,
+}
+
 #[derive(Debug)]
 enum ControlCmd {
     Stop,
@@ -40,30 +50,10 @@ pub async fn run(
     handle: &mut FirecrackerHandle,
     spec: &RunSpec,
     encoder: &mut Encoder,
+    egress: EgressContext,
 ) -> Result<()> {
-    // ── L7 egress proxy ────────────────────────────────────────────────────
-    // Spawn the per-Run forward proxy. For now we bind on 127.0.0.1:0; the
-    // veth-local IP that L3 nftables will redirect guest traffic to is a
-    // future slice. Denials land on `denied_rx` and are fused into the
-    // event stream by the main loop below.
-    let policy = spec.effective_egress_policy();
-    let (denied_tx, mut denied_rx) = mpsc::unbounded_channel::<DenialEvent>();
-    let proxy_handle = match egress_proxy::spawn_listener(
-        "127.0.0.1:0".parse().expect("static addr"),
-        policy,
-        denied_tx,
-    )
-    .await
-    {
-        Ok((addr, h)) => {
-            eprintln!("[egress] L7 proxy listening on {addr}");
-            Some(h)
-        }
-        Err(e) => {
-            eprintln!("[egress] failed to start proxy listener: {e}");
-            None
-        }
-    };
+    let mut denied_rx = egress.denied_rx;
+    let proxy_handle = egress.listener;
 
     // Control commands from crucible-core's stdin.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCmd>(16);
