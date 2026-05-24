@@ -1,6 +1,7 @@
 mod adapter;
 mod claude_code_adapter;
 mod egress;
+mod egress_proxy;
 mod encoder;
 mod events;
 mod oci_cache;
