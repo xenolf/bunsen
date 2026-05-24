@@ -79,12 +79,22 @@ pub struct SandboxConfig {
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 /// Build the kernel boot args string, embedding the spec as base64.
+///
+/// When the host process has `CRUCIBLE_INIT_DEBUG=1` in its environment, append
+/// `crucible_init_debug=1` so the guest init writes a per-run init.log to
+/// /workspace. Off by default — the diagnostics are noisy and meant for
+/// development.
 pub fn build_boot_args(spec_json: &str) -> String {
     let encoded = STANDARD.encode(spec_json.as_bytes());
+    let debug = if std::env::var("CRUCIBLE_INIT_DEBUG").as_deref() == Ok("1") {
+        " crucible_init_debug=1"
+    } else {
+        ""
+    };
     format!(
         "console=ttyS0 reboot=k panic=1 pci=off nomodule \
          root=/dev/vda rw init=/sbin/crucible-init \
-         crucible_spec={encoded}"
+         crucible_spec={encoded}{debug}"
     )
 }
 

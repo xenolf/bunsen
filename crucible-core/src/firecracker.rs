@@ -102,10 +102,15 @@ pub async fn start_firecracker(
     // 4. Spawn Firecracker — redirect its stderr to our stderr so boot errors are visible.
     let fc_log = run_dir.join("firecracker.log");
     eprintln!("[fc] spawning firecracker (log: {})", fc_log.display());
+    // FC stdout = guest serial console (init's stdout/stderr flow here via kernel).
+    // Capture it to a separate file so init panics and boot errors are visible.
+    let console_log_path = run_dir.join("console.log");
+    let console_log = std::fs::File::create(&console_log_path).context("create console log")?;
+    eprintln!("[fc] console log: {}", console_log_path.display());
     let process = Command::new(firecracker_bin)
         .args(["--api-sock", &api_socket.to_string_lossy()])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(console_log)
         .stderr(std::fs::File::create(&fc_log).context("create fc log")?)
         .spawn()
         .context("spawn firecracker")?;

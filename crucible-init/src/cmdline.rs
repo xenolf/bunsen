@@ -11,6 +11,11 @@ pub fn extract_spec(cmdline: &str) -> Option<String> {
     None
 }
 
+/// True if the kernel cmdline contains `crucible_init_debug=1`.
+pub fn debug_enabled(cmdline: &str) -> bool {
+    cmdline.split_whitespace().any(|t| t == "crucible_init_debug=1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -39,5 +44,18 @@ mod tests {
     #[test]
     fn extract_spec_ignores_invalid_base64() {
         assert!(extract_spec("crucible_spec=!!!invalid!!!").is_none());
+    }
+
+    #[test]
+    fn debug_enabled_detects_token() {
+        assert!(debug_enabled("console=ttyS0 crucible_init_debug=1 rw"));
+        assert!(debug_enabled("crucible_init_debug=1"));
+    }
+
+    #[test]
+    fn debug_enabled_false_when_absent_or_other_value() {
+        assert!(!debug_enabled("console=ttyS0 rw"));
+        assert!(!debug_enabled("crucible_init_debug=0"));
+        assert!(!debug_enabled("crucible_init_debug=true"));
     }
 }
