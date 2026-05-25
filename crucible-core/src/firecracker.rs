@@ -454,6 +454,59 @@ pub async fn delete_nftables_table(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Spawn the L3 drop-log emitter task.
+///
+/// Runs `journalctl -k -f --output=cat --since=now`, which streams the kernel
+/// ring buffer line-by-line. Each line is fed through
+/// [`crate::sandbox_nft::pump_drop_log_lines`], which filters by the per-Run
+/// table name embedded in the prefix and forwards matches as
+/// [`crate::egress::DenialEvent`]s on `sender` — the same channel the L7 proxy
+/// already uses, so both denial sources fuse into one `egress_denied` stream
+/// inside [`crate::sandbox_supervisor`].
+///
+/// The journalctl child uses `kill_on_drop(true)`: aborting the returned
+/// [`tokio::task::JoinHandle`] drops the task, which drops the [`Child`],
+/// which kills journalctl. Aborting the handle is therefore enough to tear
+/// the whole pipeline down on Run end.
+///
+/// `journalctl` is preferred over `/dev/kmsg` because the latter requires
+/// `CAP_SYS_ADMIN` (or root with seek privileges) and would not work on the
+/// unprivileged dev path we ship today. The trade-off is the systemd
+/// dependency; an installer doc slice will spell this out.
+pub fn spawn_drop_log_emitter(
+    table_name: String,
+    sender: tokio::sync::mpsc::UnboundedSender<crate::egress::DenialEvent>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let mut child = Command::new("journalctl")
+        .args(["-k", "-f", "--output=cat", "--since=now"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn journalctl -k -f for L3 drop-log tail")?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("journalctl child has no stdout pipe"))?;
+
+    Ok(tokio::spawn(async move {
+        // Keep the child alive for the lifetime of this task. kill_on_drop
+        // takes care of teardown when the task is aborted or the future
+        // resolves.
+        let reader = tokio::io::BufReader::new(stdout);
+        if let Err(e) = crate::sandbox_nft::pump_drop_log_lines(reader, &table_name, sender).await {
+            eprintln!("[egress] drop-log pump exited with error: {e:#}");
+        }
+        // Best-effort: try to reap the child once the pump exits. If the task
+        // is being aborted (cleanup path), this won't run — that's fine
+        // because kill_on_drop fires from the destructor instead.
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }))
+}
+
 // ─── Workspace ext4 ────────────────────────────────────────────────────────
 
 /// Create an ext4 workspace image, pre-populating it from `source_dir` if

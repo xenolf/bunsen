@@ -207,7 +207,7 @@ async fn run_sandbox(
 ) -> std::io::Result<()> {
     use firecracker::{
         apply_nftables_ruleset, create_tap, delete_nftables_table, delete_tap,
-        extract_workspace_from_ext4, start_firecracker,
+        extract_workspace_from_ext4, spawn_drop_log_emitter, start_firecracker,
     };
     use sandbox::SandboxConfig;
     use sandbox_net::{derive_run_network, derive_tap_name};
@@ -245,6 +245,10 @@ async fn run_sandbox(
     // proxy presence load-bearing.
     let policy = spec.effective_egress_policy();
     let (denied_tx, denied_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Keep a sender clone for the L3 drop-log task (spawned below). The proxy
+    // takes its own clone; once both producers exit, the supervisor's
+    // `denied_rx.recv()` returns None and the select arm flips off.
+    let drop_log_tx = denied_tx.clone();
     let proxy_bind: SocketAddr = SocketAddr::from((net.host, 0));
     let (proxy_addr, proxy_handle) = match egress_proxy::spawn_listener(
         proxy_bind,
@@ -275,17 +279,49 @@ async fn run_sandbox(
     // Defensive: clean up any leftover table from a previous crashed Run
     // with the same id before reloading.
     let _ = delete_nftables_table(&nft_table).await;
+    let mut nft_loaded = false;
     if let Some(addr) = proxy_addr {
         let rules = build_ruleset(&nft_table, &tap_name, net.host, addr.port());
         eprintln!("[egress] loading nftables table {nft_table}");
-        if let Err(e) = apply_nftables_ruleset(&rules).await {
-            eprintln!("[egress] WARNING: failed to load L3 nftables rules: {e:#}");
+        match apply_nftables_ruleset(&rules).await {
+            Ok(()) => nft_loaded = true,
+            Err(e) => {
+                eprintln!("[egress] WARNING: failed to load L3 nftables rules: {e:#}");
+            }
         }
     } else {
         eprintln!(
             "[egress] proxy not bound — skipping L3 nftables rules (no enforcement this Run)"
         );
     }
+
+    // ── L3 drop-log side-channel ──────────────────────────────────────────
+    // Tail `journalctl -k -f` and forward drops whose table matches this
+    // Run's nft table as DenialEvents on the same channel the L7 proxy uses,
+    // so the supervisor's existing select-arm emits them uniformly as
+    // `egress_denied(protocol=raw_tcp)`. Only started when the ruleset
+    // actually loaded — without rules, the kernel has nothing to log.
+    let drop_log_handle = if nft_loaded {
+        match spawn_drop_log_emitter(nft_table.clone(), drop_log_tx) {
+            Ok(h) => {
+                eprintln!("[egress] drop-log emitter watching table {nft_table}");
+                Some(h)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[egress] WARNING: failed to start drop-log emitter: {e:#} \
+                     — L3 drops will not produce egress_denied events"
+                );
+                None
+            }
+        }
+    } else {
+        // No nft rules loaded → no kernel-log lines to tail. Drop the unused
+        // sender so the supervisor's denial channel can close cleanly when
+        // the proxy task exits.
+        drop(drop_log_tx);
+        None
+    };
 
     let sandbox_spec_json = sandbox::build_sandbox_spec_json(spec, proxy_addr, Some(net));
 
@@ -317,6 +353,7 @@ async fn run_sandbox(
     let egress_ctx = EgressContext {
         denied_rx,
         listener: proxy_handle,
+        drop_log: drop_log_handle,
     };
     let result = sandbox_supervisor::run(&mut handle, spec, enc, egress_ctx).await;
 

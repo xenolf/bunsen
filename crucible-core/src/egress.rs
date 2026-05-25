@@ -50,6 +50,18 @@ impl Protocol {
     }
 }
 
+/// In-process denial record, produced by any egress enforcement path (L7
+/// proxy, L3 nftables drop tailer, future DNS resolver) and consumed by the
+/// Run Supervisor, which converts it into a wire-level `egress_denied` event
+/// via [`denied_payload`]. Lives here rather than next to a single source so
+/// every source can build it without cross-importing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenialEvent {
+    pub destination: String,
+    pub protocol: Protocol,
+    pub reason: String,
+}
+
 /// Composed Egress Policy: adapter-declared endpoints unioned with
 /// user-script additions, deduplicated, lowercased.
 #[derive(Debug, Clone, PartialEq, Eq)]

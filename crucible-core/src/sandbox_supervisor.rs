@@ -11,19 +11,24 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use crate::adapter::BlackBoxAdapter;
-use crate::egress_proxy::{self, DenialEvent};
+use crate::egress::DenialEvent;
+use crate::egress_proxy;
 use crate::encoder::Encoder;
 use crate::firecracker::FirecrackerHandle;
 use crate::run_spec::RunSpec;
 
-/// Pre-bound L7 egress machinery handed to [`run`] by the caller. The proxy
+/// Pre-bound egress machinery handed to [`run`] by the caller. The L7 proxy
 /// listener is bound *before* the VM starts so the bound `SocketAddr` can be
-/// injected into the guest's env (`HTTP_PROXY` / `HTTPS_PROXY`). The
-/// supervisor takes ownership of the receive half of the denial channel and
-/// the listener task handle for the duration of the Run.
+/// injected into the guest's env (`HTTP_PROXY` / `HTTPS_PROXY`); the L3
+/// drop-log tail is started after nftables loads so kernel-log entries for
+/// blocked guest traffic surface as `egress_denied(protocol=raw_tcp)` events
+/// on the same wire as L7 denials. The supervisor owns the receive half of
+/// the shared denial channel and both task handles for the duration of the
+/// Run, and aborts the tasks on exit.
 pub struct EgressContext {
     pub denied_rx: mpsc::UnboundedReceiver<DenialEvent>,
     pub listener: Option<tokio::task::JoinHandle<()>>,
+    pub drop_log: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -54,6 +59,7 @@ pub async fn run(
 ) -> Result<()> {
     let mut denied_rx = egress.denied_rx;
     let proxy_handle = egress.listener;
+    let drop_log_handle = egress.drop_log;
 
     // Control commands from crucible-core's stdin.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCmd>(16);
@@ -159,6 +165,11 @@ pub async fn run(
             .map_err(|e| anyhow::anyhow!("encoder: {e}"))?;
     }
     if let Some(h) = proxy_handle {
+        h.abort();
+    }
+    if let Some(h) = drop_log_handle {
+        // Drops the task, which drops the journalctl `Child`; kill_on_drop
+        // takes the kernel-log tail down for us.
         h.abort();
     }
 

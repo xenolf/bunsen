@@ -12,9 +12,13 @@
 //! Linux-only `nft -f -` shell-out, cleanup, and kernel-log tailing live in
 //! [`crate::firecracker`] alongside the TAP lifecycle.
 
+use std::io;
 use std::net::Ipv4Addr;
 
-use crate::egress::Protocol;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::sync::mpsc;
+
+use crate::egress::{DenialEvent, Protocol};
 
 /// Derive a deterministic, nft-safe table name from a Run id.
 ///
@@ -160,6 +164,53 @@ pub fn parse_drop_log_line(line: &str) -> Option<DropEvent> {
 /// denial path) can produce similarly-formatted reasons.
 pub fn drop_event_reason(ev: &DropEvent) -> String {
     format!("L3 drop (proto={})", ev.l4_proto)
+}
+
+/// Drive a side-channel reader: read kernel-log lines from `reader`, parse
+/// each with [`parse_drop_log_line`], and forward matches whose
+/// [`DropEvent::table`] equals `own_table` as [`DenialEvent`]s on `sender`.
+///
+/// The Run Supervisor already drains a [`DenialEvent`] channel emitted by the
+/// L7 proxy (see [`crate::egress_proxy`]); this lets the L3 path share the
+/// same wire so both denial sources fuse into one `egress_denied` stream
+/// without changing the supervisor's select-loop shape.
+///
+/// Filtering by `own_table` is what makes a single host-wide kernel-log tail
+/// (e.g. `journalctl -k -f`) safe with concurrent Runs: each Run only emits
+/// events whose embedded table name matches its own.
+///
+/// Returns:
+/// - `Ok(())` on EOF (the reader's stream closed).
+/// - Early `Ok(())` if `sender` is closed — the consumer is gone, so there
+///   is no point continuing to read.
+/// - `Err(io::Error)` only on a read failure.
+pub async fn pump_drop_log_lines<R>(
+    reader: R,
+    own_table: &str,
+    sender: mpsc::UnboundedSender<DenialEvent>,
+) -> io::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        let Some(ev) = parse_drop_log_line(&line) else {
+            continue;
+        };
+        if ev.table != own_table {
+            continue;
+        }
+        let denial = DenialEvent {
+            destination: ev.destination.clone(),
+            protocol: ev.protocol,
+            reason: drop_event_reason(&ev),
+        };
+        if sender.send(denial).is_err() {
+            // Receiver dropped — Run is shutting down; stop tailing.
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -412,4 +463,142 @@ mod tests {
         assert!(r.contains("TCP"), "reason missing L4 proto: {r:?}");
         assert!(r.to_lowercase().contains("l3"), "reason should mention L3 origin: {r:?}");
     }
+
+    // ── pump_drop_log_lines ────────────────────────────────────────────────
+
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    fn synthetic_line(table: &str, dst: &str, dpt: Option<u16>, proto: &str) -> String {
+        let prefix = drop_log_prefix(table);
+        match dpt {
+            Some(p) => format!(
+                "{prefix}IN=tap-x OUT= SRC=169.254.1.2 DST={dst} PROTO={proto} DPT={p}\n"
+            ),
+            None => format!(
+                "{prefix}IN=tap-x OUT= SRC=169.254.1.2 DST={dst} PROTO={proto}\n"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_emits_denial_for_matching_table() {
+        let table = derive_table_name("01HXY00000000000");
+        let input = synthetic_line(&table, "8.8.8.8", Some(443), "TCP");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        pump_drop_log_lines(BufReader::new(input.as_bytes()), &table, tx)
+            .await
+            .expect("pump must finish cleanly on EOF");
+
+        let ev = rx.try_recv().expect("denial event expected");
+        assert_eq!(ev.destination, "8.8.8.8:443");
+        assert_eq!(ev.protocol, Protocol::RawTcp);
+        // Reason must follow the stable `drop_event_reason` shape so the host
+        // transcript shows a consistent reason across L3 drops.
+        assert!(ev.reason.contains("TCP"), "reason missing L4 proto: {:?}", ev.reason);
+        assert!(ev.reason.to_lowercase().contains("l3"), "reason: {:?}", ev.reason);
+        assert!(rx.try_recv().is_err(), "no extra event expected");
+    }
+
+    #[tokio::test]
+    async fn pump_filters_by_table_name() {
+        // Two Runs share a host. Only events whose embedded table matches
+        // *our* table should be forwarded — otherwise a single tail would
+        // cross-contaminate events between Runs.
+        let our_table = derive_table_name("OURS-1111111111");
+        let other_table = derive_table_name("OTHER-2222222222");
+        let mut input = String::new();
+        input.push_str(&synthetic_line(&other_table, "9.9.9.9", Some(443), "TCP"));
+        input.push_str(&synthetic_line(&our_table, "1.1.1.1", Some(80), "TCP"));
+        input.push_str(&synthetic_line(&other_table, "8.8.4.4", Some(53), "UDP"));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        pump_drop_log_lines(BufReader::new(input.as_bytes()), &our_table, tx)
+            .await
+            .expect("pump must finish cleanly on EOF");
+
+        let ev = rx.try_recv().expect("our event must come through");
+        assert_eq!(ev.destination, "1.1.1.1:80");
+        assert!(rx.try_recv().is_err(), "other tables must be filtered out");
+    }
+
+    #[tokio::test]
+    async fn pump_ignores_unrelated_lines() {
+        let table = derive_table_name("01HXY00000000000");
+        let mut input = String::new();
+        input.push_str("May 25 12:34:56 host kernel: usb 1-1: new high-speed USB device\n");
+        input.push_str("audit: type=1400 something\n");
+        input.push_str("\n");
+        // A line carrying the marker but missing DST= must also be skipped.
+        input.push_str(&format!(
+            "{}IN=tap-x OUT= PROTO=TCP DPT=443\n",
+            drop_log_prefix(&table)
+        ));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        pump_drop_log_lines(BufReader::new(input.as_bytes()), &table, tx)
+            .await
+            .expect("pump must finish cleanly on EOF");
+
+        assert!(rx.try_recv().is_err(), "no events expected from unrelated lines");
+    }
+
+    #[tokio::test]
+    async fn pump_returns_when_receiver_dropped() {
+        // If the consumer goes away mid-tail there is nothing useful to do:
+        // the pump must exit promptly rather than keep reading kernel log
+        // forever and accumulating dead sends. We use a "stuck" reader (an
+        // open duplex with no writer activity after the first matched line)
+        // to force the loop to traverse send-failure before EOF.
+        let table = derive_table_name("RUN0000000000000");
+        let (mut writer, reader) = tokio::io::duplex(4096);
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx); // close consumer before pump even reads
+
+        // Write one matching line; pump should try to send, observe a closed
+        // channel, and return. Without the early-exit the test would hang
+        // here on the next read.
+        let line = synthetic_line(&table, "8.8.8.8", Some(443), "TCP");
+        writer.write_all(line.as_bytes()).await.unwrap();
+
+        let pump = tokio::spawn(async move {
+            pump_drop_log_lines(BufReader::new(reader), &table, tx).await
+        });
+
+        // The pump should resolve quickly. If it hangs, this test will time
+        // out via the tokio test harness (and we'll know early-exit broke).
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), pump).await;
+        let inner = result
+            .expect("pump must not block once the receiver is gone")
+            .expect("pump task must not panic");
+        inner.expect("pump must return Ok on receiver-closed");
+
+        // Drop the writer; pump is already done.
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn pump_handles_multiple_matching_lines_in_order() {
+        let table = derive_table_name("ORDER0000000000");
+        let mut input = String::new();
+        input.push_str(&synthetic_line(&table, "1.1.1.1", Some(443), "TCP"));
+        input.push_str(&synthetic_line(&table, "2.2.2.2", Some(80), "TCP"));
+        input.push_str(&synthetic_line(&table, "3.3.3.3", None, "ICMP"));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        pump_drop_log_lines(BufReader::new(input.as_bytes()), &table, tx)
+            .await
+            .expect("pump must finish cleanly on EOF");
+
+        let e1 = rx.try_recv().expect("first event");
+        assert_eq!(e1.destination, "1.1.1.1:443");
+        let e2 = rx.try_recv().expect("second event");
+        assert_eq!(e2.destination, "2.2.2.2:80");
+        let e3 = rx.try_recv().expect("third event");
+        assert_eq!(e3.destination, "3.3.3.3");
+        assert!(e3.reason.contains("ICMP"), "reason should carry L4 proto: {:?}", e3.reason);
+        assert!(rx.try_recv().is_err(), "no extra events expected");
+    }
+
 }

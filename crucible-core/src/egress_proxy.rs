@@ -31,17 +31,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use crate::egress::{denied_payload, EgressPolicy, Protocol, EVENT_TYPE};
+use crate::egress::{denied_payload, DenialEvent, EgressPolicy, Protocol, EVENT_TYPE};
 use crate::encoder::Encoder;
-
-/// A proxy-side denial. The Run Supervisor converts this into an
-/// `egress_denied` event via [`crate::egress::denied_payload`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DenialEvent {
-    pub destination: String,
-    pub protocol: Protocol,
-    pub reason: String,
-}
 
 /// Parsed `CONNECT host:port HTTP/1.1` request line.
 #[derive(Debug, Clone, PartialEq, Eq)]
