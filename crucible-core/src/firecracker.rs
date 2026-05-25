@@ -405,6 +405,55 @@ pub async fn delete_tap(name: &str) -> Result<()> {
     Ok(())
 }
 
+// ─── nftables ruleset management ──────────────────────────────────────────
+
+/// Load an nftables ruleset by piping it into `nft -f -`.
+///
+/// The ruleset is expected to declare its own table (see
+/// [`crate::sandbox_nft::build_ruleset`]); the caller is responsible for
+/// generating one with a per-Run table name and for tearing it down with
+/// [`delete_nftables_table`] after the Run ends.
+pub async fn apply_nftables_ruleset(rules: &str) -> Result<()> {
+    let mut child = Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn nft")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(rules.as_bytes()).await.context("write nft rules")?;
+        stdin.flush().await.ok();
+        drop(stdin);
+    }
+
+    let output = child.wait_with_output().await.context("wait nft")?;
+    if !output.status.success() {
+        bail!(
+            "nft -f - failed (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Delete a per-Run nftables table by name. Idempotent: missing-table is not
+/// an error, since cleanup runs unconditionally on Run end and on pre-apply
+/// defensive cleanup from a previous crashed Run.
+pub async fn delete_nftables_table(name: &str) -> Result<()> {
+    // `nft delete table` returns non-zero if the table doesn't exist; swallow
+    // that case so callers can use this as an idempotent cleanup.
+    let _ = Command::new("nft")
+        .args(["delete", "table", "inet", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    Ok(())
+}
+
 // ─── Workspace ext4 ────────────────────────────────────────────────────────
 
 /// Create an ext4 workspace image, pre-populating it from `source_dir` if

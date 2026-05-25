@@ -10,6 +10,7 @@ mod run_dir;
 mod run_spec;
 mod sandbox;
 mod sandbox_net;
+mod sandbox_nft;
 mod supervisor;
 mod ulid;
 mod workspace_materializer;
@@ -204,9 +205,13 @@ async fn run_sandbox(
     enc: &mut encoder::Encoder,
     workspace_path: &std::path::Path,
 ) -> std::io::Result<()> {
-    use firecracker::{create_tap, delete_tap, extract_workspace_from_ext4, start_firecracker};
+    use firecracker::{
+        apply_nftables_ruleset, create_tap, delete_nftables_table, delete_tap,
+        extract_workspace_from_ext4, start_firecracker,
+    };
     use sandbox::SandboxConfig;
     use sandbox_net::{derive_run_network, derive_tap_name};
+    use sandbox_nft::{build_ruleset, derive_table_name};
     use sandbox_supervisor::EgressContext;
     use std::net::SocketAddr;
 
@@ -258,6 +263,30 @@ async fn run_sandbox(
         }
     };
 
+    // ── L3 egress enforcement (nftables) ───────────────────────────────────
+    // Default-deny on the TAP — only TCP to the L7 proxy address is allowed.
+    // Drops are logged with a per-Run prefix so a follow-up slice can emit
+    // egress_denied(protocol=raw_tcp) events from the kernel log. Only loaded
+    // when the proxy actually bound: without a proxy address there is no
+    // safe rule to allow, so loading the table here would render the guest
+    // completely offline (matches "fail-closed" intent but is too aggressive
+    // until the proxy is treated as mandatory in a later slice).
+    let nft_table = derive_table_name(run_id);
+    // Defensive: clean up any leftover table from a previous crashed Run
+    // with the same id before reloading.
+    let _ = delete_nftables_table(&nft_table).await;
+    if let Some(addr) = proxy_addr {
+        let rules = build_ruleset(&nft_table, &tap_name, net.host, addr.port());
+        eprintln!("[egress] loading nftables table {nft_table}");
+        if let Err(e) = apply_nftables_ruleset(&rules).await {
+            eprintln!("[egress] WARNING: failed to load L3 nftables rules: {e:#}");
+        }
+    } else {
+        eprintln!(
+            "[egress] proxy not bound — skipping L3 nftables rules (no enforcement this Run)"
+        );
+    }
+
     let sandbox_spec_json = sandbox::build_sandbox_spec_json(spec, proxy_addr, Some(net));
 
     let config = SandboxConfig {
@@ -297,6 +326,10 @@ async fn run_sandbox(
             eprintln!("[fc] workspace extraction warning: {e:#}");
         }
     }
+
+    // Remove the per-Run nftables table. Idempotent; safe even if loading
+    // earlier failed.
+    let _ = delete_nftables_table(&nft_table).await;
 
     result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))
 }
