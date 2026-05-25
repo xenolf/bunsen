@@ -29,6 +29,12 @@ pub struct EgressContext {
     pub denied_rx: mpsc::UnboundedReceiver<DenialEvent>,
     pub listener: Option<tokio::task::JoinHandle<()>>,
     pub drop_log: Option<tokio::task::JoinHandle<()>>,
+    /// Per-Run DNS listener (slice 10m). Bound on `net.host:53` when
+    /// privileges allow; absent on dev boxes that lack `CAP_NET_BIND_SERVICE`,
+    /// in which case the guest's `/etc/resolv.conf` will point at an address
+    /// nothing answers on, and DNS-only egress attempts surface as L3 drops
+    /// via the nftables ruleset.
+    pub dns_listener: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -60,6 +66,7 @@ pub async fn run(
     let mut denied_rx = egress.denied_rx;
     let proxy_handle = egress.listener;
     let drop_log_handle = egress.drop_log;
+    let dns_handle = egress.dns_listener;
 
     // Control commands from crucible-core's stdin.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCmd>(16);
@@ -170,6 +177,9 @@ pub async fn run(
     if let Some(h) = drop_log_handle {
         // Drops the task, which drops the journalctl `Child`; kill_on_drop
         // takes the kernel-log tail down for us.
+        h.abort();
+    }
+    if let Some(h) = dns_handle {
         h.abort();
     }
 

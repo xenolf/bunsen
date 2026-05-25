@@ -19,11 +19,21 @@
 //! reserved label-length forms (`01` / `10`). Loose parsing would let a
 //! hostile guest hide an allowed name behind a compression pointer.
 
-// dead_code: the parser, decision, and refused-response builder are public
-// API consumed by the next slice (UDP listener). Tests cover all of them.
+// dead_code: a few internal qtype constants + the upstream resolver fields
+// (used only through the trait) trip dead_code; the surface API of the
+// module — parser, decision, refused-builder, handler, listener — is all
+// consumed by run_sandbox + tests.
 #![allow(dead_code)]
 
-use crate::egress::EgressPolicy;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+
+use crate::egress::{DenialEvent, EgressPolicy, Protocol};
 
 /// Failure modes for [`parse_dns_query`]. Surfaced for tests + future
 /// structured logging; the UDP slice will respond with FORMERR for these
@@ -249,6 +259,186 @@ pub fn build_refused_response(query_bytes: &[u8]) -> Result<Vec<u8>, DnsParseErr
 /// converts a `DnsDecision::Deny` into a [`crate::egress::DenialEvent`].
 pub fn dns_event_reason(qtype: u16) -> String {
     format!("DNS query denied (qtype={qtype})")
+}
+
+// ─── Slice 10m: UDP listener + upstream resolver abstraction ─────────────
+
+/// Trait abstracting "send the query upstream and get bytes back". Production
+/// uses [`TokioUdpResolver`]; tests substitute fakes to keep the deny / allow
+/// shapes verifiable without a live recursive resolver.
+#[async_trait::async_trait]
+pub trait DnsResolver: Send + Sync {
+    /// Forward `query_bytes` to the upstream and return the upstream's
+    /// response bytes verbatim. An `Err` is treated as "upstream unavailable"
+    /// by the handler — symmetric with the L7 path's `502` on upstream
+    /// failure, no `DenialEvent` is emitted because this isn't a policy
+    /// rejection.
+    async fn resolve(&self, query_bytes: &[u8]) -> io::Result<Vec<u8>>;
+}
+
+/// Production [`DnsResolver`] that sends each query to a fixed upstream
+/// `(ip:port)` over UDP and reads back one response.
+///
+/// A fresh ephemeral source port is bound per query: long-lived sockets to a
+/// single upstream are unusual for DNS and would force serialization of
+/// outstanding queries. Per-query bind is cheap on Linux.
+pub struct TokioUdpResolver {
+    upstream: SocketAddr,
+    timeout: Duration,
+}
+
+impl TokioUdpResolver {
+    /// Default 5-second timeout. Matches stock `glibc` `RES_TIMEOUT` (`5s`),
+    /// which is what guest resolvers in the OCI image will be configured
+    /// with — picking a shorter value here would surface as a guest-side
+    /// timeout rather than a graceful upstream failure.
+    pub fn new(upstream: SocketAddr) -> Self {
+        Self {
+            upstream,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    pub fn with_timeout(mut self, t: Duration) -> Self {
+        self.timeout = t;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl DnsResolver for TokioUdpResolver {
+    async fn resolve(&self, query_bytes: &[u8]) -> io::Result<Vec<u8>> {
+        let bind: SocketAddr = if self.upstream.is_ipv6() {
+            "[::]:0".parse().expect("static literal")
+        } else {
+            "0.0.0.0:0".parse().expect("static literal")
+        };
+        let sock = UdpSocket::bind(bind).await?;
+        sock.connect(self.upstream).await?;
+        sock.send(query_bytes).await?;
+        // 4096 is enough for a standard UDP DNS response (the RFC 1035 limit
+        // is 512 bytes; EDNS extends to ~4096; over UDP, anything larger
+        // gets truncated and the client falls back to TCP).
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(self.timeout, sock.recv(&mut buf)).await {
+            Ok(Ok(n)) => {
+                buf.truncate(n);
+                Ok(buf)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "DNS upstream timed out",
+            )),
+        }
+    }
+}
+
+/// What the per-packet handler decided. The listener uses [`Reply`] bytes to
+/// drive a `send_to` back to the client and treats [`NoReply`] as "drop this
+/// datagram silently" — the client will retry on its own timeout.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DnsHandleOutcome {
+    Reply(Vec<u8>),
+    NoReply,
+}
+
+/// Drive one DNS query end-to-end: parse, decide, and either forward (Allow)
+/// or refuse (Deny). On Deny also emits a [`DenialEvent`] on the shared
+/// channel so the supervisor surfaces it as `egress_denied(protocol=dns)`.
+///
+/// Splitting this off from [`spawn_dns_listener`] is the same trick slice 10b
+/// used for the L7 proxy: the policy/resolver/event-shape is fully unit-
+/// testable without a real `UdpSocket`. Tests pass a fake [`DnsResolver`].
+///
+/// Parse-error datagrams are dropped (`NoReply`, no event). Building a
+/// FORMERR would require us to trust the first 12 bytes of garbage as the
+/// query header — easier and safer to be silent and let the guest's resolver
+/// time out.
+pub async fn handle_dns_query<R: DnsResolver + ?Sized>(
+    query_bytes: &[u8],
+    policy: &EgressPolicy,
+    resolver: &R,
+    denied_tx: &mpsc::UnboundedSender<DenialEvent>,
+) -> DnsHandleOutcome {
+    let query = match parse_dns_query(query_bytes) {
+        Ok(q) => q,
+        Err(_) => return DnsHandleOutcome::NoReply,
+    };
+    match evaluate_dns_query(&query, policy) {
+        DnsDecision::Allow => match resolver.resolve(query_bytes).await {
+            Ok(bytes) => DnsHandleOutcome::Reply(bytes),
+            Err(_) => DnsHandleOutcome::NoReply,
+        },
+        DnsDecision::Deny { .. } => {
+            // Attribute the event to the first denied question so a multi-
+            // question packet that mixes allowed + denied names doesn't lose
+            // the violator.
+            let (dest, qtype) = query
+                .questions
+                .iter()
+                .find(|q| !policy.allows(&q.name))
+                .map(|q| (q.name.clone(), q.qtype))
+                .unwrap_or_else(|| (String::new(), 0));
+            // Receiver may already be gone (Run stopped); drop silently.
+            let _ = denied_tx.send(DenialEvent {
+                destination: dest,
+                protocol: Protocol::Dns,
+                reason: dns_event_reason(qtype),
+            });
+            match build_refused_response(query_bytes) {
+                Ok(reply) => DnsHandleOutcome::Reply(reply),
+                Err(_) => DnsHandleOutcome::NoReply,
+            }
+        }
+    }
+}
+
+/// Spawn a UDP listener that accepts DNS queries on `addr` and drives each
+/// one through [`handle_dns_query`]. Returns the bound [`SocketAddr`] (so
+/// callers can request port 0 and learn the assigned port) and the listener's
+/// join handle.
+///
+/// Mirrors [`crate::egress_proxy::spawn_listener`]'s shape — one task accepts,
+/// one task per query handles. Per-query tasks share a single `UdpSocket`
+/// (via `Arc`) for the `send_to` reply because there is no per-flow socket
+/// in UDP.
+pub async fn spawn_dns_listener<R>(
+    addr: SocketAddr,
+    policy: EgressPolicy,
+    resolver: R,
+    denied_tx: mpsc::UnboundedSender<DenialEvent>,
+) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)>
+where
+    R: DnsResolver + 'static,
+{
+    let sock = UdpSocket::bind(addr).await?;
+    let bound = sock.local_addr()?;
+    let sock = Arc::new(sock);
+    let resolver = Arc::new(resolver);
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, peer) = match sock.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            // Copy the datagram off the shared buffer before spawning so the
+            // next iteration of the loop can reuse it without racing.
+            let bytes = buf[..n].to_vec();
+            let policy = policy.clone();
+            let resolver = resolver.clone();
+            let tx = denied_tx.clone();
+            let sock = sock.clone();
+            tokio::spawn(async move {
+                let outcome = handle_dns_query(&bytes, &policy, &*resolver, &tx).await;
+                if let DnsHandleOutcome::Reply(reply) = outcome {
+                    let _ = sock.send_to(&reply, peer).await;
+                }
+            });
+        }
+    });
+    Ok((bound, handle))
 }
 
 #[cfg(test)]
@@ -646,5 +836,259 @@ mod tests {
         assert!(r.contains("28"), "reason missing qtype: {r:?}");
         let r = dns_event_reason(qtype::A);
         assert!(r.contains("1"), "reason missing qtype: {r:?}");
+    }
+
+    // ── slice 10m: handle_dns_query / spawn_dns_listener ───────────────────
+
+    /// Fake resolver: returns canned bytes regardless of input. Used in the
+    /// allow-path tests so the handler can be exercised without a live
+    /// upstream resolver. The default is empty bytes, which the listener
+    /// would happily forward — for tests that care about the wire shape we
+    /// override `reply`.
+    #[derive(Default, Clone)]
+    struct FakeResolver {
+        reply: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsResolver for FakeResolver {
+        async fn resolve(&self, _query: &[u8]) -> io::Result<Vec<u8>> {
+            Ok(self.reply.clone())
+        }
+    }
+
+    /// Resolver that always fails. Exercises the "upstream unavailable" path
+    /// — the handler must return `NoReply` and *not* emit a denial event
+    /// (upstream failure is not a policy violation).
+    struct FailingResolver;
+
+    #[async_trait::async_trait]
+    impl DnsResolver for FailingResolver {
+        async fn resolve(&self, _query: &[u8]) -> io::Result<Vec<u8>> {
+            Err(io::Error::new(io::ErrorKind::Other, "upstream broken"))
+        }
+    }
+
+    /// Resolver that records what bytes it was asked to forward. Lets a test
+    /// assert that the listener forwards the client's datagram verbatim.
+    struct RecordingResolver {
+        seen: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+        reply: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsResolver for RecordingResolver {
+        async fn resolve(&self, query: &[u8]) -> io::Result<Vec<u8>> {
+            self.seen.lock().await.push(query.to_vec());
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_allow_returns_resolver_reply_no_event() {
+        let p = policy(&["github.com"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let canned = b"upstream reply bytes".to_vec();
+        let resolver = FakeResolver { reply: canned.clone() };
+        let q = build_query(0x1234, 0x0100, "github.com", qtype::A);
+
+        let outcome = handle_dns_query(&q, &p, &resolver, &tx).await;
+        assert_eq!(outcome, DnsHandleOutcome::Reply(canned));
+        assert!(rx.try_recv().is_err(), "no denial event for an allowed query");
+    }
+
+    #[tokio::test]
+    async fn handle_allow_forwards_query_bytes_verbatim() {
+        // The whole point of the resolver path: the client's query bytes
+        // reach upstream unchanged so the upstream's TXIDs / EDNS / etc.
+        // match what the client expects.
+        let p = policy(&["github.com"]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let resolver = RecordingResolver {
+            seen: seen.clone(),
+            reply: Vec::new(),
+        };
+        let q = build_query(0x1234, 0x0100, "github.com", qtype::A);
+
+        let _ = handle_dns_query(&q, &p, &resolver, &tx).await;
+        let observed = seen.lock().await.clone();
+        assert_eq!(observed, vec![q]);
+    }
+
+    #[tokio::test]
+    async fn handle_deny_returns_refused_and_emits_event() {
+        let p = policy(&["github.com"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let q = build_query(0xBEEF, 0x0100, "evil.example", qtype::A);
+
+        let outcome = handle_dns_query(&q, &p, &FakeResolver::default(), &tx).await;
+        let reply = match outcome {
+            DnsHandleOutcome::Reply(bytes) => bytes,
+            other => panic!("expected Reply, got {other:?}"),
+        };
+        assert_eq!(&reply[0..2], &[0xBE, 0xEF], "id must be preserved");
+        let flags = u16::from_be_bytes([reply[2], reply[3]]);
+        assert_ne!(flags & FLAG_QR, 0, "QR must be set");
+        assert_eq!(flags & 0x000F, RCODE_REFUSED as u16);
+
+        let ev = rx.try_recv().expect("denial event");
+        assert_eq!(ev.destination, "evil.example");
+        assert_eq!(ev.protocol, Protocol::Dns);
+        assert!(ev.reason.contains("qtype=1"), "reason should mention qtype: {}", ev.reason);
+    }
+
+    #[tokio::test]
+    async fn handle_parse_error_is_noreply_no_event() {
+        let p = policy(&["github.com"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Truncated header: parse fails. Handler must drop the packet rather
+        // than try to fabricate a FORMERR from garbage.
+        let outcome = handle_dns_query(&[0u8; 4], &p, &FakeResolver::default(), &tx).await;
+        assert_eq!(outcome, DnsHandleOutcome::NoReply);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_upstream_failure_is_noreply_no_event() {
+        // Upstream resolver is down → guest sees no reply (will time out on
+        // its own). This is *not* a policy denial and must not emit an
+        // egress_denied event. Mirrors the L7 proxy's 502 path.
+        let p = policy(&["github.com"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let q = build_query(0x1234, 0, "github.com", qtype::A);
+        let outcome = handle_dns_query(&q, &p, &FailingResolver, &tx).await;
+        assert_eq!(outcome, DnsHandleOutcome::NoReply);
+        assert!(rx.try_recv().is_err(), "upstream failure is not a policy denial");
+    }
+
+    #[tokio::test]
+    async fn handle_multi_question_attributes_to_first_denied() {
+        // 2-question query: github.com (allowed) + evil.example (denied).
+        // The handler must report the violator (the unlisted name), not the
+        // allowed name that happens to come first in the packet.
+        let p = policy(&["github.com"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut q = Vec::new();
+        q.extend_from_slice(&0x0001u16.to_be_bytes());
+        q.extend_from_slice(&0u16.to_be_bytes());
+        q.extend_from_slice(&2u16.to_be_bytes()); // QDCOUNT=2
+        q.extend_from_slice(&0u16.to_be_bytes());
+        q.extend_from_slice(&0u16.to_be_bytes());
+        q.extend_from_slice(&0u16.to_be_bytes());
+        q.extend(encode_name("github.com"));
+        q.extend_from_slice(&qtype::A.to_be_bytes());
+        q.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        q.extend(encode_name("evil.example"));
+        q.extend_from_slice(&qtype::AAAA.to_be_bytes());
+        q.extend_from_slice(&QCLASS_IN.to_be_bytes());
+
+        let _ = handle_dns_query(&q, &p, &FakeResolver::default(), &tx).await;
+        let ev = rx.try_recv().expect("denial event");
+        assert_eq!(ev.destination, "evil.example");
+        assert!(
+            ev.reason.contains("qtype=28"),
+            "reason should mention AAAA: {}",
+            ev.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_dns_listener_deny_path_loopback() {
+        let p = policy(&["github.com"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (bound, h) = spawn_dns_listener(
+            "127.0.0.1:0".parse().unwrap(),
+            p,
+            FakeResolver::default(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(bound).await.unwrap();
+        let q = build_query(0xCAFE, 0x0100, "evil.example", qtype::A);
+        client.send(&q).await.unwrap();
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .expect("listener should reply within timeout")
+            .unwrap();
+        buf.truncate(n);
+
+        assert_eq!(&buf[0..2], &[0xCA, 0xFE], "id preserved");
+        let flags = u16::from_be_bytes([buf[2], buf[3]]);
+        assert_eq!(flags & 0x000F, RCODE_REFUSED as u16);
+
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("denial event should arrive")
+            .expect("channel still open");
+        assert_eq!(ev.destination, "evil.example");
+        assert_eq!(ev.protocol, Protocol::Dns);
+
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn spawn_dns_listener_allow_path_loopback() {
+        let p = policy(&["allowed.example"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let canned = b"\x00\x01canned-upstream-reply".to_vec();
+        let resolver = FakeResolver { reply: canned.clone() };
+        let (bound, h) = spawn_dns_listener(
+            "127.0.0.1:0".parse().unwrap(),
+            p,
+            resolver,
+            tx,
+        )
+        .await
+        .unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(bound).await.unwrap();
+        let q = build_query(0xAAAA, 0x0100, "allowed.example", qtype::A);
+        client.send(&q).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .expect("listener should reply within timeout")
+            .unwrap();
+        buf.truncate(n);
+        assert_eq!(buf, canned, "allowed reply forwarded verbatim from resolver");
+        assert!(rx.try_recv().is_err(), "no denial event for an allowed query");
+
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn spawn_dns_listener_drops_malformed_silently() {
+        // Junk that can't possibly be a DNS query must not get a reply nor
+        // emit an event. Tests the "drop silently" semantics — the client's
+        // recv times out, not the test runner.
+        let p = policy(&["github.com"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (bound, h) = spawn_dns_listener(
+            "127.0.0.1:0".parse().unwrap(),
+            p,
+            FakeResolver::default(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(bound).await.unwrap();
+        client.send(b"not a dns query").await.unwrap();
+
+        let mut buf = vec![0u8; 512];
+        let resp = tokio::time::timeout(Duration::from_millis(300), client.recv(&mut buf)).await;
+        assert!(resp.is_err(), "listener must not reply to garbage");
+        assert!(rx.try_recv().is_err(), "no event for garbage");
+
+        h.abort();
     }
 }

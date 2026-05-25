@@ -330,14 +330,15 @@ async fn run_sandbox(
     // proxy presence load-bearing.
     let policy = spec.effective_egress_policy();
     let (denied_tx, denied_rx) = tokio::sync::mpsc::unbounded_channel();
-    // Keep a sender clone for the L3 drop-log task (spawned below). The proxy
-    // takes its own clone; once both producers exit, the supervisor's
-    // `denied_rx.recv()` returns None and the select arm flips off.
+    // Keep sender clones for the L3 drop-log + DNS listener tasks (spawned
+    // below). The proxy takes its own clone; once all producers exit, the
+    // supervisor's `denied_rx.recv()` returns None and the select arm flips off.
     let drop_log_tx = denied_tx.clone();
+    let dns_tx = denied_tx.clone();
     let proxy_bind: SocketAddr = SocketAddr::from((net.host, 0));
     let (proxy_addr, proxy_handle) = match egress_proxy::spawn_listener(
         proxy_bind,
-        policy,
+        policy.clone(),
         denied_tx,
     )
     .await
@@ -348,6 +349,52 @@ async fn run_sandbox(
         }
         Err(e) => {
             eprintln!("[egress] failed to start proxy listener: {e}");
+            (None, None)
+        }
+    };
+
+    // ── DNS listener (slice 10m) ───────────────────────────────────────────
+    // Bind a UDP listener on `net.host:53` so the guest's resolver routes
+    // through us. Allowed queries forward to an upstream resolver; denied
+    // queries get a REFUSED reply + a DenialEvent (protocol=dns) on the
+    // existing denial channel. Port 53 is privileged, so on dev boxes the
+    // bind will fail with EACCES — log a warning and continue. In that
+    // case the DNS denial path is non-functional this Run, but the L3
+    // nftables rule (next block) will not include a DNS exception either,
+    // so guest DNS traffic surfaces as raw_tcp drops uniformly.
+    use std::env;
+    let upstream_str = env::var("CRUCIBLE_DNS_UPSTREAM")
+        .unwrap_or_else(|_| "8.8.8.8:53".to_string());
+    let upstream: SocketAddr = upstream_str.parse().unwrap_or_else(|_| {
+        eprintln!(
+            "[egress] WARNING: invalid CRUCIBLE_DNS_UPSTREAM={upstream_str:?}, \
+             falling back to 8.8.8.8:53"
+        );
+        "8.8.8.8:53".parse().expect("static literal")
+    });
+    let dns_bind: SocketAddr = SocketAddr::from((net.host, 53));
+    let (dns_port, dns_handle) = match dns::spawn_dns_listener(
+        dns_bind,
+        policy,
+        dns::TokioUdpResolver::new(upstream),
+        dns_tx,
+    )
+    .await
+    {
+        Ok((addr, h)) => {
+            eprintln!("[egress] DNS listener bound on {addr} (upstream {upstream})");
+            (Some(addr.port()), Some(h))
+        }
+        Err(e) => {
+            // spawn_dns_listener consumed dns_tx already; on Err it's dropped
+            // inside the function before it returns, so no extra cleanup
+            // needed here. The remaining producers (the proxy listener + the
+            // drop-log task, if either started) keep the supervisor's
+            // denied_rx open.
+            eprintln!(
+                "[egress] failed to bind DNS listener on {dns_bind}: {e} \
+                 — DNS-only egress attempts will surface as raw_tcp drops"
+            );
             (None, None)
         }
     };
@@ -366,7 +413,11 @@ async fn run_sandbox(
     let _ = delete_nftables_table(&nft_table).await;
     let mut nft_loaded = false;
     if let Some(addr) = proxy_addr {
-        let rules = build_ruleset(&nft_table, &tap_name, net.host, addr.port());
+        // dns_port is included only when the DNS listener actually bound; if
+        // we add a DNS allow rule for a port nothing's listening on, the
+        // guest's resolver queries would be silently lost (kernel forwards
+        // them but no one answers) instead of surfacing as raw_tcp drops.
+        let rules = build_ruleset(&nft_table, &tap_name, net.host, addr.port(), dns_port);
         eprintln!("[egress] loading nftables table {nft_table}");
         match apply_nftables_ruleset(&rules).await {
             Ok(()) => nft_loaded = true,
@@ -439,6 +490,7 @@ async fn run_sandbox(
         denied_rx,
         listener: proxy_handle,
         drop_log: drop_log_handle,
+        dns_listener: dns_handle,
     };
     let result = sandbox_supervisor::run(&mut handle, spec, enc, egress_ctx).await;
 

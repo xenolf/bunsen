@@ -49,6 +49,14 @@ pub fn drop_log_prefix(table_name: &str) -> String {
 /// Build the nftables ruleset that allows only TCP to `proxy_host:proxy_port`
 /// arriving on `tap` and drops everything else (with logging).
 ///
+/// When `dns_port` is `Some(p)`, an additional rule permits UDP to
+/// `proxy_host:p` so the host-side DNS listener (slice 10m) is reachable from
+/// the guest. When `None`, all UDP from the TAP — including DNS — is dropped
+/// (and surfaces as `egress_denied(protocol=raw_tcp)` via the drop-log
+/// emitter); this is the right default if the DNS listener failed to bind
+/// (e.g. dev box without `CAP_NET_BIND_SERVICE`) because the alternative is
+/// to silently forward queries to whatever resolver the guest picks.
+///
 /// The ruleset lives in its own `inet` table named `table_name` so multiple
 /// concurrent Runs don't interfere — each Run loads + deletes its own table.
 /// `input` and `forward` are both hooked because guest traffic to the host's
@@ -62,8 +70,15 @@ pub fn build_ruleset(
     tap: &str,
     proxy_host: Ipv4Addr,
     proxy_port: u16,
+    dns_port: Option<u16>,
 ) -> String {
     let prefix = drop_log_prefix(table_name);
+    let dns_rule = match dns_port {
+        Some(p) => format!(
+            "        ip daddr {proxy_host} udp dport {p} accept\n",
+        ),
+        None => String::new(),
+    };
     format!(
         "table inet {table_name} {{\n\
          \x20   chain input {{\n\
@@ -76,6 +91,7 @@ pub fn build_ruleset(
          \x20   }}\n\
          \x20   chain from-guest {{\n\
          \x20       ip daddr {proxy_host} tcp dport {proxy_port} accept\n\
+         {dns_rule}\
          \x20       log prefix \"{prefix}\" level info\n\
          \x20       counter drop\n\
          \x20   }}\n\
@@ -272,7 +288,7 @@ mod tests {
 
     #[test]
     fn ruleset_declares_table_in_inet_family() {
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080);
+        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
         assert!(r.contains("table inet crucible-tt"));
     }
 
@@ -280,7 +296,7 @@ mod tests {
     fn ruleset_filters_only_traffic_from_tap() {
         // input and forward chains both jump only when iifname matches the
         // TAP; traffic on any other host interface is untouched.
-        let r = build_ruleset("crucible-tt", "tap-xyz", ipv4("169.254.1.1"), 8080);
+        let r = build_ruleset("crucible-tt", "tap-xyz", ipv4("169.254.1.1"), 8080, None);
         assert!(r.contains("iifname \"tap-xyz\" jump from-guest"));
         // Both hook chains should jump on iifname; count occurrences.
         let n = r.matches("iifname \"tap-xyz\" jump from-guest").count();
@@ -289,7 +305,7 @@ mod tests {
 
     #[test]
     fn ruleset_accepts_only_tcp_to_proxy_host_and_port() {
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.42.1"), 34567);
+        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.42.1"), 34567, None);
         assert!(r.contains("ip daddr 169.254.42.1 tcp dport 34567 accept"));
     }
 
@@ -298,7 +314,7 @@ mod tests {
         // Order matters: accept first, then log, then drop. nftables
         // evaluates rules top-to-bottom; if accept ever moves below drop the
         // proxy stops working.
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080);
+        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
         let accept_pos = r.find("accept").expect("accept rule missing");
         let log_pos = r.find("log prefix").expect("log rule missing");
         let drop_pos = r.find("drop").expect("drop rule missing");
@@ -311,7 +327,7 @@ mod tests {
         // The log prefix in the ruleset must equal drop_log_prefix() so the
         // future kernel-log emitter and the rule loader agree.
         let table = "crucible-runxyz";
-        let r = build_ruleset(table, "tap-runxyz", ipv4("169.254.1.1"), 8080);
+        let r = build_ruleset(table, "tap-runxyz", ipv4("169.254.1.1"), 8080, None);
         let prefix = drop_log_prefix(table);
         assert!(
             r.contains(&format!("log prefix \"{prefix}\"")),
@@ -324,15 +340,61 @@ mod tests {
         // We do NOT change the host's default chain policy — only Run-specific
         // traffic gets filtered. Otherwise loading the ruleset could break
         // the host's own networking.
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080);
+        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
         assert!(r.contains("policy accept"));
     }
 
     #[test]
     fn ruleset_with_different_tap_names_produces_different_text() {
-        let r1 = build_ruleset("crucible-a", "tap-a", ipv4("169.254.1.1"), 8080);
-        let r2 = build_ruleset("crucible-b", "tap-b", ipv4("169.254.1.1"), 8080);
+        let r1 = build_ruleset("crucible-a", "tap-a", ipv4("169.254.1.1"), 8080, None);
+        let r2 = build_ruleset("crucible-b", "tap-b", ipv4("169.254.1.1"), 8080, None);
         assert_ne!(r1, r2);
+    }
+
+    // ── slice 10m: optional DNS allow rule ─────────────────────────────────
+
+    #[test]
+    fn ruleset_no_dns_port_omits_udp_rule() {
+        // Default (no DNS listener bound) — UDP from the TAP is dropped along
+        // with everything else.
+        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
+        assert!(!r.contains("udp dport"), "no UDP rule should appear when dns_port=None:\n{r}");
+    }
+
+    #[test]
+    fn ruleset_with_dns_port_accepts_udp_to_proxy_host() {
+        // DNS listener bound on port 53 → ruleset must permit UDP to the
+        // proxy host on that port. Without this rule, the guest's DNS
+        // queries get dropped at L3 before they ever reach the listener.
+        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.42.1"), 34567, Some(53));
+        assert!(
+            r.contains("ip daddr 169.254.42.1 udp dport 53 accept"),
+            "ruleset missing DNS allow rule:\n{r}"
+        );
+    }
+
+    #[test]
+    fn ruleset_dns_rule_precedes_log_drop() {
+        // The accept-then-log-then-drop ordering must hold for the DNS rule
+        // too. nftables walks the chain top-to-bottom; if DNS accept ends up
+        // below `drop`, guest DNS would be silently denied.
+        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080, Some(53));
+        let udp_pos = r.find("udp dport 53 accept").expect("dns rule missing");
+        let log_pos = r.find("log prefix").expect("log rule missing");
+        let drop_pos = r.find("counter drop").expect("drop rule missing");
+        assert!(udp_pos < log_pos, "dns accept must precede log");
+        assert!(log_pos < drop_pos, "log must precede drop");
+    }
+
+    #[test]
+    fn ruleset_dns_rule_uses_proxy_host_address() {
+        // The DNS listener is bound on the same TAP host IP as the L7 proxy
+        // (both bind on net.host in run_sandbox), so the accept rule's
+        // destination must match the proxy host, not some other address.
+        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.5.9"), 8080, Some(53));
+        assert!(r.contains("ip daddr 169.254.5.9 udp dport 53"));
+        // Other addresses should not appear in a UDP rule.
+        assert!(!r.contains("ip daddr 127.0.0.1 udp"));
     }
 
     // ── parse_drop_log_line ────────────────────────────────────────────────
