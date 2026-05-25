@@ -107,6 +107,18 @@ pub fn run() -> ! {
             eprintln!("crucible-init: configure_eth0 failed: {e}");
             dbg(&format!("configure_eth0 failed: {e}"));
         }
+        // Point libc resolvers at the host-side DNS listener. Agents that
+        // honour HTTPS_PROXY don't need this (the proxy resolves names
+        // server-side), but agents that probe DNS directly do. Failure is
+        // logged but not fatal: the bind mount can fail when the rootfs
+        // image lacks /etc/resolv.conf (rare) or when it's a symlink, in
+        // which case the agent still has HTTPS_PROXY as the fallback.
+        if let Err(e) = crate::network::install_resolv_conf(net) {
+            eprintln!("crucible-init: install_resolv_conf failed: {e}");
+            dbg(&format!("install_resolv_conf failed: {e}"));
+        } else {
+            dbg(&format!("installed resolv.conf -> {}", net.host_ip));
+        }
     }
 
     // Connect stdout/stderr before forking so sockets are ready.

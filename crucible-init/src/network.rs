@@ -10,7 +10,9 @@
 //! same static binary in every rootfs.
 
 use serde::Deserialize;
+use std::io;
 use std::net::Ipv4Addr;
+use std::path::Path;
 
 /// Per-Run network configuration handed to the guest by the host. Mirrors
 /// `crucible_core::sandbox_net::RunNetwork` on the wire (kebab-case JSON).
@@ -20,6 +22,39 @@ pub struct GuestNetwork {
     pub guest_ip: Ipv4Addr,
     pub host_ip: Ipv4Addr,
     pub prefix_len: u8,
+}
+
+/// Tmpfs path where the staged `/etc/resolv.conf` body lives before the
+/// bind mount lands it at the canonical location. `/run` is tmpfs (mounted
+/// by [`crate::init_linux::mount_filesystems`]) so this path is writable
+/// even though the rootfs is read-only.
+pub const RESOLV_CONF_SCRATCH: &str = "/run/crucible/resolv.conf";
+
+/// Canonical location of the guest's resolver config; bind-mount target.
+pub const RESOLV_CONF_TARGET: &str = "/etc/resolv.conf";
+
+/// Render the `/etc/resolv.conf` body that points the guest's libc resolver
+/// at the host-side DNS listener on `host_ip:53`.
+///
+/// One nameserver line, trailing newline. No search domains, no `options`,
+/// no comments: an additional line could be parsed by a guest resolver as
+/// another (unreachable) nameserver and stall lookups during failover.
+pub fn format_resolv_conf(host_ip: Ipv4Addr) -> String {
+    format!("nameserver {host_ip}\n")
+}
+
+/// Write the resolv.conf body to `scratch_path` (typically [`RESOLV_CONF_SCRATCH`]).
+///
+/// Creates parent directories if missing and truncates any pre-existing
+/// file. This is the platform-independent half of the bring-up; the Linux
+/// `install_resolv_conf` ties it to the bind mount.
+pub fn stage_resolv_conf(net: &GuestNetwork, scratch_path: &Path) -> io::Result<()> {
+    if let Some(parent) = scratch_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(scratch_path, format_resolv_conf(net.host_ip))
 }
 
 /// Convert a CIDR prefix length (e.g. 30) into an IPv4 netmask
@@ -156,16 +191,70 @@ mod linux {
         }
         Ok(())
     }
+
+    /// Stage `nameserver <host_ip>` to a tmpfs file under `/run/crucible/`
+    /// and bind-mount it over `/etc/resolv.conf` so the guest's libc
+    /// resolver routes through the host-side DNS listener.
+    ///
+    /// The rootfs is mounted read-only at the Firecracker level, so writing
+    /// `/etc/resolv.conf` directly fails with EROFS — the bind mount over
+    /// the existing file is what makes the change visible.
+    ///
+    /// Requires that `/etc/resolv.conf` already exists as a regular file in
+    /// the rootfs (standard for Alpine/Debian/Ubuntu OCI base images). If
+    /// the target is missing or is a symlink, the mount fails and the
+    /// caller is expected to log + continue.
+    pub fn install_resolv_conf(net: &GuestNetwork) -> io::Result<()> {
+        let scratch = std::path::Path::new(super::RESOLV_CONF_SCRATCH);
+        super::stage_resolv_conf(net, scratch)?;
+        bind_mount_file(scratch, std::path::Path::new(super::RESOLV_CONF_TARGET))
+    }
+
+    /// `mount(source, target, NULL, MS_BIND, NULL)`. Source and target must
+    /// both exist; for file-over-file binds the kernel just substitutes the
+    /// inode in dentry lookups under `target`.
+    fn bind_mount_file(source: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+        let src = CString::new(source.as_os_str().as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let tgt = CString::new(target.as_os_str().as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // Empty filesystem type and data are ignored for MS_BIND.
+        let typ = CString::new("").unwrap();
+        let ret = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                tgt.as_ptr(),
+                typ.as_ptr(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::configure_eth0;
+use std::os::unix::ffi::OsStrExt;
+
+#[cfg(target_os = "linux")]
+pub use linux::{configure_eth0, install_resolv_conf};
 
 #[cfg(not(target_os = "linux"))]
 pub fn configure_eth0(_net: &GuestNetwork) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "configure_eth0 is Linux-only",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn install_resolv_conf(_net: &GuestNetwork) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "install_resolv_conf is Linux-only",
     ))
 }
 
@@ -250,5 +339,86 @@ mod tests {
             prefix_len_to_netmask(net.prefix_len),
             Ipv4Addr::new(255, 255, 255, 252),
         );
+    }
+
+    // ─── /etc/resolv.conf shape + staging ─────────────────────────────────
+
+    #[test]
+    fn format_resolv_conf_emits_single_nameserver_line() {
+        let s = format_resolv_conf(Ipv4Addr::new(169, 254, 42, 1));
+        assert_eq!(s, "nameserver 169.254.42.1\n");
+    }
+
+    #[test]
+    fn format_resolv_conf_has_trailing_newline() {
+        // glibc's resolv.conf parser stops at the first line without a
+        // terminating newline on some versions; always emit one.
+        let s = format_resolv_conf(Ipv4Addr::new(10, 0, 0, 53));
+        assert!(s.ends_with('\n'));
+    }
+
+    #[test]
+    fn format_resolv_conf_emits_exactly_one_line() {
+        // No options, no search domains, no comments — just the nameserver.
+        // Extra lines would either be ignored (best case) or interpreted by
+        // a guest's resolv.conf parser as additional servers.
+        let s = format_resolv_conf(Ipv4Addr::new(169, 254, 1, 1));
+        assert_eq!(s.lines().count(), 1);
+    }
+
+    #[test]
+    fn format_resolv_conf_uses_dotted_quad_form() {
+        // Display impl on Ipv4Addr already produces the canonical form; this
+        // test pins the wire format so a future refactor can't accidentally
+        // emit `nameserver 0xa9fe...` or similar.
+        let s = format_resolv_conf(Ipv4Addr::new(8, 8, 8, 8));
+        assert!(s.contains("8.8.8.8"));
+        assert!(!s.contains("0x"));
+    }
+
+    #[test]
+    fn stage_resolv_conf_writes_content_to_scratch_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("resolv.conf");
+        let net = GuestNetwork {
+            guest_ip: Ipv4Addr::new(169, 254, 42, 2),
+            host_ip: Ipv4Addr::new(169, 254, 42, 1),
+            prefix_len: 30,
+        };
+        stage_resolv_conf(&net, &scratch).unwrap();
+        let on_disk = std::fs::read_to_string(&scratch).unwrap();
+        assert_eq!(on_disk, "nameserver 169.254.42.1\n");
+    }
+
+    #[test]
+    fn stage_resolv_conf_overwrites_existing_file() {
+        // The scratch path may survive across runs in the same VM if init
+        // somehow re-entered. Stage must truncate and rewrite, not append.
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("resolv.conf");
+        std::fs::write(&scratch, b"stale content\n").unwrap();
+        let net = GuestNetwork {
+            guest_ip: Ipv4Addr::new(169, 254, 42, 2),
+            host_ip: Ipv4Addr::new(169, 254, 0, 5),
+            prefix_len: 30,
+        };
+        stage_resolv_conf(&net, &scratch).unwrap();
+        let on_disk = std::fs::read_to_string(&scratch).unwrap();
+        assert_eq!(on_disk, "nameserver 169.254.0.5\n");
+    }
+
+    #[test]
+    fn stage_resolv_conf_creates_parent_dir_if_missing() {
+        // Caller may pass /run/crucible/resolv.conf before mount_filesystems
+        // has reached /run/crucible. Defensive: create parents.
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("nested").join("resolv.conf");
+        let net = GuestNetwork {
+            guest_ip: Ipv4Addr::new(169, 254, 42, 2),
+            host_ip: Ipv4Addr::new(169, 254, 42, 1),
+            prefix_len: 30,
+        };
+        stage_resolv_conf(&net, &scratch).unwrap();
+        assert!(scratch.exists());
     }
 }
