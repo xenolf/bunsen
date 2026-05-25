@@ -15,13 +15,38 @@ __all__ = [
 ]
 
 
-def run(spec: dict, *, _core_bin: Optional[str] = None) -> _AsyncRunContext:
-    """Async context manager. Usage: async with crucible.run(spec) as r: ..."""
+def run(
+    spec: dict,
+    *,
+    manage_firewall: bool = False,
+    _core_bin: Optional[str] = None,
+) -> _AsyncRunContext:
+    """Async context manager. Usage: async with crucible.run(spec) as r: ...
+
+    manage_firewall: when True, crucible-core is allowed to add a per-TAP
+    iptables ACCEPT rule on the host for the lifetime of this Run, to work
+    around a default-DROP INPUT chain (e.g. UFW on Ubuntu). The rule is
+    scoped to the Run's TAP device and removed on Run end. Default False
+    so that crucible never touches the host firewall unless told to this
+    invocation.
+    """
     argv = _core_bin.split() if _core_bin else find_core_bin()
+    if manage_firewall:
+        argv = argv + ["--manage-firewall"]
     return _AsyncRunContext(spec, argv)
 
 
-def run_sync(spec: dict, *, _core_bin: Optional[str] = None) -> _SyncRunContext:
-    """Sync context manager. Usage: with crucible.run_sync(spec) as r: ..."""
+def run_sync(
+    spec: dict,
+    *,
+    manage_firewall: bool = False,
+    _core_bin: Optional[str] = None,
+) -> _SyncRunContext:
+    """Sync context manager. Usage: with crucible.run_sync(spec) as r: ...
+
+    See `run` for the meaning of `manage_firewall`.
+    """
     argv = _core_bin.split() if _core_bin else find_core_bin()
+    if manage_firewall:
+        argv = argv + ["--manage-firewall"]
     return _SyncRunContext(spec, argv)

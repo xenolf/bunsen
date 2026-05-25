@@ -270,3 +270,32 @@ async def test_cancel_kills_subprocess():
         # Give it a moment to clean up
         await asyncio.sleep(0.1)
         assert proc.returncode is not None, "Subprocess must have exited after cancellation"
+
+
+def test_manage_firewall_kwarg_appends_cli_flag():
+    """Slice 10k: manage_firewall=True must inject --manage-firewall into argv."""
+    import crucible
+
+    spec = {"adapter": "black-box"}
+
+    ctx_on = crucible.run(spec, manage_firewall=True, _core_bin="dummy-core")
+    assert "--manage-firewall" in ctx_on._core_argv
+
+    ctx_off = crucible.run(spec, manage_firewall=False, _core_bin="dummy-core")
+    assert "--manage-firewall" not in ctx_off._core_argv
+
+    ctx_default = crucible.run(spec, _core_bin="dummy-core")
+    assert "--manage-firewall" not in ctx_default._core_argv
+
+
+def test_manage_firewall_kwarg_works_for_run_sync():
+    """Slice 10k: same kwarg behavior in run_sync."""
+    import crucible
+
+    spec = {"adapter": "black-box"}
+
+    ctx_on = crucible.run_sync(spec, manage_firewall=True, _core_bin="dummy-core")
+    assert "--manage-firewall" in ctx_on._core_argv
+
+    ctx_off = crucible.run_sync(spec, _core_bin="dummy-core")
+    assert "--manage-firewall" not in ctx_off._core_argv

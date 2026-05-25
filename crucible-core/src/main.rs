@@ -4,6 +4,7 @@ mod egress;
 mod egress_proxy;
 mod encoder;
 mod events;
+mod firewall_check;
 mod oci_cache;
 mod redactor;
 mod run_dir;
@@ -17,6 +18,8 @@ mod workspace_materializer;
 
 #[cfg(target_os = "linux")]
 mod firecracker;
+#[cfg(target_os = "linux")]
+mod firewall;
 #[cfg(target_os = "linux")]
 mod sandbox_supervisor;
 #[cfg(target_os = "linux")]
@@ -58,6 +61,19 @@ async fn main() {
         eprintln!("invalid spec: {e}");
         std::process::exit(1);
     });
+
+    // ── Slice 10k: host firewall probe ────────────────────────────────────
+    // Probe BEFORE we touch the run_dir, transcript, or emit run_started so
+    // that an aborted probe leaves zero side effects on the host. Only runs
+    // on Linux in sandbox mode (--kernel provided); macOS and host-subprocess
+    // paths don't share a kernel with the L7 proxy and have nothing to probe.
+    #[cfg(target_os = "linux")]
+    if cli.kernel.is_some() {
+        if let Err(msg) = check_host_firewall(cli.manage_firewall).await {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    }
 
     let run_id = ulid::generate();
     eprintln!("{run_id}");
@@ -131,7 +147,7 @@ async fn main() {
 
     // ── Dispatch: sandbox (Linux + --kernel/--rootfs) or host subprocess ───
     let agent_history_path = run_dir.agent_history_path();
-    let result = run_with_backend(cli.kernel, cli.rootfs, cli.firecracker, &spec, &run_id, &mut enc, &workspace_path, Some(&agent_history_path)).await;
+    let result = run_with_backend(cli.kernel, cli.rootfs, cli.firecracker, cli.manage_firewall, &spec, &run_id, &mut enc, &workspace_path, Some(&agent_history_path)).await;
 
     let ended_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let exit_reason = if result.is_ok() { "agent_exit" } else { "supervisor_error" };
@@ -158,6 +174,7 @@ async fn run_with_backend(
     kernel: Option<std::path::PathBuf>,
     rootfs: Option<std::path::PathBuf>,
     firecracker_bin: Option<std::path::PathBuf>,
+    manage_firewall: bool,
     spec: &run_spec::RunSpec,
     run_id: &str,
     enc: &mut encoder::Encoder,
@@ -182,17 +199,63 @@ async fn run_with_backend(
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))?
             }
         };
-        return run_sandbox(kernel, rootfs, firecracker_bin, spec, run_id, enc, workspace_path).await;
+        return run_sandbox(kernel, rootfs, firecracker_bin, manage_firewall, spec, run_id, enc, workspace_path).await;
     }
     // On Linux after the if-let: kernel was moved; suppress unused warnings.
     #[cfg(target_os = "linux")]
-    let _ = (rootfs, firecracker_bin);
+    let _ = (rootfs, firecracker_bin, manage_firewall);
 
     // On macOS: all three were never consumed.
     #[cfg(not(target_os = "linux"))]
-    let _ = (kernel, rootfs, firecracker_bin);
+    let _ = (kernel, rootfs, firecracker_bin, manage_firewall);
 
     supervisor::run(spec, run_id, enc, workspace_path, agent_history_path).await
+}
+
+/// Probe the host iptables INPUT chain and decide whether to proceed.
+///
+/// On Linux + sandbox mode, called BEFORE any side-effecting host work
+/// (run_dir creation, workspace materialization, encoder open). The
+/// acceptance criterion is "produces no run_started events on Blocked":
+/// running the probe at the top of main() makes that automatic.
+///
+/// Returns:
+/// - `Ok(())` — proceed. Either iptables is absent, the INPUT chain is
+///   ACCEPT-by-default, a covering rule already exists, or the user passed
+///   `--manage-firewall` and authorized us to install one ourselves later.
+/// - `Err(msg)` — the caller should print `msg` to stderr and exit non-zero.
+#[cfg(target_os = "linux")]
+async fn check_host_firewall(manage_firewall: bool) -> Result<(), String> {
+    use firewall_check::{parse_iptables_save, Decision};
+
+    let probe = match firewall::probe_iptables().await {
+        Ok(Some(stdout)) => parse_iptables_save(&stdout),
+        Ok(None) => Decision::Permissive,
+        Err(e) => {
+            // Probe failed but iptables exists. Most likely cause is running
+            // unprivileged. We can't see the rules and we couldn't add one
+            // either, so warn and treat as permissive — the L3 nft path
+            // is the actual security boundary, and if the host firewall is
+            // dropping us the user will see the timeout symptom and re-run
+            // with --manage-firewall.
+            eprintln!(
+                "[firewall] WARNING: failed to probe iptables: {e:#} \
+                 — proceeding without firewall management"
+            );
+            Decision::Permissive
+        }
+    };
+
+    if matches!(probe, Decision::Blocked) && !manage_firewall {
+        return Err(
+            "[crucible-core] ERROR: host iptables INPUT policy is DROP and no allow rule covers \
+             169.254.0.0/16, so the sandbox's L7 proxy will be unreachable from the guest. \
+             Re-run with --manage-firewall (Python: manage_firewall=True) to let crucible add \
+             a per-TAP allow rule for the lifetime of this Run, or open the link-local range \
+             manually: sudo ufw allow from 169.254.0.0/16".to_string()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -200,6 +263,7 @@ async fn run_sandbox(
     kernel: std::path::PathBuf,
     rootfs: std::path::PathBuf,
     firecracker_bin: Option<std::path::PathBuf>,
+    manage_firewall: bool,
     spec: &run_spec::RunSpec,
     run_id: &str,
     enc: &mut encoder::Encoder,
@@ -235,6 +299,26 @@ async fn run_sandbox(
     create_tap(&tap_name, net.host, net.prefix_len)
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))?;
+
+    // ── Slice 10k: host iptables co-existence ─────────────────────────────
+    // The pre-flight probe in main() already decided whether we can proceed.
+    // If the caller passed --manage-firewall we install the per-TAP allow
+    // rule unconditionally (idempotent pre-cleanup first, in case a previous
+    // Run with the same tap_name crashed before its guard ran). The
+    // TapAllowGuard removes the rule via std::process::Command on Drop —
+    // synchronous so cleanup runs reliably on panic and during runtime
+    // shutdown. Holding the guard in run_sandbox's local scope ties its
+    // lifetime to the Run.
+    let _firewall_guard = if manage_firewall {
+        let _ = firewall::remove_tap_allow(&tap_name).await;
+        firewall::add_tap_allow(&tap_name)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))?;
+        eprintln!("[firewall] installed per-TAP allow rule for {tap_name}");
+        Some(firewall::TapAllowGuard::new(tap_name.clone()))
+    } else {
+        None
+    };
 
     // ── L7 egress proxy ────────────────────────────────────────────────────
     // Bind the proxy on the TAP host IP (port 0 → kernel-assigned) so the
@@ -376,6 +460,7 @@ struct CliArgs {
     kernel: Option<std::path::PathBuf>,
     rootfs: Option<std::path::PathBuf>,
     firecracker: Option<std::path::PathBuf>,
+    manage_firewall: bool,
 }
 
 fn parse_cli_args(args: &[String]) -> CliArgs {
@@ -383,6 +468,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
     let mut kernel = None;
     let mut rootfs = None;
     let mut firecracker = None;
+    let mut manage_firewall = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -390,6 +476,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
             "--kernel" if i + 1 < args.len() => { kernel = Some(std::path::PathBuf::from(&args[i+1])); i += 2; }
             "--rootfs" if i + 1 < args.len() => { rootfs = Some(std::path::PathBuf::from(&args[i+1])); i += 2; }
             "--firecracker" if i + 1 < args.len() => { firecracker = Some(std::path::PathBuf::from(&args[i+1])); i += 2; }
+            "--manage-firewall" => { manage_firewall = true; i += 1; }
             other => {
                 if let Some(v) = other.strip_prefix("--spec=") { spec = Some(v.to_string()); }
                 else if let Some(v) = other.strip_prefix("--kernel=") { kernel = Some(std::path::PathBuf::from(v)); }
@@ -399,7 +486,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
             }
         }
     }
-    CliArgs { spec, kernel, rootfs, firecracker }
+    CliArgs { spec, kernel, rootfs, firecracker, manage_firewall }
 }
 
 
@@ -435,5 +522,21 @@ mod tests {
         assert!(cli.kernel.is_none());
         assert!(cli.rootfs.is_none());
         assert!(cli.spec.is_some());
+        assert!(!cli.manage_firewall);
+    }
+
+    #[test]
+    fn parse_cli_manage_firewall_flag() {
+        let args = strs(&["crucible-core", "--manage-firewall", "--spec", "{}"]);
+        let cli = parse_cli_args(&args);
+        assert!(cli.manage_firewall);
+        assert!(cli.spec.is_some());
+    }
+
+    #[test]
+    fn parse_cli_manage_firewall_default_false() {
+        let args = strs(&["crucible-core", "--kernel", "/k", "--rootfs", "/r", "--spec", "{}"]);
+        let cli = parse_cli_args(&args);
+        assert!(!cli.manage_firewall);
     }
 }
