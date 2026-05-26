@@ -80,24 +80,62 @@ When a Run attempts a destination outside the policy, the enforcer emits an `egr
 {"type": "egress_denied", "destination": "github.com", "protocol": "https", "reason": "not in allowlist"}
 ```
 
-`protocol` is one of `http`, `https`, `raw_tcp` (L3 nftables drop), or `dns`. Per ADR-0003 these events do *not* terminate the Run; the agent receives a normal network error and decides what to do. User Scripts that want hard-fail subscribe to `EgressDenied` and call `run.stop()`.
+`protocol` is one of `http`, `https`, `raw_tcp` (L3 nftables drop), or `dns`. The four enforcement paths attribute as follows:
+
+| Origin | `protocol` | `destination` shape | Typical `reason` |
+|---|---|---|---|
+| L7 proxy `CONNECT` rejected (port 443) | `https` | `<host>` | `not in allowlist` |
+| L7 proxy `CONNECT` rejected (port 80) | `http` | `<host>` | `not in allowlist` |
+| L7 proxy `CONNECT` to any other port | `raw_tcp` | `<host>` | `not in allowlist` |
+| L3 nftables drop on the TAP | `raw_tcp` | `<ip>:<port>` (or bare `<ip>` for ICMP) | `dropped at l3 (PROTO=TCP)` |
+| DNS resolver REFUSED | `dns` | `<qname>` | `qtype A` / `qtype AAAA` / … |
+
+Per ADR-0003 these events do *not* terminate the Run; the agent receives a normal network error and decides what to do. User Scripts that want hard-fail subscribe to `EgressDenied` and call `run.stop()`.
 
 ## OCI image
 
-Each Adapter declares a digest-pinned OCI image reference that provides the agent runtime environment. The image is pulled from a registry (e.g. GHCR) and cached locally as an ext4 rootfs.
+Each Adapter is paired with a digest-pinned OCI image that provides the agent runtime environment. The image is pulled lazily on first use (`oci_cache::resolve_rootfs`), flattened to an ext4 file, and cached at `${XDG_CACHE_HOME:-~/.cache}/crucible/rootfs/<digest>.ext4`. One shared `vmlinux` (fetched by `kernel/fetch-vmlinux.sh`) boots every image — Adapters do not ship kernels.
 
-The image must:
-- Contain the agent binary and all runtime dependencies
-- Be published to GHCR as `ghcr.io/org/crucible-adapter-<name>@sha256:<hex64>`
-- Be rebuilt and the digest updated in the Adapter declaration when dependencies change
+### What the image must contain
+
+- The agent binary and all of its runtime dependencies (interpreter, libraries, default config).
+- `/sbin/crucible-init` — the in-guest PID 1 built from `crucible-init/`. The host wires it in as the kernel's `init=`. It mounts `/proc`, `/sys`, `/run`, `/tmp`, brings up `eth0` from the spec's `network` block, installs `/etc/resolv.conf` over a bind mount, then `execve`s the agent.
+- `/etc/resolv.conf` must exist as a regular file (even empty). Crucible bind-mounts a per-Run file over it; the rootfs is otherwise read-only, so the target inode must be pre-created. Alpine bases ship without it — see `adapters/_smoke-test/Dockerfile` for the placeholder pattern.
+- A standard `$PATH` containing `sh`, `wget` or `curl`, and whatever the agent shells out to. (BusyBox is fine.)
+
+### Build and publish
+
+Adapter images are built from a small Dockerfile in `adapters/<name>/`. The `adapters/_smoke-test/` and `adapters/_alpine-test/` directories are working references — Alpine base, the musl-built `crucible-init` copied into `/sbin/`, `apk add` for the agent's runtime, the `resolv.conf` placeholder.
+
+Reference invocation:
+
+```sh
+cargo build --release -p crucible-init --target x86_64-unknown-linux-musl
+docker buildx build --platform linux/amd64 --tag ghcr.io/<org>/crucible-adapter-<name>:dev adapters/<name>
+docker push ghcr.io/<org>/crucible-adapter-<name>:dev
+# Take the digest reported by `docker push` and use it as the pinned ref.
+```
+
+The Adapter declaration **must** reference the image by digest, never by tag:
+
+```text
+ghcr.io/<org>/crucible-adapter-<name>@sha256:<64 hex chars>
+```
+
+`oci_cache::OciImageRef::parse` enforces this — tags are rejected. Rebuild and re-pin the digest whenever the agent version or its dependencies change.
+
+### Local override
+
+Both `--rootfs /path/to/custom.ext4` (host CLI) and a `oci-image` field on the RunSpec are honoured. `--rootfs` wins when both are supplied; otherwise the spec's `oci-image` is resolved through the OCI cache. Local development typically uses `--rootfs` pointing at `target/<name>-rootfs.ext4` built by the adapter's `build-rootfs.sh`.
 
 ## Implementing a custom Adapter
 
 1. Choose an adapter name (lowercase, hyphen-separated).
-2. Implement a line parser in `crucible-core/src/<name>_adapter.rs` following the `ClaudeCodeParser` pattern.
-3. Add a dispatch branch in `supervisor.rs` for the adapter name.
-4. Declare `EGRESS_ENDPOINTS` as a `&[&str]` constant.
-5. Build and publish an OCI image; record the digest-pinned reference.
-6. Add captured output fixtures and tests under `src/testdata/`.
+2. Implement a line parser in `crucible-core/src/<name>_adapter.rs` following the `ClaudeCodeParser` or `AiderParser` pattern. Aider's is the closer template if your agent emits plain text rather than a structured stream.
+3. Add an `AdapterParser` variant in `supervisor.rs` and dispatch on the `spec.adapter` string at the top of `supervisor::run`.
+4. Wire native-history preservation into `supervisor::copy_agent_history` — an explicit allowlist of paths is preferred over a glob.
+5. Declare a `pub const EGRESS_ENDPOINTS: &[&str]`. If endpoints are model-derived, expose an `egress_endpoints_for_model(&str) -> &[&str]` helper and add the dispatch branch in `RunSpec::effective_egress_policy` (`run_spec.rs`).
+6. Build and publish an OCI image as above; record the digest-pinned reference.
+7. Capture an output fixture under `crucible-core/src/testdata/<name>_fixture.txt` and assert the expected event sequence in unit tests.
 
-See `crucible-core/src/claude_code_adapter.rs` for a complete reference implementation.
+See `crucible-core/src/claude_code_adapter.rs` and `crucible-core/src/aider_adapter.rs` for complete reference implementations.
