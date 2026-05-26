@@ -52,6 +52,17 @@ impl RunSpec {
     pub fn effective_egress_policy(&self) -> EgressPolicy {
         let adapter_declared: &[&str] = match self.adapter.as_str() {
             "claude-code" => crate::claude_code_adapter::EGRESS_ENDPOINTS,
+            "aider" => {
+                // Aider's required endpoint depends on the configured model
+                // (Anthropic vs OpenAI vs Gemini). Extract `--model X` from
+                // the user-supplied cmd and look it up. When no model is
+                // declared — or it's unknown — the user-script's
+                // `egress-endpoints` is the only source.
+                match crate::aider_adapter::extract_model_from_cmd(&self.cmd) {
+                    Some(m) => crate::aider_adapter::egress_endpoints_for_model(&m),
+                    None => &[],
+                }
+            }
             _ => &[],
         };
         EgressPolicy::compose(adapter_declared, &self.egress_endpoints)
@@ -144,6 +155,49 @@ mod tests {
         .unwrap();
         let policy = spec.effective_egress_policy();
         assert!(policy.allows("api.anthropic.com"));
+        assert!(policy.allows("github.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_aider_with_openai_model_includes_openai() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"aider","cmd":["aider","--model","gpt-4o","--message","hi"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.openai.com"));
+        assert!(!policy.allows("api.anthropic.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_aider_with_claude_model_includes_anthropic() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"aider","cmd":["aider","--model=claude-3-5-sonnet"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.anthropic.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_aider_without_model_is_user_only() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"aider","cmd":["aider","--message","hi"],"egress-endpoints":["api.openai.com"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.openai.com"));
+        assert!(!policy.allows("api.anthropic.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_aider_unions_adapter_and_user_additions() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"aider","cmd":["aider","--model","gpt-4o"],"egress-endpoints":["github.com"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.openai.com"));
         assert!(policy.allows("github.com"));
     }
 

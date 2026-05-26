@@ -1,4 +1,5 @@
 mod adapter;
+mod aider_adapter;
 mod claude_code_adapter;
 mod dns;
 mod egress;

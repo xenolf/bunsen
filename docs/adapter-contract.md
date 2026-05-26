@@ -56,10 +56,10 @@ After the agent process exits, crucible copies the agent's native history direct
 
 | Adapter | Native history path (inside Workspace) |
 |---|---|
-| `claude-code` | `.claude/` |
-| `aider` | `.aider.chat.history.md` (and similar) |
+| `claude-code` | `.claude/` (whole directory copied recursively) |
+| `aider` | `.aider.chat.history.md`, `.aider.input.history`, `.aider.llm.history` (top-level files copied individually; `.aider.tags.cache.*` and other cache state are skipped) |
 
-The copy is best-effort: if the directory doesn't exist, no error is raised.
+The copy is best-effort: if no source files exist, no error is raised and `agent-history/` is not created.
 
 ## Declared egress endpoints
 
@@ -70,7 +70,7 @@ The effective Egress Policy is the case-insensitive union of the adapter's decla
 | Adapter | Required endpoints |
 |---|---|
 | `claude-code` | `api.anthropic.com` |
-| `aider` | depends on configured model |
+| `aider` | derived from the `--model X` / `--model=X` value in `cmd`: `claude-*` / `anthropic/*` → `api.anthropic.com`; `gpt-*` / `o1*` / `o3*` / `openai/*` → `api.openai.com`; `gemini-*` → `generativelanguage.googleapis.com`; otherwise nothing declared (user script must supply the allowlist) |
 
 Composition is implemented by `RunSpec::effective_egress_policy()` (see `crucible-core/src/egress.rs`).
 

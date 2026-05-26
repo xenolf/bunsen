@@ -9,9 +9,41 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use crate::adapter::BlackBoxAdapter;
+use crate::aider_adapter::AiderParser;
 use crate::claude_code_adapter::ClaudeCodeParser;
 use crate::encoder::Encoder;
 use crate::run_spec::RunSpec;
+
+/// Per-adapter line parser dispatch. Each branch owns whatever state
+/// the parser needs across lines; the supervisor only cares about the
+/// (event_type, payload) pairs it gets back.
+enum AdapterParser {
+    ClaudeCode(ClaudeCodeParser),
+    Aider(AiderParser),
+    BlackBox,
+}
+
+impl AdapterParser {
+    fn parse_stdout(&mut self, line: &str) -> Vec<(String, serde_json::Value)> {
+        match self {
+            AdapterParser::ClaudeCode(p) => p.parse_line(line),
+            AdapterParser::Aider(p) => p.parse_line(line),
+            AdapterParser::BlackBox => vec![(
+                "output".into(),
+                BlackBoxAdapter::output_event("stdout", line.as_bytes()),
+            )],
+        }
+    }
+
+    /// End-of-stream flush hook. Currently only the aider parser holds
+    /// state that must be drained after the final stdout line.
+    fn flush(&mut self) -> Vec<(String, serde_json::Value)> {
+        match self {
+            AdapterParser::Aider(p) => p.flush(),
+            _ => vec![],
+        }
+    }
+}
 
 #[derive(Debug)]
 enum OutputLine {
@@ -43,6 +75,52 @@ fn signal_pgid(pgid: Pid, sig: Signal) {
     let _ = killpg(pgid, sig);
 }
 
+/// Per-adapter dispatch for agent-native history preservation.
+///
+/// - `claude-code` stores everything in a single `.claude/` directory
+///   at the workspace root; we recursively copy that into `agent-history/`.
+/// - `aider` writes its history as a set of top-level files
+///   (`.aider.chat.history.md`, `.aider.input.history`,
+///   `.aider.llm.history`) plus cache state under `.aider.tags.cache.v3/`
+///   that callers don't want to retain. We copy only the user-facing
+///   history files.
+/// - Anything else falls back to the claude-code behavior so existing
+///   adapters keep working; unknown adapters that have no `.claude/`
+///   simply produce an empty `agent-history/`, which is correct.
+fn copy_agent_history(adapter: &str, workspace: &Path, dst: &Path) -> std::io::Result<()> {
+    match adapter {
+        "aider" => copy_aider_history(workspace, dst),
+        _ => {
+            let dot_claude = workspace.join(".claude");
+            if dot_claude.exists() {
+                copy_dir_all(&dot_claude, dst)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+const AIDER_HISTORY_FILES: &[&str] = &[
+    ".aider.chat.history.md",
+    ".aider.input.history",
+    ".aider.llm.history",
+];
+
+fn copy_aider_history(workspace: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut any = false;
+    for name in AIDER_HISTORY_FILES {
+        let src = workspace.join(name);
+        if src.exists() {
+            if !any {
+                std::fs::create_dir_all(dst)?;
+                any = true;
+            }
+            std::fs::copy(&src, dst.join(name))?;
+        }
+    }
+    Ok(())
+}
+
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -59,8 +137,11 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace_path: &Path, agent_history_path: Option<&Path>) -> std::io::Result<()> {
-    let use_claude_code = spec.adapter == "claude-code";
-    let mut cc_parser = if use_claude_code { Some(ClaudeCodeParser::new()) } else { None };
+    let mut parser = match spec.adapter.as_str() {
+        "claude-code" => AdapterParser::ClaudeCode(ClaudeCodeParser::new()),
+        "aider" => AdapterParser::Aider(AiderParser::new()),
+        _ => AdapterParser::BlackBox,
+    };
 
     let mut cmd = Command::new(&spec.cmd[0]);
     cmd.args(&spec.cmd[1..])
@@ -145,12 +226,8 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
                 match msg {
                     Some(OutputLine::Line { stream, text }) => {
                         if stream == "stdout" {
-                            if let Some(parser) = cc_parser.as_mut() {
-                                for (event_type, payload) in parser.parse_line(&text) {
-                                    encoder.emit(&event_type, payload)?;
-                                }
-                            } else {
-                                encoder.emit("output", BlackBoxAdapter::output_event(stream, text.as_bytes()))?;
+                            for (event_type, payload) in parser.parse_stdout(&text) {
+                                encoder.emit(&event_type, payload)?;
                             }
                         } else {
                             encoder.emit("output", BlackBoxAdapter::output_event(stream, text.as_bytes()))?;
@@ -205,13 +282,17 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
     let status = child.wait().await?;
     let exit_code = status.code();
 
-    // Copy agent's native history to agent-history/ (best-effort).
+    // Flush any per-line state the adapter parser was holding for a
+    // multi-line event (aider's split Tokens:/Cost: pair) so the
+    // transcript surfaces it before run_ended.
+    for (event_type, payload) in parser.flush() {
+        encoder.emit(&event_type, payload)?;
+    }
+
+    // Copy agent's native history (best-effort) into agent-history/.
     if let Some(hist_dst) = agent_history_path {
-        let dot_claude = workspace_path.join(".claude");
-        if dot_claude.exists() {
-            if let Err(e) = copy_dir_all(&dot_claude, hist_dst) {
-                eprintln!("[supervisor] agent history copy warning: {e}");
-            }
+        if let Err(e) = copy_agent_history(&spec.adapter, workspace_path, hist_dst) {
+            eprintln!("[supervisor] agent history copy warning: {e}");
         }
     }
 
@@ -295,5 +376,67 @@ mod tests {
             // The function should not create hist when .claude is absent
             assert!(!hist.exists());
         }
+    }
+
+    #[test]
+    fn copy_aider_history_copies_known_files_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dst_path = dst.path().join("agent-history");
+
+        std::fs::write(workspace.path().join(".aider.chat.history.md"), "chat").unwrap();
+        std::fs::write(workspace.path().join(".aider.input.history"), "input").unwrap();
+        std::fs::write(workspace.path().join(".aider.llm.history"), "llm").unwrap();
+        // A cache dir and an unrelated dotfile should be ignored.
+        std::fs::create_dir_all(workspace.path().join(".aider.tags.cache.v3")).unwrap();
+        std::fs::write(
+            workspace.path().join(".aider.tags.cache.v3/x"),
+            "cache",
+        )
+        .unwrap();
+        std::fs::write(workspace.path().join("README.md"), "readme").unwrap();
+
+        copy_agent_history("aider", workspace.path(), &dst_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst_path.join(".aider.chat.history.md")).unwrap(),
+            "chat"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_path.join(".aider.input.history")).unwrap(),
+            "input"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_path.join(".aider.llm.history")).unwrap(),
+            "llm"
+        );
+        assert!(!dst_path.join(".aider.tags.cache.v3").exists());
+        assert!(!dst_path.join("README.md").exists());
+    }
+
+    #[test]
+    fn copy_aider_history_noop_when_no_files_present() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dst_path = dst.path().join("agent-history");
+
+        copy_agent_history("aider", workspace.path(), &dst_path).unwrap();
+        assert!(!dst_path.exists(), "no aider history → no agent-history/");
+    }
+
+    #[test]
+    fn copy_agent_history_falls_back_to_claude_layout_for_other_adapters() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dst_path = dst.path().join("agent-history");
+
+        std::fs::create_dir_all(workspace.path().join(".claude")).unwrap();
+        std::fs::write(workspace.path().join(".claude/session.json"), "sess").unwrap();
+
+        copy_agent_history("claude-code", workspace.path(), &dst_path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst_path.join("session.json")).unwrap(),
+            "sess"
+        );
     }
 }
