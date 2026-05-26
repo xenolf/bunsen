@@ -363,16 +363,24 @@ async fn run_sandbox(
     // case the DNS denial path is non-functional this Run, but the L3
     // nftables rule (next block) will not include a DNS exception either,
     // so guest DNS traffic surfaces as raw_tcp drops uniformly.
+    // Resolution order (slice 10p): explicit env var → host /etc/resolv.conf
+    // first `nameserver` line → 8.8.8.8:53 literal. The env var stays load-
+    // bearing for air-gapped hosts that need to override the host's resolver
+    // pick; the /etc/resolv.conf step is the implicit default that lets
+    // hosts behind a corporate or split-horizon resolver work without
+    // setting anything.
     use std::env;
-    let upstream_str = env::var("CRUCIBLE_DNS_UPSTREAM")
-        .unwrap_or_else(|_| "8.8.8.8:53".to_string());
-    let upstream: SocketAddr = upstream_str.parse().unwrap_or_else(|_| {
-        eprintln!(
-            "[egress] WARNING: invalid CRUCIBLE_DNS_UPSTREAM={upstream_str:?}, \
-             falling back to 8.8.8.8:53"
-        );
-        "8.8.8.8:53".parse().expect("static literal")
-    });
+    let upstream: SocketAddr = match env::var("CRUCIBLE_DNS_UPSTREAM") {
+        Ok(s) => s.parse().unwrap_or_else(|_| {
+            let fallback = dns::default_dns_upstream();
+            eprintln!(
+                "[egress] WARNING: invalid CRUCIBLE_DNS_UPSTREAM={s:?}, \
+                 falling back to {fallback}"
+            );
+            fallback
+        }),
+        Err(_) => dns::default_dns_upstream(),
+    };
     let dns_bind: SocketAddr = SocketAddr::from((net.host, 53));
     let (dns_port, dns_handle) = match dns::spawn_dns_listener(
         dns_bind,
