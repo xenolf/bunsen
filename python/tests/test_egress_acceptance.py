@@ -8,8 +8,12 @@ Run with:
 Can be run from any directory — no pytest plugin required beyond pytest itself.
 
 Optional env vars:
-    CRUCIBLE_MANAGE_FIREWALL=0   disable --manage-firewall (default: enabled)
-    CRUCIBLE_FIRECRACKER=/path   path to firecracker binary (default: "firecracker")
+    CRUCIBLE_ALPINE_ROOTFS=/path  also run every AC against an alpine-derived
+                                  rootfs (see adapters/_alpine-test/). When
+                                  set, each test runs twice — once per rootfs
+                                  — with pytest ids `[smoke]` and `[alpine]`.
+    CRUCIBLE_MANAGE_FIREWALL=0    disable --manage-firewall (default: enabled)
+    CRUCIBLE_FIRECRACKER=/path    path to firecracker binary (default: "firecracker")
 
 Assumes busybox is available inside the guest (wget, nc, nslookup, sh).
 The rootfs must have git for AC7 (User Story 21 demo); that test is skipped
@@ -33,17 +37,46 @@ pytestmark = pytest.mark.skipif(
 
 _KERNEL = os.environ.get("CRUCIBLE_KERNEL", "")
 _ROOTFS = os.environ.get("CRUCIBLE_ROOTFS", "")
+_ALPINE_ROOTFS = os.environ.get("CRUCIBLE_ALPINE_ROOTFS", "")
 _FIRECRACKER = os.environ.get("CRUCIBLE_FIRECRACKER", "")
 _MANAGE_FIREWALL = os.environ.get("CRUCIBLE_MANAGE_FIREWALL", "1") != "0"
 
 
-def _require_images():
-    """Call at the top of each test that needs real VM images."""
-    if not _KERNEL or not _ROOTFS:
-        pytest.skip("set CRUCIBLE_KERNEL and CRUCIBLE_ROOTFS to run acceptance tests")
+def _rootfs_params() -> list:
+    """Discover all rootfs sources from env and produce pytest params.
+
+    Each set env var contributes one parametrization. If neither is set, a
+    single "no-rootfs" param is emitted with a skip marker so the suite
+    collects (and reports a clean skip) instead of erroring at collection.
+    """
+    specs = []
+    if _ROOTFS:
+        specs.append(pytest.param(_ROOTFS, id="smoke"))
+    if _ALPINE_ROOTFS:
+        specs.append(pytest.param(_ALPINE_ROOTFS, id="alpine"))
+    if not specs:
+        specs.append(pytest.param(
+            None,
+            id="no-rootfs",
+            marks=pytest.mark.skip(
+                reason="set CRUCIBLE_ROOTFS and/or CRUCIBLE_ALPINE_ROOTFS to run acceptance tests"
+            ),
+        ))
+    return specs
 
 
-def _kvm_core_bin() -> str:
+@pytest.fixture(params=_rootfs_params())
+def rootfs(request) -> str:
+    """Yield each rootfs path the suite should exercise.
+
+    Skips when CRUCIBLE_KERNEL is missing — the rootfs alone isn't enough.
+    """
+    if not _KERNEL:
+        pytest.skip("set CRUCIBLE_KERNEL to run acceptance tests")
+    return request.param
+
+
+def _kvm_core_bin(rootfs_path: str) -> str:
     """Build the _core_bin string with --kernel/--rootfs flags.
 
     Intentionally bypasses CRUCIBLE_CORE_BIN — conftest.py sets that to the
@@ -66,13 +99,13 @@ def _kvm_core_bin() -> str:
         pytest.skip(
             "real crucible-core binary not found; build with `cargo build --release`"
         )
-    parts = [binary, "--kernel", _KERNEL, "--rootfs", _ROOTFS]
+    parts = [binary, "--kernel", _KERNEL, "--rootfs", rootfs_path]
     if _FIRECRACKER:
         parts += ["--firecracker", _FIRECRACKER]
     return " ".join(parts)
 
 
-async def _collect(spec: dict, timeout: float) -> tuple:
+async def _collect(spec: dict, timeout: float, rootfs_path: str) -> tuple:
     """Spawn crucible-core, collect events until RunEnded, capture stderr via temp file.
 
     Returns (events, stderr).
@@ -91,7 +124,7 @@ async def _collect(spec: dict, timeout: float) -> tuple:
     import time
     from crucible._events import decode_event, RunEnded as _RunEnded
 
-    cmd = _kvm_core_bin().split()
+    cmd = _kvm_core_bin(rootfs_path).split()
     if _MANAGE_FIREWALL:
         cmd += ["--manage-firewall"]
     cmd += ["--spec", _json.dumps(spec)]
@@ -162,9 +195,9 @@ async def _collect(spec: dict, timeout: float) -> tuple:
     return events, stderr
 
 
-def _run_and_collect(spec: dict, timeout: float = 90.0) -> list:
+def _run_and_collect(spec: dict, rootfs_path: str, timeout: float = 90.0) -> list:
     """Run a sandbox synchronously and return all events. No pytest-asyncio needed."""
-    events, stderr = asyncio.run(_collect(spec, timeout))
+    events, stderr = asyncio.run(_collect(spec, timeout, rootfs_path))
     if stderr:
         # Printed to pytest's captured output — visible with -s and in failure reports.
         print(f"\n[crucible-core stderr]\n{stderr}\n", flush=True)
@@ -197,7 +230,7 @@ def _spec(cmd: str, egress_endpoints: Optional[list] = None) -> dict:
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
-def test_ac1_allowed_domain_produces_no_egress_denied():
+def test_ac1_allowed_domain_produces_no_egress_denied(rootfs):
     """AC1: a domain in the egress allowlist produces no EgressDenied.
 
     wget connects via HTTPS_PROXY (injected by crucible). The proxy allows
@@ -205,12 +238,11 @@ def test_ac1_allowed_domain_produces_no_egress_denied():
     The underlying request may fail (no API key) — that is irrelevant; we
     only care that no EgressDenied event is emitted.
     """
-    _require_images()
     spec = _spec(
         "wget -q --timeout=10 -O /dev/null https://api.anthropic.com/ 2>&1 || true; echo DONE",
         egress_endpoints=["api.anthropic.com"],
     )
-    events = _run_and_collect(spec)
+    events = _run_and_collect(spec, rootfs)
 
     denials = _denials(events)
     assert denials == [], f"unexpected EgressDenied events: {denials}"
@@ -220,7 +252,7 @@ def test_ac1_allowed_domain_produces_no_egress_denied():
     assert ended.reason == "agent_exit"
 
 
-def test_ac2_blocked_https_produces_egress_denied():
+def test_ac2_blocked_https_produces_egress_denied(rootfs):
     """AC2: HTTPS to a domain not in the allowlist produces EgressDenied(https).
 
     With an empty egress-endpoints list, the proxy denies the CONNECT to
@@ -228,12 +260,11 @@ def test_ac2_blocked_https_produces_egress_denied():
     The agent receives a 403 from the proxy, so wget exits non-zero; the
     Run continues and exits normally (agent_exit).
     """
-    _require_images()
     spec = _spec(
         "wget -q --timeout=10 -O /dev/null https://github.com/ 2>&1 || true; echo DONE",
         egress_endpoints=[],
     )
-    events = _run_and_collect(spec)
+    events = _run_and_collect(spec, rootfs)
 
     denials = _denials(events)
     assert len(denials) >= 1, f"expected at least one EgressDenied, got: {events}"
@@ -247,18 +278,17 @@ def test_ac2_blocked_https_produces_egress_denied():
     assert ended.reason == "agent_exit"
 
 
-def test_ac3_adding_domain_to_allowlist_lifts_block():
+def test_ac3_adding_domain_to_allowlist_lifts_block(rootfs):
     """AC3: adding 'github.com' to egress-endpoints allows the HTTPS CONNECT.
 
     Same command as AC2, but with github.com in egress-endpoints. The proxy
     allows the CONNECT; no EgressDenied is emitted.
     """
-    _require_images()
     spec = _spec(
         "wget -q --timeout=10 -O /dev/null https://github.com/ 2>&1 || true; echo DONE",
         egress_endpoints=["github.com"],
     )
-    events = _run_and_collect(spec)
+    events = _run_and_collect(spec, rootfs)
 
     github_denials = [
         d for d in _denials(events) if d.destination == "github.com"
@@ -270,7 +300,7 @@ def test_ac3_adding_domain_to_allowlist_lifts_block():
     assert ended.reason == "agent_exit"
 
 
-def test_ac4_raw_tcp_bypass_produces_egress_denied_raw_tcp():
+def test_ac4_raw_tcp_bypass_produces_egress_denied_raw_tcp(rootfs):
     """AC4: a direct TCP connection that bypasses the proxy is dropped at L3.
 
     nc connects directly to 1.1.1.1:443 — not to the proxy. The nftables
@@ -280,12 +310,11 @@ def test_ac4_raw_tcp_bypass_produces_egress_denied_raw_tcp():
     A 2-second sleep after nc gives the kernel log pipeline time to flush
     before the agent exits and the denial channel is drained.
     """
-    _require_images()
     spec = _spec(
         "nc -w 3 1.1.1.1 443 </dev/null 2>&1 || true; sleep 2; echo DONE",
         egress_endpoints=[],
     )
-    events = _run_and_collect(spec)
+    events = _run_and_collect(spec, rootfs)
 
     raw_tcp_denials = [d for d in _denials(events) if d.protocol == "raw_tcp"]
     assert len(raw_tcp_denials) >= 1, (
@@ -293,7 +322,7 @@ def test_ac4_raw_tcp_bypass_produces_egress_denied_raw_tcp():
     )
 
 
-def test_ac5_dns_for_non_allowed_domain_produces_egress_denied_dns():
+def test_ac5_dns_for_non_allowed_domain_produces_egress_denied_dns(rootfs):
     """AC5: DNS lookup for a domain not in the allowlist produces EgressDenied(dns).
 
     crucible-init wrote /etc/resolv.conf pointing at the host-side DNS
@@ -301,12 +330,11 @@ def test_ac5_dns_for_non_allowed_domain_produces_egress_denied_dns():
     the listener evaluates the domain against the egress policy, returns
     REFUSED, and emits DenialEvent(protocol=dns).
     """
-    _require_images()
     spec = _spec(
         "nslookup github.com 2>&1 || true; echo DONE",
         egress_endpoints=[],
     )
-    events = _run_and_collect(spec)
+    events = _run_and_collect(spec, rootfs)
 
     dns_denials = [d for d in _denials(events) if d.protocol == "dns"]
     assert len(dns_denials) >= 1, (
@@ -320,14 +348,13 @@ def test_ac5_dns_for_non_allowed_domain_produces_egress_denied_dns():
     )
 
 
-def test_ac6_egress_denied_does_not_terminate_run():
+def test_ac6_egress_denied_does_not_terminate_run(rootfs):
     """AC6: multiple EgressDenied events leave the Run running; it exits normally.
 
     Two blocked HTTPS requests produce two denial events. The agent exits
     with exit_code=0 — the Run reason must be 'agent_exit', not 'killed',
     'stopped', or anything triggered by a denial.
     """
-    _require_images()
     spec = _spec(
         (
             "wget -q --timeout=5 -O /dev/null https://github.com/ 2>&1 || true; "
@@ -336,7 +363,7 @@ def test_ac6_egress_denied_does_not_terminate_run():
         ),
         egress_endpoints=[],
     )
-    events = _run_and_collect(spec)
+    events = _run_and_collect(spec, rootfs)
 
     denials = _denials(events)
     assert len(denials) >= 2, f"expected >= 2 EgressDenied events, got {denials}"
@@ -355,7 +382,7 @@ def test_ac6_egress_denied_does_not_terminate_run():
     )
 
 
-def test_ac7_user_story_21_clone_public_repo():
+def test_ac7_user_story_21_clone_public_repo(rootfs):
     """AC7 / User Story 21: with github.com in the egress policy, git clone works.
 
     This test requires git in the rootfs. It is skipped at runtime if
@@ -364,7 +391,6 @@ def test_ac7_user_story_21_clone_public_repo():
     A successful clone prints CLONE_OK; the test asserts that string appears
     in the agent's stdout output and that no github.com EgressDenied was emitted.
     """
-    _require_images()
     from crucible._events import Output
 
     # The command first checks for git; if absent it prints NO_GIT and exits 0
@@ -376,7 +402,7 @@ def test_ac7_user_story_21_clone_public_repo():
     )
     spec = _spec(check_then_clone, egress_endpoints=["github.com"])
 
-    events = _run_and_collect(spec, timeout=120.0)
+    events = _run_and_collect(spec, rootfs, timeout=120.0)
 
     stdout_text = "".join(
         e.text for e in events if isinstance(e, Output) and e.stream == "stdout"
