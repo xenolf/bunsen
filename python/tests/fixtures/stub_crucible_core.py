@@ -2,10 +2,7 @@
 """Stub crucible-core for testing. Reads --spec, emits scripted NDJSON to stdout."""
 import json
 import sys
-import os
-import signal
 import time
-import threading
 
 RUN_ID = "01HWTEST00000000000000000A"
 WORKSPACE = f"/tmp/crucible-test-runs/{RUN_ID}/workspace"

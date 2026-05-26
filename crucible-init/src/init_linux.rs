@@ -218,10 +218,10 @@ fn mount_filesystems() {
 
 fn mount_workspace() {
     // /dev/vdb is the workspace ext4 block device attached by Firecracker.
-    mount_fs("/dev/vdb", "/workspace", "ext4", libc::MS_RELATIME as u64, None);
+    mount_fs("/dev/vdb", "/workspace", "ext4", libc::MS_RELATIME, None);
 }
 
-fn mount_fs(source: &str, target: &str, fs: &str, flags: u64, data: Option<&str>) {
+fn mount_fs(source: &str, target: &str, fs: &str, flags: libc::c_ulong, data: Option<&str>) {
     let src = CString::new(source).unwrap();
     let tgt = CString::new(target).unwrap();
     let typ = CString::new(fs).unwrap();
@@ -231,7 +231,7 @@ fn mount_fs(source: &str, target: &str, fs: &str, flags: u64, data: Option<&str>
         .unwrap_or(std::ptr::null());
 
     let ret = unsafe {
-        libc::mount(src.as_ptr(), tgt.as_ptr(), typ.as_ptr(), flags as libc::c_ulong, data_ptr)
+        libc::mount(src.as_ptr(), tgt.as_ptr(), typ.as_ptr(), flags, data_ptr)
     };
     if ret != 0 {
         let err = io::Error::last_os_error();
@@ -378,16 +378,12 @@ fn fork_exec(spec: &InitSpec) -> (pid_t, RawFd, RawFd) {
                 // Match the OCI image's WORKDIR. Adapters like claude-code
                 // derive memory/session paths from cwd and can fail silently
                 // when started at "/".
-                let ws = b"/workspace\0".as_ptr() as *const libc::c_char;
-                libc::chdir(ws);
+                libc::chdir(c"/workspace".as_ptr());
 
                 // fd 0 = /dev/null    (isatty(0)=false)
                 // fd 1 = stdout pipe  (isatty(1)=false → streaming mode)
                 // fd 2 = stderr pipe
-                let devnull = libc::open(
-                    b"/dev/null\0".as_ptr() as *const libc::c_char,
-                    libc::O_RDONLY,
-                );
+                let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
                 libc::dup2(devnull, libc::STDIN_FILENO);
                 libc::dup2(stdout_pipe[1], libc::STDOUT_FILENO);
                 libc::dup2(stderr_pipe[1], libc::STDERR_FILENO);

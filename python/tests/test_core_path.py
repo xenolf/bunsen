@@ -38,7 +38,7 @@ def test_env_var_overrides_everything(core_path_module, monkeypatch, tmp_path):
     pkg_bin = pkg_dir / "bin" / "crucible-core"
     _make_exec(pkg_bin)
     try:
-        monkeypatch.setenv("CRUCIBLE_CORE_BIN", f"/custom/path/crucible-core --flag")
+        monkeypatch.setenv("CRUCIBLE_CORE_BIN", "/custom/path/crucible-core --flag")
         argv = core_path_module.find_core_bin()
         assert argv == ["/custom/path/crucible-core", "--flag"]
     finally:

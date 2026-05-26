@@ -2,12 +2,9 @@
 from __future__ import annotations
 import asyncio
 import json
-import sys
 import threading
-from contextlib import contextmanager
 from typing import AsyncIterator, Iterator, Optional
 
-from ._core_path import find_core_bin
 from ._events import RunStarted, RunEnded, decode_event, _Base, SchemaVersionError
 
 

@@ -156,7 +156,7 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
     unsafe {
         cmd.pre_exec(|| {
             nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             Ok(())
         });
     }

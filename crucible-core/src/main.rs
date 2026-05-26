@@ -228,7 +228,7 @@ async fn run_with_backend(
                 })?;
                 oci_cache::resolve_rootfs(oci_ref)
                     .await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))?
+                    .map_err(|e| std::io::Error::other(format!("{e:#}")))?
             }
         };
         return run_sandbox(kernel, rootfs, firecracker_bin, manage_firewall, spec, run_id, enc, workspace_path).await;
@@ -330,7 +330,7 @@ async fn run_sandbox(
     );
     create_tap(&tap_name, net.host, net.prefix_len)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))?;
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
 
     // ── Slice 10k: host iptables co-existence ─────────────────────────────
     // The pre-flight probe in main() already decided whether we can proceed.
@@ -345,7 +345,7 @@ async fn run_sandbox(
         let _ = firewall::remove_tap_allow(&tap_name).await;
         firewall::add_tap_allow(&tap_name)
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))?;
+            .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
         eprintln!("[firewall] installed per-TAP allow rule for {tap_name}");
         Some(firewall::TapAllowGuard::new(tap_name.clone()))
     } else {
@@ -523,7 +523,7 @@ async fn run_sandbox(
 
     let mut handle = start_firecracker(&config, &fc_bin)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))?;
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
 
     let egress_ctx = EgressContext {
         denied_rx,
@@ -544,7 +544,7 @@ async fn run_sandbox(
     // earlier failed.
     let _ = delete_nftables_table(&nft_table).await;
 
-    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:#}")))
+    result.map_err(|e| std::io::Error::other(format!("{e:#}")))
 }
 
 struct CliArgs {

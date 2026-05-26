@@ -24,6 +24,8 @@
 //! acceptance work. Adding HTTP later is a small extension to the same
 //! request-parsing/decide/forward shape.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::io;
 use std::net::SocketAddr;
 
@@ -46,7 +48,7 @@ pub struct ConnectRequest {
 /// future structured logging.
 #[derive(Debug)]
 pub enum ParseError {
-    Io(io::Error),
+    Io(#[allow(dead_code)] io::Error),
     Empty,
     /// Method was not CONNECT. Carries the (trimmed) first request line so the
     /// caller can attempt absolute-URI parsing for BusyBox-style wget requests.
@@ -109,7 +111,7 @@ where
 /// `GET https://github.com/ HTTP/1.1`. Returns `None` for relative URIs or
 /// unknown schemes so the caller can fall back to a plain 400.
 fn extract_abs_uri_host(first_line: &str) -> Option<(String, u16)> {
-    let uri = first_line.splitn(3, ' ').nth(1)?;
+    let uri = first_line.split(' ').nth(1)?;
     let (rest, default_port): (&str, u16) = if let Some(s) = uri.strip_prefix("https://") {
         (s, 443)
     } else if let Some(s) = uri.strip_prefix("http://") {
@@ -414,7 +416,7 @@ mod tests {
                 .lock()
                 .await
                 .take()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "already taken"))
+                .ok_or_else(|| io::Error::other("already taken"))
         }
     }
 

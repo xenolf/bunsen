@@ -24,7 +24,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncRead};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
@@ -42,6 +42,9 @@ pub struct FirecrackerHandle {
 }
 
 impl FirecrackerHandle {
+    // Hard-kill fallback. Today the supervisor only does cooperative kill via
+    // vsock; this is here for a follow-up slice that adds a timeout escape.
+    #[allow(dead_code)]
     pub async fn kill(&mut self) -> Result<()> {
         self.process.kill().await?;
         Ok(())
@@ -337,7 +340,7 @@ async fn read_http_headers(stream: &mut UnixStream) -> Result<(u16, usize, Vec<u
         .filter_map(|l| {
             let lower = l.to_ascii_lowercase();
             lower.starts_with("content-length:").then(|| {
-                l.splitn(2, ':').nth(1).unwrap_or("").trim().parse::<usize>().ok()
+                l.split_once(':').map(|x| x.1).unwrap_or("").trim().parse::<usize>().ok()
             }).flatten()
         })
         .next()
@@ -360,7 +363,6 @@ async fn connect_host_to_guest(vsock_uds: &Path, port: u32) -> Result<UnixStream
     // truly broken guest fails before the host's stdout/stderr accept
     // timeouts elapse.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut last_reply = String::new();
     loop {
         let mut stream = UnixStream::connect(vsock_uds)
             .await
@@ -378,9 +380,8 @@ async fn connect_host_to_guest(vsock_uds: &Path, port: u32) -> Result<UnixStream
         if reply.starts_with("OK") {
             return Ok(stream);
         }
-        last_reply = reply;
         if std::time::Instant::now() >= deadline {
-            bail!("vsock CONNECT rejected: {last_reply}");
+            bail!("vsock CONNECT rejected: {reply}");
         }
         // Drop the failed UDS stream and back off briefly before retrying.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -586,8 +587,6 @@ pub async fn create_workspace_ext4_from_dir(path: &Path, source_dir: &Path, size
 /// the VM exits, so agent writes are visible on the host.
 /// Requires root (uses losetup + mount).
 pub async fn extract_workspace_from_ext4(ext4_path: &Path, target_dir: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
     // Get the loop device for the ext4 image.
     let losetup = Command::new("losetup")
         .args(["-f", "--show", &ext4_path.to_string_lossy()])

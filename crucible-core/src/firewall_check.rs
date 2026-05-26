@@ -18,6 +18,8 @@
 //! rationale and the exact error message printed by the caller on
 //! [`Decision::Blocked`] without an explicit opt-in.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 /// Whether the host's iptables INPUT chain would drop a packet arriving from
 /// the per-Run /30 in `169.254.0.0/16`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

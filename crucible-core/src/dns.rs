@@ -702,7 +702,7 @@ mod tests {
         // 5 × 63-byte labels = 315 bytes + 5 length bytes = 320 > 255.
         for _ in 0..5 {
             q.push(63);
-            q.extend(std::iter::repeat(b'a').take(63));
+            q.extend(std::iter::repeat_n(b'a', 63));
         }
         q.push(0);
         q.extend_from_slice(&qtype::A.to_be_bytes());
@@ -934,7 +934,7 @@ mod tests {
     #[async_trait::async_trait]
     impl DnsResolver for FailingResolver {
         async fn resolve(&self, _query: &[u8]) -> io::Result<Vec<u8>> {
-            Err(io::Error::new(io::ErrorKind::Other, "upstream broken"))
+            Err(io::Error::other("upstream broken"))
         }
     }
 

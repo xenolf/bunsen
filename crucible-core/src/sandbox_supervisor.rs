@@ -46,7 +46,7 @@ enum ControlCmd {
     Timeout,
 }
 
-pub fn parse_cmd(line: &str) -> Option<ControlCmd> {
+fn parse_cmd(line: &str) -> Option<ControlCmd> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     match v.get("op")?.as_str()? {
         "stop" => Some(ControlCmd::Stop),

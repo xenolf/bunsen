@@ -12,6 +12,8 @@
 //! Linux-only `nft -f -` shell-out, cleanup, and kernel-log tailing live in
 //! [`crate::firecracker`] alongside the TAP lifecycle.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::io;
 use std::net::Ipv4Addr;
 
@@ -590,7 +592,7 @@ mod tests {
         let mut input = String::new();
         input.push_str("May 25 12:34:56 host kernel: usb 1-1: new high-speed USB device\n");
         input.push_str("audit: type=1400 something\n");
-        input.push_str("\n");
+        input.push('\n');
         // A line carrying the marker but missing DST= must also be skipped.
         input.push_str(&format!(
             "{}IN=tap-x OUT= PROTO=TCP DPT=443\n",

@@ -12,6 +12,8 @@
 //! `Protocol` mirrors the four shapes of denial the enforcer surfaces:
 //! L7 → `http`/`https`, L3 nftables drop → `raw_tcp`, DNS resolver → `dns`.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -76,7 +78,7 @@ impl EgressPolicy {
     pub fn compose(adapter_declared: &[&str], user_added: &[String]) -> Self {
         let mut seen = std::collections::HashSet::<String>::new();
         let mut allowed = Vec::new();
-        for s in adapter_declared.iter().copied() {
+        for s in adapter_declared {
             let norm = s.trim().to_ascii_lowercase();
             if !norm.is_empty() && seen.insert(norm.clone()) {
                 allowed.push(norm);
@@ -98,6 +100,7 @@ impl EgressPolicy {
         self.allowed.iter().any(|a| a == &norm)
     }
 
+    #[cfg(test)]
     pub fn as_slice(&self) -> &[String] {
         &self.allowed
     }
@@ -123,7 +126,7 @@ mod tests {
     fn compose_unions_adapter_and_user() {
         let p = EgressPolicy::compose(
             &["api.anthropic.com"],
-            &vec!["github.com".to_string()],
+            &["github.com".to_string()],
         );
         assert!(p.allows("api.anthropic.com"));
         assert!(p.allows("github.com"));
@@ -134,7 +137,7 @@ mod tests {
     fn compose_dedupes_case_insensitively() {
         let p = EgressPolicy::compose(
             &["API.Anthropic.COM"],
-            &vec!["api.anthropic.com".to_string(), " api.anthropic.com ".to_string()],
+            &["api.anthropic.com".to_string(), " api.anthropic.com ".to_string()],
         );
         assert_eq!(p.as_slice().len(), 1);
         assert_eq!(p.as_slice()[0], "api.anthropic.com");
@@ -144,14 +147,14 @@ mod tests {
     fn compose_skips_empty_entries() {
         let p = EgressPolicy::compose(
             &[""],
-            &vec!["".to_string(), "  ".to_string(), "github.com".to_string()],
+            &["".to_string(), "  ".to_string(), "github.com".to_string()],
         );
         assert_eq!(p.as_slice(), &["github.com".to_string()]);
     }
 
     #[test]
     fn allows_is_exact_no_suffix_matching() {
-        let p = EgressPolicy::compose(&["github.com"], &vec![]);
+        let p = EgressPolicy::compose(&["github.com"], &[]);
         assert!(p.allows("github.com"));
         // Subdomain not implicitly allowed.
         assert!(!p.allows("api.github.com"));
@@ -161,7 +164,7 @@ mod tests {
 
     #[test]
     fn empty_policy_denies_everything() {
-        let p = EgressPolicy::compose(&[], &vec![]);
+        let p = EgressPolicy::compose(&[], &[]);
         assert!(!p.allows("api.anthropic.com"));
         assert!(p.as_slice().is_empty());
     }
@@ -190,7 +193,7 @@ mod tests {
     fn adapter_endpoints_first_then_user() {
         let p = EgressPolicy::compose(
             &["a.example", "b.example"],
-            &vec!["c.example".to_string(), "a.example".to_string()],
+            &["c.example".to_string(), "a.example".to_string()],
         );
         assert_eq!(
             p.as_slice(),

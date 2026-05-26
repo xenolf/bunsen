@@ -8,6 +8,8 @@
 //! The L7 proxy will bind on the host's `.1` in a follow-up slice so the
 //! address injected as `HTTPS_PROXY` is reachable from inside the guest.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::net::Ipv4Addr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

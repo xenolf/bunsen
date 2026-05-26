@@ -9,6 +9,8 @@
 //! not be present on every Adapter image, but `crucible-init` itself is the
 //! same static binary in every rootfs.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use serde::Deserialize;
 use std::io;
 use std::net::Ipv4Addr;

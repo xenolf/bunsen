@@ -1,9 +1,7 @@
 """Tests for the Python subprocess driver against a stub crucible-core."""
 import asyncio
-import os
 import sys
 import pytest
-import pytest_asyncio
 from pathlib import Path
 
 STUB = Path(__file__).parent / "fixtures" / "stub_crucible_core.py"

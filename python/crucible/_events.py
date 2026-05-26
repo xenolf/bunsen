@@ -1,7 +1,7 @@
 """Typed event dataclasses for crucible's NDJSON event stream."""
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 SCHEMA_VERSION = 1
 

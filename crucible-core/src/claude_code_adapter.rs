@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use serde_json::{json, Value};
 
 /// Declared egress endpoints required by the Claude Code adapter.

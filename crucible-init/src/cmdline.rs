@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 
 /// Extract and base64-decode the `crucible_spec=` token from the kernel cmdline.

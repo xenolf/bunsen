@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use base64::{Engine, engine::general_purpose::STANDARD};

@@ -24,6 +24,8 @@
 //! `model_usage` flush triggered by the next `> prompt` or by
 //! [`AiderParser::flush`] at end-of-stream.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use serde_json::{json, Value};
 
 /// Endpoints aider needs based on the configured model name. The empty
@@ -181,7 +183,7 @@ impl AiderParser {
     }
 
     /// If a Tokens: line is pending, emit it as a cost-less model_usage
-    /// + close the open turn. Used both as a per-line precondition and
+    /// and close the open turn. Used both as a per-line precondition and
     /// by [`AiderParser::flush`] at end-of-stream.
     fn flush_pending_usage(&mut self) -> Option<Vec<(String, Value)>> {
         let pending = self.pending_usage.take()?;
