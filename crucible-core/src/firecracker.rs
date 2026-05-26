@@ -351,22 +351,40 @@ async fn read_http_headers(stream: &mut UnixStream) -> Result<(u16, usize, Vec<u
 /// Connect to the Firecracker vsock UDS and send `CONNECT {port}\n` to
 /// establish a host→guest channel on the given vsock port.
 async fn connect_host_to_guest(vsock_uds: &Path, port: u32) -> Result<UnixStream> {
-    let mut stream = UnixStream::connect(vsock_uds)
-        .await
-        .context("connect to vsock UDS")?;
-    stream
-        .write_all(format!("CONNECT {port}\n").as_bytes())
-        .await?;
-    stream.flush().await?;
+    // The guest may still be calling socket()/bind()/listen() on `port` when
+    // the host fires off the CONNECT — Firecracker replies with a rejection
+    // line if no listener is bound yet. Retry on rejection (only) with a
+    // short backoff until the total elapsed exceeds the deadline; surface
+    // other errors (UDS connect, I/O) immediately. The 2 s budget is well
+    // above the worst-case observed gap (~50 ms) but short enough that a
+    // truly broken guest fails before the host's stdout/stderr accept
+    // timeouts elapse.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut last_reply = String::new();
+    loop {
+        let mut stream = UnixStream::connect(vsock_uds)
+            .await
+            .context("connect to vsock UDS")?;
+        stream
+            .write_all(format!("CONNECT {port}\n").as_bytes())
+            .await?;
+        stream.flush().await?;
 
-    // Firecracker replies "OK <cid> <port>\n" on success.
-    let mut ack = vec![0u8; 32];
-    let n = stream.read(&mut ack).await?;
-    let reply = std::str::from_utf8(&ack[..n]).unwrap_or("").trim().to_string();
-    if !reply.starts_with("OK") {
-        bail!("vsock CONNECT rejected: {reply}");
+        // Firecracker replies "OK <cid> <port>\n" on success, otherwise a
+        // line like "Failed to accept connection: ...\n".
+        let mut ack = vec![0u8; 64];
+        let n = stream.read(&mut ack).await?;
+        let reply = std::str::from_utf8(&ack[..n]).unwrap_or("").trim().to_string();
+        if reply.starts_with("OK") {
+            return Ok(stream);
+        }
+        last_reply = reply;
+        if std::time::Instant::now() >= deadline {
+            bail!("vsock CONNECT rejected: {last_reply}");
+        }
+        // Drop the failed UDS stream and back off briefly before retrying.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Ok(stream)
 }
 
 // ─── TAP device management ─────────────────────────────────────────────────
