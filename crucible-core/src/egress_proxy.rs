@@ -48,7 +48,9 @@ pub struct ConnectRequest {
 pub enum ParseError {
     Io(io::Error),
     Empty,
-    NotConnect,
+    /// Method was not CONNECT. Carries the (trimmed) first request line so the
+    /// caller can attempt absolute-URI parsing for BusyBox-style wget requests.
+    NotConnect(String),
     MalformedTarget,
     BadPort,
 }
@@ -77,7 +79,7 @@ where
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     if !method.eq_ignore_ascii_case("CONNECT") {
-        return Err(ParseError::NotConnect);
+        return Err(ParseError::NotConnect(trimmed.to_string()));
     }
     let (host, port_str) = target.rsplit_once(':').ok_or(ParseError::MalformedTarget)?;
     if host.is_empty() {
@@ -101,6 +103,32 @@ where
         host: host.to_string(),
         port,
     })
+}
+
+/// Extract `(host, port)` from an absolute-URI request line such as
+/// `GET https://github.com/ HTTP/1.1`. Returns `None` for relative URIs or
+/// unknown schemes so the caller can fall back to a plain 400.
+fn extract_abs_uri_host(first_line: &str) -> Option<(String, u16)> {
+    let uri = first_line.splitn(3, ' ').nth(1)?;
+    let (rest, default_port): (&str, u16) = if let Some(s) = uri.strip_prefix("https://") {
+        (s, 443)
+    } else if let Some(s) = uri.strip_prefix("http://") {
+        (s, 80)
+    } else {
+        return None;
+    };
+    // Strip path: rest is "github.com/path" or "github.com:8080/path"
+    let host_part = rest.split('/').next().unwrap_or(rest);
+    if let Some((host, port_str)) = host_part.rsplit_once(':') {
+        if !host.is_empty() {
+            return Some((host.to_string(), port_str.parse().unwrap_or(default_port)));
+        }
+    }
+    if !host_part.is_empty() {
+        Some((host_part.to_string(), default_port))
+    } else {
+        None
+    }
 }
 
 /// Decision for a parsed `CONNECT` request.
@@ -163,6 +191,32 @@ pub async fn serve_connection<C, S>(
     let mut client = BufReader::new(client);
     let req = match read_connect_request(&mut client).await {
         Ok(r) => r,
+        Err(ParseError::NotConnect(first_line)) => {
+            // BusyBox wget sends absolute-URI GETs instead of CONNECT. Apply
+            // the egress policy so blocked domains still produce EgressDenied.
+            if let Some((host, port)) = extract_abs_uri_host(&first_line) {
+                let pseudo = ConnectRequest { host: host.clone(), port };
+                if let Decision::Deny { reason } = evaluate(&pseudo, policy) {
+                    let _ = client.write_all(RESP_FORBIDDEN).await;
+                    let _ = client.shutdown().await;
+                    let proto = match port {
+                        443 => Protocol::Https,
+                        80 => Protocol::Http,
+                        _ => Protocol::RawTcp,
+                    };
+                    let _ = denied_tx.send(DenialEvent {
+                        destination: host,
+                        protocol: proto,
+                        reason,
+                    });
+                    return;
+                }
+            }
+            // Allowed domain or unrecognized URI form → 400, no DenialEvent.
+            let _ = client.write_all(RESP_BAD_REQUEST).await;
+            let _ = client.shutdown().await;
+            return;
+        }
         Err(_) => {
             let _ = client.write_all(RESP_BAD_REQUEST).await;
             let _ = client.shutdown().await;
@@ -281,7 +335,7 @@ mod tests {
         let raw = b"GET / HTTP/1.1\r\n\r\n";
         let mut r = BufReader::new(&raw[..]);
         let err = read_connect_request(&mut r).await.unwrap_err();
-        assert!(matches!(err, ParseError::NotConnect));
+        assert!(matches!(err, ParseError::NotConnect(_)));
     }
 
     #[tokio::test]
@@ -500,6 +554,87 @@ mod tests {
         let s = String::from_utf8_lossy(&resp);
         assert!(s.starts_with("HTTP/1.1 400"), "got: {s}");
         assert!(rx.try_recv().is_err(), "malformed request is not a policy denial");
+    }
+
+    #[test]
+    fn extract_abs_uri_host_https() {
+        assert_eq!(
+            extract_abs_uri_host("GET https://github.com/ HTTP/1.1"),
+            Some(("github.com".into(), 443))
+        );
+    }
+
+    #[test]
+    fn extract_abs_uri_host_http() {
+        assert_eq!(
+            extract_abs_uri_host("GET http://example.com/path HTTP/1.1"),
+            Some(("example.com".into(), 80))
+        );
+    }
+
+    #[test]
+    fn extract_abs_uri_host_with_explicit_port() {
+        assert_eq!(
+            extract_abs_uri_host("GET https://example.com:8443/foo HTTP/1.1"),
+            Some(("example.com".into(), 8443))
+        );
+    }
+
+    #[test]
+    fn extract_abs_uri_host_relative_uri_returns_none() {
+        assert_eq!(extract_abs_uri_host("GET / HTTP/1.1"), None);
+    }
+
+    #[test]
+    fn extract_abs_uri_host_empty_returns_none() {
+        assert_eq!(extract_abs_uri_host(""), None);
+    }
+
+    #[tokio::test]
+    async fn abs_uri_blocked_domain_emits_403_and_denial_event() {
+        // BusyBox wget sends GET https://github.com/ HTTP/1.1 instead of CONNECT.
+        // The proxy must still enforce the egress policy and emit a denial event.
+        let (mut client, server) = duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let p = policy(&[]);
+
+        client
+            .write_all(b"GET https://github.com/ HTTP/1.1\r\nHost: github.com\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        serve_connection(server, &p, &UnreachableConnector, &tx).await;
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("HTTP/1.1 403"), "got: {s}");
+
+        let event = rx.try_recv().expect("denial event must be sent");
+        assert_eq!(event.destination, "github.com");
+        assert_eq!(event.protocol, Protocol::Https);
+    }
+
+    #[tokio::test]
+    async fn abs_uri_allowed_domain_returns_400_no_denial_event() {
+        // Allowed domain with abs-URI: can't tunnel (not CONNECT), so 400,
+        // but no EgressDenied since the domain is permitted.
+        let (mut client, server) = duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let p = policy(&["api.anthropic.com"]);
+
+        client
+            .write_all(b"GET https://api.anthropic.com/ HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        serve_connection(server, &p, &UnreachableConnector, &tx).await;
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("HTTP/1.1 400"), "got: {s}");
+        assert!(rx.try_recv().is_err(), "allowed domain must not produce a denial event");
     }
 
     #[tokio::test]
