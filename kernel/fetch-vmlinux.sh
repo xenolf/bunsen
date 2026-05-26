@@ -9,17 +9,38 @@
 #   ${XDG_CACHE_HOME:-~/.cache}/crucible/kernel/vmlinux-<VERSION>
 # and is symlinked as:
 #   ${XDG_CACHE_HOME:-~/.cache}/crucible/kernel/vmlinux  (the default for builds)
+#
+# Host architecture is detected from `uname -m`; the constants below must agree
+# with crucible-core/src/kernel.rs (KERNEL_VERSION / KERNEL_URL / KERNEL_SHA256)
+# so the two implementations share a cache.
 
 set -euo pipefail
 
 # ── Pinned kernel ────────────────────────────────────────────────────────────
-# Firecracker-CI guest kernel (x86_64). CI_VERSION tracks the matching
-# Firecracker release line; see:
+# Firecracker-CI guest kernel. CI_VERSION tracks the matching Firecracker
+# release line; see:
 #   https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md
 CI_VERSION="v1.15"
 KERNEL_VERSION="6.1.155"
-KERNEL_SHA256="e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2"
-KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${CI_VERSION}/x86_64/vmlinux-${KERNEL_VERSION}"
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)
+        KERNEL_SHA256="e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2"
+        KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${CI_VERSION}/x86_64/vmlinux-${KERNEL_VERSION}"
+        ;;
+    aarch64|arm64)
+        # Linux reports aarch64; macOS reports arm64. Both map to the same
+        # Firecracker aarch64 image — but Firecracker only runs on Linux, so
+        # the macOS case is only useful for `--check`-style smoke tests.
+        KERNEL_SHA256="e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591"
+        KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${CI_VERSION}/aarch64/vmlinux-${KERNEL_VERSION}"
+        ;;
+    *)
+        echo "fetch-vmlinux: error: unsupported architecture: $ARCH (expected x86_64 or aarch64)" >&2
+        exit 1
+        ;;
+esac
 
 CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/crucible/kernel"
 DEST="${CACHE_DIR}/vmlinux-${KERNEL_VERSION}"
@@ -62,7 +83,7 @@ if [[ "${1:-}" == "--check" ]]; then
         exit 1
     fi
     if verify "$DEST" "$KERNEL_SHA256"; then
-        info "cached vmlinux matches pinned SHA-256 ✓"
+        info "cached vmlinux matches pinned SHA-256 ($ARCH) ✓"
         exit 0
     else
         exit 1
@@ -75,7 +96,7 @@ mkdir -p "$CACHE_DIR"
 
 if [[ -f "$DEST" ]]; then
     if verify "$DEST" "$KERNEL_SHA256"; then
-        info "already cached: $DEST"
+        info "already cached ($ARCH): $DEST"
         ln -sf "$DEST" "$LINK"
         exit 0
     else
@@ -84,7 +105,7 @@ if [[ -f "$DEST" ]]; then
     fi
 fi
 
-info "downloading vmlinux-${KERNEL_VERSION}…"
+info "downloading vmlinux-${KERNEL_VERSION} for $ARCH…"
 info "  from: $KERNEL_URL"
 info "  to:   $DEST"
 

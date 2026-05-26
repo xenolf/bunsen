@@ -7,6 +7,7 @@ mod egress_proxy;
 mod encoder;
 mod events;
 mod firewall_check;
+mod kernel;
 mod oci_cache;
 mod redactor;
 mod run_dir;
@@ -64,13 +65,42 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // ── Slice 02 (v1.1): lazy kernel resolve ──────────────────────────────
+    // On Linux, when sandbox mode is intended but the user didn't pass an
+    // explicit `--kernel /path`, fetch the pinned Firecracker-CI vmlinux
+    // (lazy on first call, cached afterwards). Side-effecting work — run_dir
+    // creation, transcript open, run_started emission — happens *after* this
+    // step so a download/SHA failure surfaces as a clean top-level error
+    // rather than partway through a Run.
+    //
+    // The trigger for "sandbox is intended" is `--rootfs` or `spec.oci_image`.
+    // Without either we have nothing to boot, so we fall through to the
+    // host-subprocess path and don't waste a kernel fetch.
+    #[cfg(target_os = "linux")]
+    let resolved_kernel: Option<std::path::PathBuf> = if let Some(k) = cli.kernel.clone() {
+        Some(k)
+    } else if spec.oci_image.is_some() || cli.rootfs.is_some() {
+        match kernel::ensure_kernel().await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("[crucible-core] failed to acquire guest kernel: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let resolved_kernel: Option<std::path::PathBuf> = cli.kernel.clone();
+
     // ── Slice 10k: host firewall probe ────────────────────────────────────
     // Probe BEFORE we touch the run_dir, transcript, or emit run_started so
     // that an aborted probe leaves zero side effects on the host. Only runs
-    // on Linux in sandbox mode (--kernel provided); macOS and host-subprocess
-    // paths don't share a kernel with the L7 proxy and have nothing to probe.
+    // on Linux when we'll enter sandbox mode (kernel resolved); macOS and
+    // host-subprocess paths don't share a kernel with the L7 proxy and have
+    // nothing to probe.
     #[cfg(target_os = "linux")]
-    if cli.kernel.is_some() {
+    if resolved_kernel.is_some() {
         if let Err(msg) = check_host_firewall(cli.manage_firewall).await {
             eprintln!("{msg}");
             std::process::exit(1);
@@ -149,7 +179,7 @@ async fn main() {
 
     // ── Dispatch: sandbox (Linux + --kernel/--rootfs) or host subprocess ───
     let agent_history_path = run_dir.agent_history_path();
-    let result = run_with_backend(cli.kernel, cli.rootfs, cli.firecracker, cli.manage_firewall, &spec, &run_id, &mut enc, &workspace_path, Some(&agent_history_path)).await;
+    let result = run_with_backend(resolved_kernel, cli.rootfs, cli.firecracker, cli.manage_firewall, &spec, &run_id, &mut enc, &workspace_path, Some(&agent_history_path)).await;
 
     let ended_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let exit_reason = if result.is_ok() { "agent_exit" } else { "supervisor_error" };
