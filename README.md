@@ -31,9 +31,9 @@ cargo build --release -p crucible-init --target x86_64-unknown-linux-musl
 #    ${XDG_CACHE_HOME:-~/.cache}/crucible/kernel/vmlinux).
 ./kernel/fetch-vmlinux.sh
 
-# 3. Install the Python library
+# 3. Install the Python library (editable install from repo root; maturin backend)
 python -m venv .venv && source .venv/bin/activate
-pip install -e ./python
+pip install -e .
 
 # 4. (Optional) build the smoke-test rootfs so you can run end-to-end
 #    without pulling an OCI image.
@@ -47,10 +47,11 @@ After step 4, the rootfs lives at `target/smoke-rootfs.ext4`.
 The Python library finds the `crucible-core` host binary in this order:
 
 1. `CRUCIBLE_CORE_BIN` environment variable (a full argv string, space-separated)
-2. `target/release/crucible-core` walking up from the installed `crucible/` package
-3. `crucible-core` on `$PATH`
+2. `crucible/bin/crucible-core` adjacent to the installed `crucible/` package (the published-wheel layout)
+3. `target/release/crucible-core` walking up from the installed `crucible/` package (cargo dev build)
+4. `crucible-core` on `$PATH`
 
-If none match, `crucible.run(...)` raises `FileNotFoundError` with the three options.
+If none match, `crucible.run(...)` raises `FileNotFoundError` with all four options.
 
 ## First Run
 
@@ -93,7 +94,7 @@ A Run's outputs land under `${XDG_RUNTIME_DIR:-/tmp}/crucible/runs/<run_id>/`: t
 ```sh
 cargo test                              # host-side Rust + crucible-init unit tests
 cargo check --target x86_64-unknown-linux-musl -p crucible-core   # cross-check
-pip install -e './python[dev]' && pytest -q python/tests          # Python unit tests
+pip install -e '.[dev]' && pytest -q python/tests                  # Python unit tests
 
 # Acceptance suite (Linux + KVM required)
 CRUCIBLE_KERNEL=~/.cache/crucible/kernel/vmlinux \
