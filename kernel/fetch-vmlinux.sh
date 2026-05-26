@@ -13,15 +13,13 @@
 set -euo pipefail
 
 # ── Pinned kernel ────────────────────────────────────────────────────────────
-# Firecracker v1.7.0 guest kernel (x86_64).
-# Source: https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md
-KERNEL_VERSION="6.1.102"
-KERNEL_SHA256="7c6d47f09f98d6e8da4dd0ef2a5d3edfb6f1a7f9c5a9e8b3d2e1f0a4c7b6d5e2"
-KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.7/x86_64/vmlinux-${KERNEL_VERSION}"
-# ─────────────────────────────────────────────────────────────────────────────
-# NOTE: Replace KERNEL_SHA256 with the actual SHA-256 from the Firecracker
-# release notes before using this script in production.
-# ─────────────────────────────────────────────────────────────────────────────
+# Firecracker-CI guest kernel (x86_64). CI_VERSION tracks the matching
+# Firecracker release line; see:
+#   https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md
+CI_VERSION="v1.15"
+KERNEL_VERSION="6.1.155"
+KERNEL_SHA256="e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2"
+KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${CI_VERSION}/x86_64/vmlinux-${KERNEL_VERSION}"
 
 CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/crucible/kernel"
 DEST="${CACHE_DIR}/vmlinux-${KERNEL_VERSION}"
