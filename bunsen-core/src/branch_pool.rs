@@ -73,6 +73,52 @@ pub struct ManifestEntry {
     pub force: bool,
 }
 
+/// A [`ManifestEntry`] with both refs already resolved against the Pool and
+/// host repo. `host_sha` is `None` when the host has no ref by that name,
+/// which is trivially fast-forwardable (it's a brand-new branch on the host).
+///
+/// Extracted from the live validation pass so the FF predicate can be
+/// exercised against synthetic triples without touching git.
+#[derive(Debug, Clone)]
+pub struct ResolvedManifestEntry {
+    pub pool_ref: String,
+    pub host_ref: String,
+    pub pool_sha: String,
+    pub host_sha: Option<String>,
+    pub force: bool,
+}
+
+/// Pure validation of a fully-resolved manifest against a "would this be
+/// a fast-forward?" predicate. Returns `Err(NotFastForward)` on the first
+/// pair that is non-FF and not opted into `force`.
+///
+/// The predicate is called as `is_ff(host_sha, pool_sha)`: it should return
+/// `true` if pushing `pool_sha` over `host_sha` is a fast-forward (i.e.
+/// `host_sha` is an ancestor of `pool_sha`).
+pub fn validate_resolved_manifest<F>(
+    entries: &[ResolvedManifestEntry],
+    mut is_ff: F,
+) -> Result<(), BranchPoolError>
+where
+    F: FnMut(&str, &str) -> bool,
+{
+    for e in entries {
+        if e.force {
+            continue;
+        }
+        let Some(host_sha) = e.host_sha.as_deref() else {
+            continue;
+        };
+        if !is_ff(host_sha, &e.pool_sha) {
+            return Err(BranchPoolError::NotFastForward {
+                pool_ref: e.pool_ref.clone(),
+                host_ref: e.host_ref.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct BranchPool {
     path: PathBuf,
@@ -258,29 +304,48 @@ impl BranchPool {
         kept: &[&ManifestEntry],
         temp_refs: &mut Vec<String>,
     ) -> Result<(), BranchPoolError> {
+        // Resolve every entry by walking the host once: pull each present
+        // host ref into a local temp namespace so the ancestor check is
+        // purely local. Then run the same decision the pure validator
+        // makes — using is_ancestor against the local temp refs.
+        let mut resolved: Vec<ResolvedManifestEntry> = Vec::with_capacity(kept.len());
         for (i, e) in kept.iter().enumerate() {
-            // pool_ref must resolve in the Pool
             let pool_sha = rev_parse(&self.path, &format!("refs/heads/{}", e.pool_ref)).await?;
-            // host_ref's current tip (None ⇒ new branch on host, trivially FF)
             let host_sha = ls_remote(host_repo, &format!("refs/heads/{}", e.host_ref)).await?;
-            let Some(host_sha) = host_sha else { continue };
+            if host_sha.is_some() {
+                let temp = format!("refs/bunsen-validate/{i}");
+                run_git(
+                    &[
+                        "fetch",
+                        "--no-tags",
+                        &path_to_str(host_repo),
+                        &format!("refs/heads/{}:{}", e.host_ref, temp),
+                    ],
+                    Some(&self.path),
+                )
+                .await?;
+                temp_refs.push(temp);
+            }
+            resolved.push(ResolvedManifestEntry {
+                pool_ref: e.pool_ref.clone(),
+                host_ref: e.host_ref.clone(),
+                pool_sha,
+                host_sha,
+                force: e.force,
+            });
+        }
+
+        // Decision mirrors validate_resolved_manifest exactly. Kept separate
+        // because is_ancestor is async; the pure function is the unit-test
+        // surface for the same rule set.
+        for e in &resolved {
             if e.force {
                 continue;
             }
-            // Pull host_sha into a unique temp ref so the ancestor check is local
-            let temp = format!("refs/bunsen-validate/{i}");
-            run_git(
-                &[
-                    "fetch",
-                    "--no-tags",
-                    &path_to_str(host_repo),
-                    &format!("refs/heads/{}:{}", e.host_ref, temp),
-                ],
-                Some(&self.path),
-            )
-            .await?;
-            temp_refs.push(temp);
-            if !is_ancestor(&self.path, &host_sha, &pool_sha).await? {
+            let Some(host_sha) = e.host_sha.as_deref() else {
+                continue;
+            };
+            if !is_ancestor(&self.path, host_sha, &e.pool_sha).await? {
                 return Err(BranchPoolError::NotFastForward {
                     pool_ref: e.pool_ref.clone(),
                     host_ref: e.host_ref.clone(),
@@ -890,5 +955,113 @@ mod tests {
 
         std::fs::remove_dir_all(&host).ok();
         std::fs::remove_dir_all(&pool_dir).ok();
+    }
+
+    // --- validate_resolved_manifest (pure) ---
+
+    fn ent(pool_ref: &str, host_ref: &str, pool: &str, host: Option<&str>, force: bool)
+        -> ResolvedManifestEntry
+    {
+        ResolvedManifestEntry {
+            pool_ref: pool_ref.into(),
+            host_ref: host_ref.into(),
+            pool_sha: pool.into(),
+            host_sha: host.map(|s| s.to_string()),
+            force,
+        }
+    }
+
+    #[test]
+    fn validate_resolved_empty_is_ok() {
+        let res = validate_resolved_manifest(&[], |_, _| panic!("predicate must not be called"));
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn validate_resolved_new_branch_on_host_is_trivially_ff() {
+        // host_sha None ⇒ no existing ref; never invokes the predicate.
+        let entries = vec![ent("feature/a", "release/a", "AAAA", None, false)];
+        let res = validate_resolved_manifest(
+            &entries,
+            |_, _| panic!("predicate must not be called for None host_sha"),
+        );
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn validate_resolved_all_ff_passes() {
+        let entries = vec![
+            ent("a", "ra", "P_A", Some("H_A"), false),
+            ent("b", "rb", "P_B", Some("H_B"), false),
+        ];
+        let mut calls = 0;
+        let res = validate_resolved_manifest(&entries, |_h, _p| {
+            calls += 1;
+            true
+        });
+        assert!(res.is_ok());
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn validate_resolved_non_ff_without_force_returns_not_fast_forward() {
+        let entries = vec![ent("a", "ra", "P_A", Some("H_A"), false)];
+        let err = validate_resolved_manifest(&entries, |_h, _p| false).unwrap_err();
+        match err {
+            BranchPoolError::NotFastForward { pool_ref, host_ref } => {
+                assert_eq!(pool_ref, "a");
+                assert_eq!(host_ref, "ra");
+            }
+            other => panic!("expected NotFastForward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_resolved_force_bypasses_ff_check() {
+        // force=true skips the predicate entirely.
+        let entries = vec![ent("a", "ra", "P_A", Some("H_A"), true)];
+        let res = validate_resolved_manifest(
+            &entries,
+            |_h, _p| panic!("predicate must not be called when force=true"),
+        );
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn validate_resolved_force_on_one_does_not_exempt_others() {
+        let entries = vec![
+            ent("a", "ra", "P_A", Some("H_A"), true),  // force, skipped
+            ent("b", "rb", "P_B", Some("H_B"), false), // must pass FF
+        ];
+        // Predicate is called only for the non-force entry; return false → it fails.
+        let mut calls = 0;
+        let err = validate_resolved_manifest(&entries, |h, p| {
+            calls += 1;
+            assert_eq!(h, "H_B");
+            assert_eq!(p, "P_B");
+            false
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1, "only the non-force entry consults the predicate");
+        assert!(matches!(err, BranchPoolError::NotFastForward { pool_ref, .. } if pool_ref == "b"));
+    }
+
+    #[test]
+    fn validate_resolved_short_circuits_on_first_failure() {
+        // Three non-force entries; first is non-FF. Predicate must be called
+        // exactly once.
+        let entries = vec![
+            ent("a", "ra", "P_A", Some("H_A"), false),
+            ent("b", "rb", "P_B", Some("H_B"), false),
+            ent("c", "rc", "P_C", Some("H_C"), false),
+        ];
+        let mut calls = 0;
+        let err = validate_resolved_manifest(&entries, |_h, _p| {
+            calls += 1;
+            false
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1, "must short-circuit on first non-FF entry");
+        assert!(matches!(err, BranchPoolError::NotFastForward { pool_ref, .. } if pool_ref == "a"));
     }
 }

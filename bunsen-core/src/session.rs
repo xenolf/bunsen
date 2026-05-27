@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::branch_pool::{BranchPool, BranchPoolError};
+use crate::branch_pool::{BranchPool, BranchPoolError, ManifestEntry};
 use crate::ulid;
 
 // ── State machine ─────────────────────────────────────────────────────────
@@ -348,6 +348,57 @@ impl Session {
         self.meta.labels.push(label);
         write_meta_atomic(&self.path, &self.meta)?;
         Ok(())
+    }
+
+    /// Push the supplied manifest from the Pool to the Session's host repo.
+    ///
+    /// This is the **only** path by which Pool refs reach the host repo.
+    /// The manifest is validated as a whole before any push is attempted:
+    /// any non-FF pair without `force: true` aborts the whole close.
+    ///
+    /// Audit refs (`runs/*`) in the manifest are silently skipped — they
+    /// are never pushed to the host. See [`BranchPool::push_manifest`].
+    ///
+    /// Transitions: `open | failed_to_close → closing → closed` on success,
+    /// or `closing → failed_to_close` on push/validation failure. On
+    /// failure, the failure reason is persisted in `meta.json` so
+    /// [`Session::list`] can surface "this Session's last close failed
+    /// because X."
+    ///
+    /// `close()` is **never** implicit — there is no `Drop` impl that
+    /// invokes this, and the Python context manager (slice 11) inherits
+    /// the same rule. A User Script that exits without calling `close()`
+    /// leaves the Session open and detached.
+    pub async fn close(&mut self, manifest: &[ManifestEntry]) -> Result<(), SessionError> {
+        // open | failed_to_close → closing, persisted before any push.
+        let closing = self.meta.state.close_start()?;
+        self.meta.state = closing;
+        // Clear any stale failure annotation from a prior failed close
+        // attempt; if this close fails it'll be repopulated below.
+        self.meta.last_close_failure = None;
+        write_meta_atomic(&self.path, &self.meta)?;
+
+        match self.pool.push_manifest(self.meta.host_repo.as_path(), manifest).await {
+            Ok(()) => {
+                let closed = self.meta.state.close_complete()?;
+                self.meta.state = closed;
+                write_meta_atomic(&self.path, &self.meta)?;
+                Ok(())
+            }
+            Err(e) => {
+                let failed = self.meta.state.close_failed()?;
+                self.meta.state = failed;
+                self.meta.last_close_failure = Some(e.to_string());
+                write_meta_atomic(&self.path, &self.meta)?;
+                Err(SessionError::Pool(e))
+            }
+        }
+    }
+
+    /// The last close-attempt failure message, if the Session is currently
+    /// in `failed_to_close`. `None` otherwise.
+    pub fn last_close_failure(&self) -> Option<&str> {
+        self.meta.last_close_failure.as_deref()
     }
 
     /// Wipe the Pool immediately and replace the Session's metadata with a
@@ -1077,6 +1128,393 @@ mod tests {
             "got {err:?}"
         );
         assert!(dir.exists());
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Session::close (slice 10) ──────────────────────────────────────────
+    //
+    // The pure manifest-validation function is tested in branch_pool's tests
+    // against synthetic SHA triples. These tests pin the Session-level
+    // disk effects: state transitions, on-disk failure annotation, audit-
+    // ref filtering through the pool, retry-after-failure, and the no-
+    // implicit-close invariant.
+
+    fn make_bare_host_repo(suffix: &str) -> PathBuf {
+        let dir = make_temp_dir(suffix);
+        let status = StdCommand::new("git")
+            .args(["init", "--bare", "-b", "main", "--quiet", dir.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        dir
+    }
+
+    /// Seeds a bare host with one commit on `main`. Returns nothing — the
+    /// host repo is the unit being inspected.
+    fn seed_bare_host(bare: &Path) {
+        let work = make_temp_dir("close-seed-work");
+        let status = StdCommand::new("git")
+            .args(["init", "-b", "main", "--quiet", work.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        run_git_sync_in(&work, &["config", "user.email", "seed@test"]);
+        run_git_sync_in(&work, &["config", "user.name", "Seed"]);
+        std::fs::write(work.join("seed.txt"), "seed\n").unwrap();
+        run_git_sync_in(&work, &["add", "seed.txt"]);
+        run_git_sync_in(&work, &["commit", "-m", "seed", "--quiet"]);
+        run_git_sync_in(&work, &["push", bare.to_str().unwrap(), "main:main"]);
+        std::fs::remove_dir_all(&work).ok();
+    }
+
+    fn host_branch_sha(host: &Path, full_ref: &str) -> String {
+        let out = StdCommand::new("git")
+            .current_dir(host)
+            .args(["rev-parse", full_ref])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "rev-parse {full_ref} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn host_branch_names(host: &Path) -> Vec<String> {
+        let out = StdCommand::new("git")
+            .current_dir(host)
+            .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Open a Session whose host is `host_bare` under `sessions_root` and
+    /// create a pool branch `pool_branch` that fast-forwards from
+    /// `host/main` by one extra commit. Returns the SHA the pool branch
+    /// ends up at, so tests can assert that exact SHA lands on the host.
+    async fn open_with_ff_pool_branch(
+        sessions_root: &Path,
+        host_bare: &Path,
+        pool_branch: &str,
+    ) -> (Session, String) {
+        let s = Session::open_in(sessions_root, host_bare, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let pool_dir = s.path().join("pool");
+        // Build a working clone of the pool, add a commit, push back as
+        // refs/heads/<pool_branch>. This gives the pool a branch that is
+        // an FF descendant of host/main.
+        let work = make_temp_dir("ff-pool-work");
+        let pool_url = format!("file://{}", pool_dir.display());
+        let status = StdCommand::new("git")
+            .args(["clone", "--quiet", "--branch", "host/main", &pool_url, work.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success(), "clone of pool failed");
+        run_git_sync_in(&work, &["config", "user.email", "w@test"]);
+        run_git_sync_in(&work, &["config", "user.name", "W"]);
+        run_git_sync_in(&work, &["checkout", "-b", pool_branch]);
+        std::fs::write(work.join(format!("{}.txt", pool_branch.replace('/', "_"))), "advance\n")
+            .unwrap();
+        run_git_sync_in(&work, &["add", "-A"]);
+        run_git_sync_in(&work, &["commit", "-m", "advance", "--quiet"]);
+        let sha_out = StdCommand::new("git")
+            .current_dir(&work)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+        run_git_sync_in(
+            &work,
+            &["push", pool_dir.to_str().unwrap(), &format!("{pool_branch}:{pool_branch}")],
+        );
+        std::fs::remove_dir_all(&work).ok();
+        (s, sha)
+    }
+
+    #[tokio::test]
+    async fn close_ff_manifest_succeeds_and_transitions_to_closed() {
+        let host = make_bare_host_repo("close-ok-host");
+        seed_bare_host(&host);
+        let root = make_temp_dir("close-ok-root");
+
+        let (mut s, pool_sha) =
+            open_with_ff_pool_branch(&root, &host, "feature/ship").await;
+        let id = s.id().to_string();
+        assert_eq!(s.state(), SessionState::Open);
+
+        let manifest = vec![ManifestEntry {
+            pool_ref: "feature/ship".into(),
+            host_ref: "release/ship".into(),
+            force: false,
+        }];
+        s.close(&manifest).await.unwrap();
+        assert_eq!(s.state(), SessionState::Closed);
+        assert!(s.last_close_failure().is_none());
+
+        // Disk reflects in-memory state.
+        let on_disk = read_meta(s.path()).unwrap();
+        assert_eq!(on_disk.state, SessionState::Closed);
+        assert!(on_disk.last_close_failure.is_none());
+
+        // Host actually received the push.
+        let host_sha = host_branch_sha(&host, "refs/heads/release/ship");
+        assert_eq!(host_sha, pool_sha);
+
+        // list with --all surfaces the now-closed Session.
+        let listed = Session::list_in(
+            &root,
+            ListFilter { include_closed: true, include_tombstones: false },
+        )
+        .unwrap();
+        assert!(listed.iter().any(|x| x.id == id && x.state == SessionState::Closed));
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn close_non_ff_without_force_lands_in_failed_to_close() {
+        // Pool has a "stale" branch at host/main's seed SHA. Host's
+        // `protected` branch has advanced past that. A FF-only push of
+        // stale → protected is non-FF and must abort.
+        let host = make_bare_host_repo("close-nff-host");
+        seed_bare_host(&host);
+        // Advance host's `protected` ref past seed.
+        let work = make_temp_dir("close-nff-work");
+        StdCommand::new("git")
+            .args(["clone", "--quiet", host.to_str().unwrap(), work.to_str().unwrap()])
+            .status()
+            .unwrap();
+        run_git_sync_in(&work, &["config", "user.email", "w@test"]);
+        run_git_sync_in(&work, &["config", "user.name", "W"]);
+        run_git_sync_in(&work, &["checkout", "-b", "protected"]);
+        std::fs::write(work.join("p.txt"), "advance\n").unwrap();
+        run_git_sync_in(&work, &["add", "p.txt"]);
+        run_git_sync_in(&work, &["commit", "-m", "advance", "--quiet"]);
+        run_git_sync_in(&work, &["push", host.to_str().unwrap(), "protected:protected"]);
+        let protected_sha = host_branch_sha(&host, "refs/heads/protected");
+        std::fs::remove_dir_all(&work).ok();
+
+        let root = make_temp_dir("close-nff-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let session_dir = s.path().to_path_buf();
+        let pool_dir = session_dir.join("pool");
+        // Stale branch in pool = host/main (older than protected).
+        let stale_status = StdCommand::new("git")
+            .current_dir(&pool_dir)
+            .args(["branch", "stale", "host/main"])
+            .status()
+            .unwrap();
+        assert!(stale_status.success());
+
+        let manifest = vec![ManifestEntry {
+            pool_ref: "stale".into(),
+            host_ref: "protected".into(),
+            force: false,
+        }];
+        let err = s.close(&manifest).await.unwrap_err();
+        assert!(matches!(err, SessionError::Pool(BranchPoolError::NotFastForward { .. })));
+
+        // Session lands in FailedToClose, in-memory and on disk.
+        assert_eq!(s.state(), SessionState::FailedToClose);
+        let on_disk = read_meta(&session_dir).unwrap();
+        assert_eq!(on_disk.state, SessionState::FailedToClose);
+        let annot = s.last_close_failure().expect("failure annotation must be set");
+        assert!(annot.contains("non-fast-forward"), "annotation was: {annot}");
+        assert_eq!(on_disk.last_close_failure.as_deref(), Some(annot));
+
+        // Host refs are untouched.
+        assert_eq!(host_branch_sha(&host, "refs/heads/protected"), protected_sha);
+
+        // list (default = live) surfaces the FailedToClose Session.
+        let live = Session::list_in(&root, ListFilter::default()).unwrap();
+        let id = s.id().to_string();
+        assert!(
+            live.iter()
+                .any(|x| x.id == id && x.state == SessionState::FailedToClose),
+            "default list must surface failed_to_close",
+        );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn close_per_pair_force_allows_non_ff_pair() {
+        // One pair force=true (non-FF) + one pair FF=true; both succeed.
+        let host = make_bare_host_repo("close-force-host");
+        seed_bare_host(&host);
+        // Advance host's `to-rewrite` past seed.
+        let work = make_temp_dir("close-force-work");
+        StdCommand::new("git")
+            .args(["clone", "--quiet", host.to_str().unwrap(), work.to_str().unwrap()])
+            .status()
+            .unwrap();
+        run_git_sync_in(&work, &["config", "user.email", "w@test"]);
+        run_git_sync_in(&work, &["config", "user.name", "W"]);
+        run_git_sync_in(&work, &["checkout", "-b", "to-rewrite"]);
+        std::fs::write(work.join("r.txt"), "head\n").unwrap();
+        run_git_sync_in(&work, &["add", "r.txt"]);
+        run_git_sync_in(&work, &["commit", "-m", "head", "--quiet"]);
+        run_git_sync_in(&work, &["push", host.to_str().unwrap(), "to-rewrite:to-rewrite"]);
+        std::fs::remove_dir_all(&work).ok();
+
+        let root = make_temp_dir("close-force-root");
+        let (mut s, ff_sha) =
+            open_with_ff_pool_branch(&root, &host, "feature/keep").await;
+        // Pool also has a "rewrite" branch at host/main (older than to-rewrite).
+        let pool_dir = s.path().join("pool");
+        StdCommand::new("git")
+            .current_dir(&pool_dir)
+            .args(["branch", "rewrite", "host/main"])
+            .status()
+            .unwrap();
+        let rewrite_sha = {
+            let out = StdCommand::new("git")
+                .current_dir(&pool_dir)
+                .args(["rev-parse", "refs/heads/rewrite"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let manifest = vec![
+            ManifestEntry { pool_ref: "feature/keep".into(), host_ref: "release/keep".into(), force: false },
+            ManifestEntry { pool_ref: "rewrite".into(),      host_ref: "to-rewrite".into(),   force: true },
+        ];
+        s.close(&manifest).await.unwrap();
+        assert_eq!(s.state(), SessionState::Closed);
+
+        assert_eq!(host_branch_sha(&host, "refs/heads/release/keep"), ff_sha);
+        assert_eq!(host_branch_sha(&host, "refs/heads/to-rewrite"), rewrite_sha);
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn close_silently_skips_audit_refs_in_manifest() {
+        // Manifest contains a `runs/<id>` pool_ref. Close must succeed
+        // without pushing anything in the runs/* namespace to the host.
+        let host = make_bare_host_repo("close-runs-host");
+        seed_bare_host(&host);
+        let root = make_temp_dir("close-runs-root");
+        let (mut s, ff_sha) = open_with_ff_pool_branch(&root, &host, "feature/y").await;
+
+        // Seed a synthetic audit ref in the pool by pointing it at the FF tip.
+        let pool_dir = s.path().join("pool");
+        StdCommand::new("git")
+            .current_dir(&pool_dir)
+            .args(["update-ref", "refs/heads/runs/01HABC", "refs/heads/feature/y"])
+            .status()
+            .unwrap();
+
+        let manifest = vec![
+            ManifestEntry { pool_ref: "runs/01HABC".into(), host_ref: "runs/01HABC".into(), force: false },
+            ManifestEntry { pool_ref: "feature/y".into(),   host_ref: "release/y".into(),   force: false },
+        ];
+        s.close(&manifest).await.unwrap();
+        assert_eq!(s.state(), SessionState::Closed);
+
+        let names = host_branch_names(&host);
+        assert!(names.contains(&"release/y".to_string()));
+        assert!(
+            !names.iter().any(|n| n.starts_with("runs/")),
+            "no runs/* refs should land on the host: {names:?}",
+        );
+        assert_eq!(host_branch_sha(&host, "refs/heads/release/y"), ff_sha);
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn close_from_failed_to_close_retry_succeeds() {
+        // First close fails (non-FF). Second close with a clean (FF-only)
+        // manifest succeeds and the Session reaches Closed. Failure
+        // annotation is cleared on the successful retry.
+        let host = make_bare_host_repo("close-retry-host");
+        seed_bare_host(&host);
+        // Advance host's `protected` past seed.
+        let work = make_temp_dir("close-retry-work");
+        StdCommand::new("git")
+            .args(["clone", "--quiet", host.to_str().unwrap(), work.to_str().unwrap()])
+            .status()
+            .unwrap();
+        run_git_sync_in(&work, &["config", "user.email", "w@test"]);
+        run_git_sync_in(&work, &["config", "user.name", "W"]);
+        run_git_sync_in(&work, &["checkout", "-b", "protected"]);
+        std::fs::write(work.join("p.txt"), "advance\n").unwrap();
+        run_git_sync_in(&work, &["add", "p.txt"]);
+        run_git_sync_in(&work, &["commit", "-m", "advance", "--quiet"]);
+        run_git_sync_in(&work, &["push", host.to_str().unwrap(), "protected:protected"]);
+        std::fs::remove_dir_all(&work).ok();
+
+        let root = make_temp_dir("close-retry-root");
+        let (mut s, ff_sha) = open_with_ff_pool_branch(&root, &host, "feature/z").await;
+        let pool_dir = s.path().join("pool");
+        StdCommand::new("git")
+            .current_dir(&pool_dir)
+            .args(["branch", "stale", "host/main"])
+            .status()
+            .unwrap();
+
+        // First attempt: includes a non-FF stale → protected; fails.
+        let bad = vec![
+            ManifestEntry { pool_ref: "stale".into(),      host_ref: "protected".into(),    force: false },
+            ManifestEntry { pool_ref: "feature/z".into(), host_ref: "release/z".into(),    force: false },
+        ];
+        let _ = s.close(&bad).await.unwrap_err();
+        assert_eq!(s.state(), SessionState::FailedToClose);
+        assert!(s.last_close_failure().is_some());
+        // Host received nothing (push is --atomic in the pool layer).
+        let names = host_branch_names(&host);
+        assert!(!names.contains(&"release/z".to_string()));
+
+        // Retry: drop the bad pair. Close succeeds, state = Closed,
+        // failure annotation is cleared.
+        let good = vec![ManifestEntry {
+            pool_ref: "feature/z".into(),
+            host_ref: "release/z".into(),
+            force: false,
+        }];
+        s.close(&good).await.unwrap();
+        assert_eq!(s.state(), SessionState::Closed);
+        assert!(s.last_close_failure().is_none());
+        let on_disk = read_meta(s.path()).unwrap();
+        assert_eq!(on_disk.state, SessionState::Closed);
+        assert!(on_disk.last_close_failure.is_none());
+        assert_eq!(host_branch_sha(&host, "refs/heads/release/z"), ff_sha);
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_does_not_change_on_disk_state() {
+        // No-implicit-close, observed at runtime: open a Session, drop the
+        // handle without calling close, and assert the on-disk state is
+        // still Open. (The compile-time check that no impl Drop exists is
+        // session_has_no_custom_destructor_impl above.)
+        let host = make_bare_host_repo("close-nodrop-host");
+        seed_bare_host(&host);
+        let root = make_temp_dir("close-nodrop-root");
+        let s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let id = s.id().to_string();
+        let dir = s.path().to_path_buf();
+        drop(s);
+        let on_disk = read_meta(&dir).unwrap();
+        assert_eq!(on_disk.state, SessionState::Open);
+        // attach still works (it's a live Session).
+        let re = Session::attach_in(&root, &id).unwrap();
+        assert_eq!(re.state(), SessionState::Open);
         std::fs::remove_dir_all(&host).ok();
         std::fs::remove_dir_all(&root).ok();
     }
