@@ -128,6 +128,11 @@ pub enum SessionError {
     SandboxFetch(SandboxFetchError),
     AgentExit { stderr: String },
     BadRedactor(String),
+    /// The caller requested the Firecracker sandbox backend (kernel set on
+    /// the [`RunBackend`]) on a host that does not support it. Today the
+    /// supported set is Linux + KVM (see ADR-0001). The host-subprocess
+    /// backend (default `RunBackend`) is still reachable on every platform.
+    SandboxUnsupportedOnPlatform,
 }
 
 impl std::fmt::Display for SessionError {
@@ -147,6 +152,11 @@ impl std::fmt::Display for SessionError {
             Self::SandboxFetch(e) => write!(f, "sandbox fetch error: {e}"),
             Self::AgentExit { stderr } => write!(f, "agent supervisor error: {stderr}"),
             Self::BadRedactor(e) => write!(f, "redactor build error: {e}"),
+            Self::SandboxUnsupportedOnPlatform => write!(
+                f,
+                "sandbox backend (Firecracker) requires Linux + KVM; use the default \
+                 RunBackend to keep the host-subprocess path"
+            ),
         }
     }
 }
@@ -222,6 +232,54 @@ pub struct RunResult {
     pub pool_sha: Option<String>,
     pub output_branch_pushed: Option<String>,
     pub uncommitted_paths: Vec<String>,
+}
+
+/// Internal outcome of the dispatch decision inside
+/// [`Session::run_with_backend`]. The variant tells the caller whether the
+/// agent ran in the host-subprocess supervisor (in which case the caller
+/// still needs to inspect the host-side workspace and push to the Pool)
+/// or in the Firecracker sandbox (in which case the Pool has already
+/// received the agent's commits via the ext4 extraction).
+enum DispatchOutcome {
+    HostSubprocess {
+        supervisor_result: Result<(), SessionError>,
+    },
+    Sandbox {
+        sandbox_result: std::io::Result<()>,
+    },
+}
+
+/// Backend selection for [`Session::run_with_backend`].
+///
+/// The default (no kernel) runs the agent in the host-subprocess supervisor,
+/// matching the pre-Firecracker `Session::run` behaviour. Setting `kernel`
+/// (and/or `rootfs`) opts the Run into the Firecracker sandbox — the same
+/// path the legacy CLI `bunsen-core --kernel /k --rootfs /r --spec ...` has
+/// always used. The agent's commits are then extracted from the ext4 image
+/// directly into the Session's Pool via the hardened
+/// [`crate::sandbox_fetch::fetch_pool_from_git_dir`] driven by
+/// [`crate::firecracker::extract_workspace_from_ext4`] (see [ADR-0011]).
+///
+/// On non-Linux platforms, supplying a kernel returns
+/// [`SessionError::SandboxUnsupportedOnPlatform`] without leaving a Run on
+/// disk — the host-subprocess path is still reachable via the default
+/// backend.
+///
+/// [ADR-0011]: ../../../docs/adr/0011-hardened-git-fetch-from-sandbox.md
+#[derive(Debug, Clone, Default)]
+pub struct RunBackend {
+    /// Path to the guest kernel (`vmlinux`). When `None` the Run uses the
+    /// host-subprocess supervisor; when `Some` the Run boots Firecracker.
+    pub kernel: Option<PathBuf>,
+    /// Path to the rootfs ext4 image. Required by Firecracker when the
+    /// `RunSpec` does not pin an OCI image; ignored without `kernel`.
+    pub rootfs: Option<PathBuf>,
+    /// Override the `firecracker` binary location. `None` ⇒ search `$PATH`.
+    pub firecracker_bin: Option<PathBuf>,
+    /// Authorise bunsen to install the per-TAP iptables allow rule for the
+    /// lifetime of the Run when the host's INPUT chain is DROP-by-default.
+    /// Matches the CLI's `--manage-firewall` flag.
+    pub manage_firewall: bool,
 }
 
 // ── Session handle ─────────────────────────────────────────────────────────
@@ -430,6 +488,27 @@ impl Session {
     /// [ADR-0010]: ../../../docs/adr/0010-session-and-branch-pool.md
     /// [ADR-0011]: ../../../docs/adr/0011-hardened-git-fetch-from-sandbox.md
     pub async fn run(&mut self, spec: RunSpec) -> Result<RunResult, SessionError> {
+        self.run_with_backend(spec, RunBackend::default()).await
+    }
+
+    /// Run the spec under a caller-chosen backend.
+    ///
+    /// See [`RunBackend`] for the dispatch rules. With the default backend
+    /// this is equivalent to [`Session::run`].
+    pub async fn run_with_backend(
+        &mut self,
+        spec: RunSpec,
+        backend: RunBackend,
+    ) -> Result<RunResult, SessionError> {
+        // Platform gate: asking for Firecracker on non-Linux must fail before
+        // any disk side-effects so the Session and `runs/` dir are untouched
+        // for the caller. The host-subprocess fallback stays reachable via
+        // the default RunBackend on every platform.
+        #[cfg(not(target_os = "linux"))]
+        if backend.kernel.is_some() {
+            return Err(SessionError::SandboxUnsupportedOnPlatform);
+        }
+
         // State check: open | failed_to_close accept new Runs; everything else
         // refuses. The state does not change as a result of the Run itself.
         let _ = self.meta.state.accept_new_run()?;
@@ -500,29 +579,72 @@ impl Session {
             }),
         )?;
 
-        // Run the agent. The supervisor is the host-subprocess fallback —
-        // a future slice can branch into Firecracker here when the Session
-        // is given a kernel/rootfs config.
+        // Run the agent. The host-subprocess supervisor is the default
+        // backend on every platform; Firecracker is selected when the
+        // caller hands us a kernel via `RunBackend`. The sandbox path
+        // performs ext4 extraction into the Pool inline, so the
+        // host-subprocess `extract_run_output` step is replaced with a
+        // Pool-side read of the audit ref to compute `pool_sha`.
         let agent_history_path = run_dir.agent_history_path();
-        let supervisor_result = crate::supervisor::run(
-            &spec,
-            &run_id,
-            &mut enc,
-            &workspace_path,
-            // We perform the narrow agent-history copy ourselves after the
-            // supervisor returns so the same logic covers both the
-            // host-subprocess and the future Firecracker path. Passing
-            // `None` here suppresses the supervisor's older recursive copy.
-            None,
-        )
-        .await;
-
-        // Inspect the Workspace and (best-effort) push to the Pool. We do
-        // this even if the supervisor returned an error so a crashed agent
-        // can still surface its partial state via the audit ref.
-        let extraction =
-            self.extract_run_output(&workspace_path, &run_id, &spec, &mut enc, &agent_history_path)
-                .await;
+        let dispatch = self
+            .run_dispatch(
+                backend,
+                &spec,
+                &run_id,
+                &mut enc,
+                &workspace_path,
+                &agent_history_path,
+            )
+            .await;
+        let (supervisor_result, extraction): (
+            Result<(), SessionError>,
+            Result<RunResult, SessionError>,
+        ) = match dispatch {
+            DispatchOutcome::HostSubprocess { supervisor_result } => {
+                let extraction = self
+                    .extract_run_output(
+                        &workspace_path,
+                        &run_id,
+                        &spec,
+                        &mut enc,
+                        &agent_history_path,
+                    )
+                    .await;
+                (supervisor_result, extraction)
+            }
+            DispatchOutcome::Sandbox { sandbox_result } => {
+                // The sandbox lifecycle (sandbox_run::run) drove both the
+                // supervisor and the Pool extraction. Build a RunResult by
+                // reading the Pool's audit ref back. Uncommitted paths are
+                // not available — the ext4 is gone by the time we return —
+                // so we report an empty list for the sandbox path.
+                match sandbox_result {
+                    Ok(()) => {
+                        let pool_sha = self
+                            .read_pool_ref_sha(&format!("refs/heads/runs/{run_id}"))
+                            .await
+                            .ok();
+                        let _ = enc.emit(
+                            "run_ended",
+                            serde_json::json!({ "reason": "agent_exit" }),
+                        );
+                        (
+                            Ok(()),
+                            Ok(RunResult {
+                                run_id: run_id.clone(),
+                                pool_sha,
+                                output_branch_pushed: spec.output_branch.clone(),
+                                uncommitted_paths: Vec::new(),
+                            }),
+                        )
+                    }
+                    Err(e) => (
+                        Err(SessionError::AgentExit { stderr: e.to_string() }),
+                        Err(SessionError::AgentExit { stderr: e.to_string() }),
+                    ),
+                }
+            }
+        };
 
         // Final meta with end timestamps.
         let ended_at = now_iso8601();
@@ -548,8 +670,83 @@ impl Session {
         // extraction succeeded); the dir is no longer needed.
         let _ = std::fs::remove_dir_all(&workspace_path);
 
-        supervisor_result.map_err(|e| SessionError::AgentExit { stderr: e.to_string() })?;
+        supervisor_result?;
         extraction
+    }
+
+    /// Dispatch to either the host-subprocess supervisor or the Firecracker
+    /// sandbox depending on the backend. Returns a value the caller pattern-
+    /// matches to decide how to compute `RunResult` (the host-subprocess
+    /// path inspects the on-host workspace; the sandbox path reads the
+    /// already-populated Pool).
+    async fn run_dispatch(
+        &self,
+        backend: RunBackend,
+        spec: &RunSpec,
+        run_id: &str,
+        enc: &mut Encoder,
+        workspace_path: &Path,
+        agent_history_dst: &Path,
+    ) -> DispatchOutcome {
+        #[cfg(target_os = "linux")]
+        if let Some(kernel) = backend.kernel {
+            let user_script_uid = current_uid();
+            let sandbox_result = crate::sandbox_run::run(
+                kernel,
+                backend.rootfs.unwrap_or_default(),
+                backend.firecracker_bin,
+                backend.manage_firewall,
+                spec,
+                run_id,
+                enc,
+                workspace_path,
+                Some(crate::sandbox_run::PoolExtraction {
+                    pool: &self.pool,
+                    output_branch: spec.output_branch.as_deref(),
+                    agent_history_dst: Some(agent_history_dst),
+                    user_script_uid,
+                }),
+            )
+            .await;
+            return DispatchOutcome::Sandbox { sandbox_result };
+        }
+        // Non-Linux always lands here. On Linux without a kernel, also lands
+        // here. The supervisor performs no agent-history copy of its own —
+        // that's done by extract_run_output via the narrow copy helper.
+        let supervisor_result = crate::supervisor::run(spec, run_id, enc, workspace_path, None)
+            .await
+            .map_err(|e| SessionError::AgentExit { stderr: e.to_string() });
+        // On non-Linux we never reach the `backend.kernel.is_some()` branch
+        // above (the early `SandboxUnsupportedOnPlatform` check in the
+        // caller guards it), but on Linux we still need to silence
+        // unused-field warnings when the kernel branch was skipped.
+        #[cfg(not(target_os = "linux"))]
+        let _ = (
+            backend.rootfs,
+            backend.firecracker_bin,
+            backend.manage_firewall,
+            agent_history_dst,
+        );
+        DispatchOutcome::HostSubprocess { supervisor_result }
+    }
+
+    /// Read a ref's SHA out of this Session's Pool, used by the sandbox
+    /// dispatch path to populate `RunResult.pool_sha` after
+    /// `extract_workspace_from_ext4` has written `refs/heads/runs/<run-id>`
+    /// into the Pool.
+    async fn read_pool_ref_sha(&self, full_ref: &str) -> Result<String, SessionError> {
+        let out = tokio::process::Command::new("git")
+            .current_dir(self.pool.path())
+            .args(["rev-parse", "--verify", full_ref])
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Err(SessionError::Git {
+                context: format!("rev-parse {full_ref}"),
+                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     async fn extract_run_output(
@@ -2288,6 +2485,132 @@ mod tests {
             .join("notes.json");
         assert!(history.exists(), "agent .claude/notes.json must be preserved");
         assert_eq!(std::fs::read_to_string(&history).unwrap().trim(), "memo");
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Session::run_with_backend (Firecracker dispatch wiring) ─────────────
+
+    /// Tracer bullet for the Firecracker dispatch wiring: the new
+    /// `Session::run_with_backend` entry point, given the default backend
+    /// (no kernel/rootfs), behaves exactly like the existing
+    /// `Session::run` — it goes through the host-subprocess supervisor and
+    /// extracts to the Pool through `fetch_pool_from_git_dir`.
+    #[tokio::test]
+    async fn run_with_backend_default_matches_run_for_host_subprocess() {
+        let host = make_host_repo("sr-rwb-default");
+        let root = make_temp_dir("sr-rwb-default-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let pool_dir = s.path().join("pool");
+
+        let spec = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", Some("feature/rwb"));
+        let res = s.run_with_backend(spec, RunBackend::default()).await.unwrap();
+
+        // Same observable result as `Session::run` produces on this AGENT_COMMIT_CMD:
+        // a populated pool_sha and the output_branch echoed back.
+        assert!(res.pool_sha.is_some(), "expected a Pool SHA after a real commit");
+        assert_eq!(res.output_branch_pushed.as_deref(), Some("feature/rwb"));
+        assert!(res.uncommitted_paths.is_empty());
+
+        let audit = format!("refs/heads/runs/{}", res.run_id);
+        let user = "refs/heads/feature/rwb";
+        assert!(pool_has_ref(&pool_dir, &audit), "audit ref missing");
+        assert!(pool_has_ref(&pool_dir, user), "output_branch missing");
+        assert_eq!(
+            pool_ref_sha(&pool_dir, &audit),
+            pool_ref_sha(&pool_dir, user),
+            "audit ref and output_branch must point at the same SHA"
+        );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Linux dispatch proof: a backend with a kernel routes through the
+    /// Firecracker path, not the host-subprocess supervisor. The
+    /// host-subprocess path would trivially succeed on a `cmd: ["true"]`
+    /// spec; the Firecracker path with a non-existent kernel must fail.
+    /// Distinguishing the two error paths proves dispatch happened.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_with_backend_kernel_dispatches_into_firecracker_on_linux() {
+        let host = make_host_repo("sr-rwb-fc");
+        let root = make_temp_dir("sr-rwb-fc-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+
+        let nonexistent_kernel = root.join("does-not-exist-vmlinux");
+        let nonexistent_rootfs = root.join("does-not-exist-rootfs.ext4");
+        let backend = RunBackend {
+            kernel: Some(nonexistent_kernel),
+            rootfs: Some(nonexistent_rootfs),
+            ..RunBackend::default()
+        };
+
+        // The host-subprocess path would happily run `true` and return Ok;
+        // the Firecracker path can't boot a non-existent kernel and must
+        // surface an error. Treat that asymmetry as the dispatch proof.
+        let spec = run_spec_with_cmd("true", "host/main", None);
+        let result = s.run_with_backend(spec, backend).await;
+        assert!(
+            result.is_err(),
+            "with a non-existent kernel the Firecracker path must fail, \
+             not silently fall through to the host-subprocess supervisor"
+        );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// On non-Linux platforms, asking for the sandbox backend must fail
+    /// loudly without leaving a Run dir or a Pool ref behind. Linux callers
+    /// reach the real Firecracker path; everyone else gets a typed error
+    /// they can route on.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn run_with_backend_sandbox_unsupported_on_non_linux() {
+        let host = make_host_repo("sr-rwb-unsupp");
+        let root = make_temp_dir("sr-rwb-unsupp-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let session_dir = s.path().to_path_buf();
+
+        // Any path is fine — the check is platform-gated, the path is never
+        // dereferenced on macOS.
+        let backend = RunBackend {
+            kernel: Some(PathBuf::from("/nonexistent/vmlinux")),
+            rootfs: Some(PathBuf::from("/nonexistent/rootfs.ext4")),
+            ..RunBackend::default()
+        };
+        let spec = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", None);
+        let err = s.run_with_backend(spec, backend).await.unwrap_err();
+        assert!(
+            matches!(err, SessionError::SandboxUnsupportedOnPlatform),
+            "expected SandboxUnsupportedOnPlatform, got {err:?}"
+        );
+
+        // No transient workspace, no Run dir.
+        let transient = root.join(".workspace");
+        if transient.exists() {
+            let leftover: Vec<_> = std::fs::read_dir(&transient)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(leftover.is_empty(), "no transient workspace leftover");
+        }
+        let runs_dir = session_dir.join("runs");
+        if runs_dir.exists() {
+            let leftover: Vec<_> = std::fs::read_dir(&runs_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(leftover.is_empty(), "no run dir leftover");
+        }
 
         std::fs::remove_dir_all(&host).ok();
         std::fs::remove_dir_all(&root).ok();

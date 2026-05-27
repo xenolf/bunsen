@@ -281,19 +281,41 @@ class Session:
             except Exception:
                 pass
 
-    def run(self, spec: dict) -> Run:
+    def run(
+        self,
+        spec: dict,
+        *,
+        kernel: Optional[str] = None,
+        rootfs: Optional[str] = None,
+        firecracker: Optional[str] = None,
+        manage_firewall: bool = False,
+    ) -> Run:
         """Drive a Run inside this Session.
 
         `spec` is a dict matching `RunSpec` (no `host_repo_path`; the
         Session provides it). `branching_strategy` may be either a dict
         (the JSON shape) or a typed `NoneStrategy` / `PoolClone` instance.
         `output_branch` is optional.
+
+        Pass `kernel` (and optionally `rootfs`, `firecracker`,
+        `manage_firewall`) to route the Run through the Firecracker sandbox
+        on Linux. With no `kernel`, the Run uses the host-subprocess
+        supervisor — the cross-platform default. See [ADR-0001] and the
+        Rust [`RunBackend`] type for the full dispatch rules. On non-Linux
+        hosts, supplying `kernel` raises `SessionError`
+        ("sandbox backend requires Linux + KVM").
         """
         spec_json = _spec_to_json(spec)
-        result = _run_core(
-            ["--session", self.id, "--spec", spec_json],
-            _core_bin=self._core_bin,
-        )
+        argv: list[str] = ["--session", self.id, "--spec", spec_json]
+        if kernel is not None:
+            argv.extend(["--kernel", kernel])
+        if rootfs is not None:
+            argv.extend(["--rootfs", rootfs])
+        if firecracker is not None:
+            argv.extend(["--firecracker", firecracker])
+        if manage_firewall:
+            argv.append("--manage-firewall")
+        result = _run_core(argv, _core_bin=self._core_bin)
         return Run(
             run_id=result["run_id"],
             pool_sha=result.get("pool_sha"),

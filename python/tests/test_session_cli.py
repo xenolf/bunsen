@@ -335,6 +335,29 @@ def test_documented_worktree_inspection_command_works(
         )
 
 
+def test_session_run_with_kernel_routes_through_sandbox_dispatch(
+    host_repo: Path, core_bin: str, xdg: Path, tmp_path: Path
+) -> None:
+    """Slice 12: `Session.run(kernel=..., rootfs=...)` routes through the
+    Firecracker dispatch, not the host-subprocess supervisor.
+
+    The host-subprocess path would happily run `cmd: ["true"]` and return Ok;
+    the Firecracker path with a non-existent kernel must fail. Treating that
+    asymmetry as the dispatch proof keeps the test usable on macOS too —
+    on macOS the failure is the typed `SandboxUnsupportedOnPlatform` error,
+    on Linux it's the kernel-not-found failure from Firecracker setup.
+    """
+    import bunsen
+
+    s = bunsen.open_session(str(host_repo), _core_bin=core_bin)
+    fake_kernel = tmp_path / "does-not-exist-vmlinux"
+    fake_rootfs = tmp_path / "does-not-exist-rootfs.ext4"
+    spec = _run_spec("true", base="host/main")
+
+    with pytest.raises(bunsen.SessionError):
+        s.run(spec, kernel=str(fake_kernel), rootfs=str(fake_rootfs))
+
+
 def test_run_session_flag_runs_inside_named_session(
     host_repo: Path, core_bin: str, xdg: Path
 ) -> None:

@@ -28,6 +28,8 @@ mod firecracker;
 #[cfg(target_os = "linux")]
 mod firewall;
 #[cfg(target_os = "linux")]
+mod sandbox_run;
+#[cfg(target_os = "linux")]
 mod sandbox_supervisor;
 #[cfg(target_os = "linux")]
 mod smoke_test;
@@ -77,10 +79,12 @@ async fn main() {
     });
 
     // Slice 11: `bunsen-core --session <id> --spec <json>` ties a Run to an
-    // existing Session and drives it through [`Session::run`], which owns
-    // workspace materialisation, supervisor dispatch, and Sandbox Fetch back
-    // into the Pool. The pre-Session legacy CLI path remains live for
-    // callers without a Session (and for transitional Firecracker testing).
+    // existing Session and drives it through [`Session::run`]/[`Session::run_with_backend`],
+    // which own workspace materialisation, supervisor dispatch, and (when a
+    // kernel was supplied) Firecracker sandbox dispatch with Pool extraction.
+    // Slice 12 adds the kernel/rootfs flags to the session path so the
+    // sandbox can be used per-Session, not just from the pre-Session legacy
+    // CLI.
     if let Some(sid) = cli.session_id.clone() {
         let mut sess = match session::Session::attach(&sid) {
             Ok(s) => s,
@@ -89,7 +93,34 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        match sess.run(spec).await {
+        // Resolve the kernel via the same lazy-fetch path the legacy CLI uses
+        // (sandbox-intended when --rootfs or spec.oci_image is set). On
+        // non-Linux this is a no-op; the Session path's platform gate will
+        // reject the eventual run if a kernel slipped through anyway.
+        #[cfg(target_os = "linux")]
+        let resolved_kernel: Option<std::path::PathBuf> = if let Some(k) = cli.kernel.clone() {
+            Some(k)
+        } else if spec.oci_image.is_some() || cli.rootfs.is_some() {
+            match kernel::ensure_kernel().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("[bunsen-core] failed to acquire guest kernel: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let resolved_kernel: Option<std::path::PathBuf> = cli.kernel.clone();
+
+        let backend = session::RunBackend {
+            kernel: resolved_kernel,
+            rootfs: cli.rootfs.clone(),
+            firecracker_bin: cli.firecracker.clone(),
+            manage_firewall: cli.manage_firewall,
+        };
+        match sess.run_with_backend(spec, backend).await {
             Ok(res) => {
                 println!(
                     "{}",
@@ -355,247 +386,22 @@ async fn run_sandbox(
     enc: &mut encoder::Encoder,
     workspace_path: &std::path::Path,
 ) -> std::io::Result<()> {
-    use firecracker::{
-        apply_nftables_ruleset, create_tap, delete_nftables_table, delete_tap,
-        spawn_drop_log_emitter, start_firecracker,
-    };
-    use sandbox::SandboxConfig;
-    use sandbox_net::{derive_run_network, derive_tap_name};
-    use sandbox_nft::{build_ruleset, derive_table_name};
-    use sandbox_supervisor::EgressContext;
-    use std::net::SocketAddr;
-
-    let fc_bin = firecracker_bin.unwrap_or_else(|| std::path::PathBuf::from("firecracker"));
-
-    // ── Per-Run network ────────────────────────────────────────────────────
-    // Derive the /30 IPv4 pair and TAP name from the run_id, then create the
-    // TAP and assign its host-side address. The L7 proxy will bind on that
-    // address (slice 10f) so the TAP must be up first. Any leftover TAP from
-    // a previous crashed Run with the same id is removed defensively — this
-    // mirrors the pre-cleanup behavior start_firecracker used to do.
-    let net = derive_run_network(run_id);
-    let tap_name = derive_tap_name(run_id);
-    let _ = delete_tap(&tap_name).await;
-    eprintln!(
-        "[fc] creating TAP device {tap_name} (host {host}/{prefix}, guest {guest})",
-        host = net.host,
-        prefix = net.prefix_len,
-        guest = net.guest,
-    );
-    create_tap(&tap_name, net.host, net.prefix_len)
-        .await
-        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-
-    // ── Slice 10k: host iptables co-existence ─────────────────────────────
-    // The pre-flight probe in main() already decided whether we can proceed.
-    // If the caller passed --manage-firewall we install the per-TAP allow
-    // rule unconditionally (idempotent pre-cleanup first, in case a previous
-    // Run with the same tap_name crashed before its guard ran). The
-    // TapAllowGuard removes the rule via std::process::Command on Drop —
-    // synchronous so cleanup runs reliably on panic and during runtime
-    // shutdown. Holding the guard in run_sandbox's local scope ties its
-    // lifetime to the Run.
-    let _firewall_guard = if manage_firewall {
-        let _ = firewall::remove_tap_allow(&tap_name).await;
-        firewall::add_tap_allow(&tap_name)
-            .await
-            .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-        eprintln!("[firewall] installed per-TAP allow rule for {tap_name}");
-        Some(firewall::TapAllowGuard::new(tap_name.clone()))
-    } else {
-        None
-    };
-
-    // ── L7 egress proxy ────────────────────────────────────────────────────
-    // Bind the proxy on the TAP host IP (port 0 → kernel-assigned) so the
-    // address injected as HTTP_PROXY / HTTPS_PROXY is reachable from inside
-    // the guest once eth0 comes up. Bind happens before build_sandbox_spec_json
-    // so the bound SocketAddr flows into the env. Listener-bind failure
-    // remains non-fatal here: a follow-up slice adds L3 nftables that make
-    // proxy presence load-bearing.
-    let policy = spec.effective_egress_policy();
-    let (denied_tx, denied_rx) = tokio::sync::mpsc::unbounded_channel();
-    // Keep sender clones for the L3 drop-log + DNS listener tasks (spawned
-    // below). The proxy takes its own clone; once all producers exit, the
-    // supervisor's `denied_rx.recv()` returns None and the select arm flips off.
-    let drop_log_tx = denied_tx.clone();
-    let dns_tx = denied_tx.clone();
-    let proxy_bind: SocketAddr = SocketAddr::from((net.host, 0));
-    let (proxy_addr, proxy_handle) = match egress_proxy::spawn_listener(
-        proxy_bind,
-        policy.clone(),
-        denied_tx,
+    // The full Firecracker lifecycle lives in `sandbox_run` so that the CLI
+    // (this caller) and `Session::run_with_backend` share one implementation.
+    // The CLI's legacy path does not extract into a Pool — workspace state
+    // dies at VM exit, matching ADR-0010 — so `extraction` is `None`.
+    sandbox_run::run(
+        kernel,
+        rootfs,
+        firecracker_bin,
+        manage_firewall,
+        spec,
+        run_id,
+        enc,
+        workspace_path,
+        None,
     )
     .await
-    {
-        Ok((addr, h)) => {
-            eprintln!("[egress] L7 proxy listening on {addr}");
-            (Some(addr), Some(h))
-        }
-        Err(e) => {
-            eprintln!("[egress] failed to start proxy listener: {e}");
-            (None, None)
-        }
-    };
-
-    // ── DNS listener (slice 10m) ───────────────────────────────────────────
-    // Bind a UDP listener on `net.host:53` so the guest's resolver routes
-    // through us. Allowed queries forward to an upstream resolver; denied
-    // queries get a REFUSED reply + a DenialEvent (protocol=dns) on the
-    // existing denial channel. Port 53 is privileged, so on dev boxes the
-    // bind will fail with EACCES — log a warning and continue. In that
-    // case the DNS denial path is non-functional this Run, but the L3
-    // nftables rule (next block) will not include a DNS exception either,
-    // so guest DNS traffic surfaces as raw_tcp drops uniformly.
-    // Resolution order (slice 10p): explicit env var → host /etc/resolv.conf
-    // first `nameserver` line → 8.8.8.8:53 literal. The env var stays load-
-    // bearing for air-gapped hosts that need to override the host's resolver
-    // pick; the /etc/resolv.conf step is the implicit default that lets
-    // hosts behind a corporate or split-horizon resolver work without
-    // setting anything.
-    use std::env;
-    let upstream: SocketAddr = match env::var("BUNSEN_DNS_UPSTREAM") {
-        Ok(s) => s.parse().unwrap_or_else(|_| {
-            let fallback = dns::default_dns_upstream();
-            eprintln!(
-                "[egress] WARNING: invalid BUNSEN_DNS_UPSTREAM={s:?}, \
-                 falling back to {fallback}"
-            );
-            fallback
-        }),
-        Err(_) => dns::default_dns_upstream(),
-    };
-    let dns_bind: SocketAddr = SocketAddr::from((net.host, 53));
-    let (dns_port, dns_handle) = match dns::spawn_dns_listener(
-        dns_bind,
-        policy,
-        dns::TokioUdpResolver::new(upstream),
-        dns_tx,
-    )
-    .await
-    {
-        Ok((addr, h)) => {
-            eprintln!("[egress] DNS listener bound on {addr} (upstream {upstream})");
-            (Some(addr.port()), Some(h))
-        }
-        Err(e) => {
-            // spawn_dns_listener consumed dns_tx already; on Err it's dropped
-            // inside the function before it returns, so no extra cleanup
-            // needed here. The remaining producers (the proxy listener + the
-            // drop-log task, if either started) keep the supervisor's
-            // denied_rx open.
-            eprintln!(
-                "[egress] failed to bind DNS listener on {dns_bind}: {e} \
-                 — DNS-only egress attempts will surface as raw_tcp drops"
-            );
-            (None, None)
-        }
-    };
-
-    // ── L3 egress enforcement (nftables) ───────────────────────────────────
-    // Default-deny on the TAP — only TCP to the L7 proxy address is allowed.
-    // Drops are logged with a per-Run prefix so a follow-up slice can emit
-    // egress_denied(protocol=raw_tcp) events from the kernel log. Only loaded
-    // when the proxy actually bound: without a proxy address there is no
-    // safe rule to allow, so loading the table here would render the guest
-    // completely offline (matches "fail-closed" intent but is too aggressive
-    // until the proxy is treated as mandatory in a later slice).
-    let nft_table = derive_table_name(run_id);
-    // Defensive: clean up any leftover table from a previous crashed Run
-    // with the same id before reloading.
-    let _ = delete_nftables_table(&nft_table).await;
-    let mut nft_loaded = false;
-    if let Some(addr) = proxy_addr {
-        // dns_port is included only when the DNS listener actually bound; if
-        // we add a DNS allow rule for a port nothing's listening on, the
-        // guest's resolver queries would be silently lost (kernel forwards
-        // them but no one answers) instead of surfacing as raw_tcp drops.
-        let rules = build_ruleset(&nft_table, &tap_name, net.host, addr.port(), dns_port);
-        eprintln!("[egress] loading nftables table {nft_table}");
-        match apply_nftables_ruleset(&rules).await {
-            Ok(()) => nft_loaded = true,
-            Err(e) => {
-                eprintln!("[egress] WARNING: failed to load L3 nftables rules: {e:#}");
-            }
-        }
-    } else {
-        eprintln!(
-            "[egress] proxy not bound — skipping L3 nftables rules (no enforcement this Run)"
-        );
-    }
-
-    // ── L3 drop-log side-channel ──────────────────────────────────────────
-    // Tail `journalctl -k -f` and forward drops whose table matches this
-    // Run's nft table as DenialEvents on the same channel the L7 proxy uses,
-    // so the supervisor's existing select-arm emits them uniformly as
-    // `egress_denied(protocol=raw_tcp)`. Only started when the ruleset
-    // actually loaded — without rules, the kernel has nothing to log.
-    let drop_log_handle = if nft_loaded {
-        match spawn_drop_log_emitter(nft_table.clone(), drop_log_tx) {
-            Ok(h) => {
-                eprintln!("[egress] drop-log emitter watching table {nft_table}");
-                Some(h)
-            }
-            Err(e) => {
-                eprintln!(
-                    "[egress] WARNING: failed to start drop-log emitter: {e:#} \
-                     — L3 drops will not produce egress_denied events"
-                );
-                None
-            }
-        }
-    } else {
-        // No nft rules loaded → no kernel-log lines to tail. Drop the unused
-        // sender so the supervisor's denial channel can close cleanly when
-        // the proxy task exits.
-        drop(drop_log_tx);
-        None
-    };
-
-    let sandbox_spec_json = sandbox::build_sandbox_spec_json(spec, proxy_addr, Some(net));
-
-    let config = SandboxConfig {
-        kernel_path: kernel,
-        rootfs_path: rootfs,
-        workspace_host_path: workspace_path.to_path_buf(),
-        spec_json: sandbox_spec_json,
-        vcpus: spec.vcpus,
-        mem_mib: spec.memory_mb,
-        workspace_disk_mib: spec.workspace_disk_mb,
-        run_id: run_id.to_string(),
-        tap_name,
-    };
-
-    // The workspace ext4 is created inside start_firecracker; here we just
-    // need to ensure the host dir exists so mkfs.ext4 -d can read it.
-    // start_firecracker creates the run_dir, so we pass config with the
-    // workspace_host_path to signal it to pre-populate.
-
-    let mut handle = start_firecracker(&config, &fc_bin)
-        .await
-        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-
-    let egress_ctx = EgressContext {
-        denied_rx,
-        listener: proxy_handle,
-        drop_log: drop_log_handle,
-        dns_listener: dns_handle,
-    };
-    let result = sandbox_supervisor::run(&mut handle, spec, enc, egress_ctx).await;
-
-    // Workspace extraction is now driven by Session::run via Sandbox Fetch
-    // into the Pool (slice 09). The CLI does not yet have a Session, so
-    // no host-side extraction happens here — slice 11 wires `bunsen run
-    // --session <id>` and the agent's commits land in the Session's Pool.
-    // Until then, CLI invocations of bunsen-core lose workspace state at
-    // VM exit, matching ADR-0010's "Pool is the source of truth" rule.
-    let _ = workspace_path;
-
-    // Remove the per-Run nftables table. Idempotent; safe even if loading
-    // earlier failed.
-    let _ = delete_nftables_table(&nft_table).await;
-
-    result.map_err(|e| std::io::Error::other(format!("{e:#}")))
 }
 
 struct CliArgs {
@@ -732,5 +538,29 @@ mod tests {
         let args = strs(&["bunsen-core", "--spec", "{}"]);
         let cli = parse_cli_args(&args);
         assert!(cli.session_id.is_none());
+    }
+
+    /// Slice 12 (Firecracker dispatch through Session::run): the
+    /// `--session <id> --kernel <p> --rootfs <p>` argument set parses as a
+    /// single CLI call so the binary can route the Run through
+    /// `Session::run_with_backend` with a sandbox-shaped RunBackend.
+    #[test]
+    fn parse_cli_session_with_kernel_and_rootfs() {
+        let args = strs(&[
+            "bunsen-core",
+            "--session",
+            "01HSESSION0000000000000000",
+            "--kernel",
+            "/vmlinux",
+            "--rootfs",
+            "/rootfs.ext4",
+            "--spec",
+            "{}",
+        ]);
+        let cli = parse_cli_args(&args);
+        assert_eq!(cli.session_id.as_deref(), Some("01HSESSION0000000000000000"));
+        assert_eq!(cli.kernel.unwrap().to_str().unwrap(), "/vmlinux");
+        assert_eq!(cli.rootfs.unwrap().to_str().unwrap(), "/rootfs.ext4");
+        assert!(cli.spec.is_some());
     }
 }
