@@ -6,3 +6,4 @@ python/*.egg-info/
 python/bunsen/bin/
 **/__pycache__/
 *.pyc
+.scratch/
