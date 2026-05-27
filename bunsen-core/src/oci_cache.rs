@@ -19,7 +19,7 @@ use tokio::process::Command;
 // placeholder; the images CI workflow replaces it with the real multi-arch
 // manifest digest via an automated PR after the first image push (ADR-0012).
 pub const DEFAULT_ROOTFS_IMAGE: &str =
-    "ghcr.io/xenolf/bunsen/bunsen-base@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    "ghcr.io/xenolf/bunsen/bunsen-base@sha256:45000c725a512be492789a86db128d96b9e68e571c86e0dc06a0a48fb731bafe";
 
 // ── Cache location ─────────────────────────────────────────────────────────────
 
