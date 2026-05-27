@@ -12,6 +12,15 @@ use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+// ── Compile-time pin: default rootfs image ────────────────────────────────────
+//
+// Used when a Run enters sandbox mode (kernel resolved) but neither `--rootfs`
+// nor `oci-image` in the run spec is provided. The digest below is a sentinel
+// placeholder; the images CI workflow replaces it with the real multi-arch
+// manifest digest via an automated PR after the first image push (ADR-0012).
+pub const DEFAULT_ROOTFS_IMAGE: &str =
+    "ghcr.io/xenolf/bunsen/bunsen-base@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
 // ── Cache location ─────────────────────────────────────────────────────────────
 
 pub fn cache_dir() -> PathBuf {
@@ -581,5 +590,20 @@ mod tests {
             _ => panic!("expected Named whiteout"),
         }
         assert!(matches!(classify_whiteout("regular_file"), WhiteoutKind::None));
+    }
+
+    // DEFAULT_ROOTFS_IMAGE must be a valid OciImageRef::parse input — a
+    // placeholder sentinel is acceptable as long as the format is digest-pinned
+    // and points at the published GHCR repository. CI swaps the digest in via
+    // an automated PR after the first image push (ADR-0012).
+    #[test]
+    fn default_rootfs_image_is_valid_oci_ref() {
+        let r = OciImageRef::parse(DEFAULT_ROOTFS_IMAGE).unwrap_or_else(|e| {
+            panic!("DEFAULT_ROOTFS_IMAGE failed to parse: {e}")
+        });
+        assert_eq!(r.registry, "ghcr.io");
+        assert_eq!(r.name, "xenolf/bunsen/bunsen-base");
+        assert!(r.digest.starts_with("sha256:"));
+        assert_eq!(r.digest_hex().len(), 64);
     }
 }

@@ -291,12 +291,10 @@ async fn run_with_backend(
         let rootfs = match rootfs {
             Some(p) => p,
             None => {
-                let oci_ref = spec.oci_image.as_deref().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "sandbox mode requires --rootfs or oci-image in spec",
-                    )
-                })?;
+                let oci_ref = spec
+                    .oci_image
+                    .as_deref()
+                    .unwrap_or(oci_cache::DEFAULT_ROOTFS_IMAGE);
                 oci_cache::resolve_rootfs(oci_ref)
                     .await
                     .map_err(|e| std::io::Error::other(format!("{e:#}")))?
