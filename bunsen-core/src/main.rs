@@ -16,6 +16,7 @@ mod run_spec;
 mod sandbox;
 mod sandbox_net;
 mod sandbox_nft;
+mod session;
 mod supervisor;
 mod ulid;
 mod workspace_materializer;
