@@ -93,29 +93,13 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        // Resolve the kernel via the same lazy-fetch path the legacy CLI uses
-        // (sandbox-intended when --rootfs or spec.oci_image is set). On
-        // non-Linux this is a no-op; the Session path's platform gate will
-        // reject the eventual run if a kernel slipped through anyway.
-        #[cfg(target_os = "linux")]
-        let resolved_kernel: Option<std::path::PathBuf> = if let Some(k) = cli.kernel.clone() {
-            Some(k)
-        } else if spec.oci_image.is_some() || cli.rootfs.is_some() {
-            match kernel::ensure_kernel().await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    eprintln!("[bunsen-core] failed to acquire guest kernel: {e:#}");
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            None
-        };
-        #[cfg(not(target_os = "linux"))]
-        let resolved_kernel: Option<std::path::PathBuf> = cli.kernel.clone();
-
+        // Lazy kernel + OCI-rootfs resolution now lives inside
+        // `Session::run_with_backend` so any Session caller (CLI or Python)
+        // gets the same behaviour without duplicating the logic. The CLI
+        // just forwards its flags as RunBackend overrides; an absent
+        // `--kernel` + `spec.oci_image` set will lazy-fetch correctly.
         let backend = session::RunBackend {
-            kernel: resolved_kernel,
+            kernel: cli.kernel.clone(),
             rootfs: cli.rootfs.clone(),
             firecracker_bin: cli.firecracker.clone(),
             manage_firewall: cli.manage_firewall,

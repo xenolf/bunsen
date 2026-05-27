@@ -249,30 +249,40 @@ enum DispatchOutcome {
     },
 }
 
-/// Backend selection for [`Session::run_with_backend`].
+/// Per-Run backend override for [`Session::run_with_backend`].
 ///
-/// The default (no kernel) runs the agent in the host-subprocess supervisor,
-/// matching the pre-Firecracker `Session::run` behaviour. Setting `kernel`
-/// (and/or `rootfs`) opts the Run into the Firecracker sandbox — the same
-/// path the legacy CLI `bunsen-core --kernel /k --rootfs /r --spec ...` has
-/// always used. The agent's commits are then extracted from the ext4 image
-/// directly into the Session's Pool via the hardened
-/// [`crate::sandbox_fetch::fetch_pool_from_git_dir`] driven by
-/// [`crate::firecracker::extract_workspace_from_ext4`] (see [ADR-0011]).
+/// All fields are optional — the default `RunBackend` lets the Session
+/// decide the backend from the [`RunSpec`]: when `spec.oci_image` is set
+/// (or any of the override fields below is supplied), the Run boots in
+/// the Firecracker sandbox; otherwise it goes through the host-subprocess
+/// supervisor. This matches the legacy CLI's "trigger for sandbox is
+/// `--rootfs` or `spec.oci_image`" rule.
 ///
-/// On non-Linux platforms, supplying a kernel returns
+/// Each field is an explicit override of the lazy-resolution default:
+///
+/// - `kernel` — bypass [`crate::kernel::ensure_kernel`] and use this path.
+/// - `rootfs` — bypass [`crate::oci_cache::resolve_rootfs`] and use this
+///   path. Required when the [`RunSpec`] has no `oci_image`.
+/// - `firecracker_bin` — override `firecracker` resolution from `$PATH`.
+/// - `manage_firewall` — same as the CLI `--manage-firewall` flag.
+///
+/// On non-Linux platforms, any sandbox-intent input (explicit kernel /
+/// rootfs / firecracker_bin OR `spec.oci_image`) returns
 /// [`SessionError::SandboxUnsupportedOnPlatform`] without leaving a Run on
-/// disk — the host-subprocess path is still reachable via the default
-/// backend.
+/// disk. The host-subprocess path stays reachable on every platform via a
+/// spec with no `oci_image` and a default backend.
 ///
 /// [ADR-0011]: ../../../docs/adr/0011-hardened-git-fetch-from-sandbox.md
 #[derive(Debug, Clone, Default)]
 pub struct RunBackend {
-    /// Path to the guest kernel (`vmlinux`). When `None` the Run uses the
-    /// host-subprocess supervisor; when `Some` the Run boots Firecracker.
+    /// Explicit guest kernel path. When `None` and sandbox is intended,
+    /// `Session::run_with_backend` lazily fetches the pinned
+    /// Firecracker-CI vmlinux via [`crate::kernel::ensure_kernel`].
     pub kernel: Option<PathBuf>,
-    /// Path to the rootfs ext4 image. Required by Firecracker when the
-    /// `RunSpec` does not pin an OCI image; ignored without `kernel`.
+    /// Explicit rootfs ext4 image. When `None` and sandbox is intended,
+    /// the rootfs is resolved from `spec.oci_image` through the OCI cache.
+    /// One of the two (this field OR `spec.oci_image`) must be supplied
+    /// to enter the sandbox.
     pub rootfs: Option<PathBuf>,
     /// Override the `firecracker` binary location. `None` ⇒ search `$PATH`.
     pub firecracker_bin: Option<PathBuf>,
@@ -280,6 +290,63 @@ pub struct RunBackend {
     /// lifetime of the Run when the host's INPUT chain is DROP-by-default.
     /// Matches the CLI's `--manage-firewall` flag.
     pub manage_firewall: bool,
+}
+
+impl RunBackend {
+    /// Whether the caller has supplied anything that, by itself, asks for
+    /// the sandbox backend regardless of what the [`RunSpec`] says.
+    fn requests_sandbox(&self) -> bool {
+        self.kernel.is_some() || self.rootfs.is_some() || self.firecracker_bin.is_some()
+    }
+}
+
+/// Lazy-resolved sandbox inputs, computed once at the top of
+/// [`Session::run_with_backend`] when sandbox intent is detected. Carries
+/// the post-resolution kernel and rootfs paths so the dispatch site can
+/// hand them straight to `sandbox_run::run` without re-querying the cache.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ResolvedSandbox {
+    kernel: PathBuf,
+    rootfs: PathBuf,
+}
+
+/// Apply [`RunBackend`]'s lazy-resolution defaults: missing kernel →
+/// [`crate::kernel::ensure_kernel`]; missing rootfs → OCI pull from
+/// `spec.oci_image` via [`crate::oci_cache::resolve_rootfs`]. Either failure
+/// surfaces as a [`SessionError`] before any Run-dir side-effects in the
+/// caller, so a resolution failure leaves the Session bit-identical on disk.
+#[cfg(target_os = "linux")]
+async fn resolve_sandbox_inputs(
+    backend: &RunBackend,
+    spec: &RunSpec,
+) -> Result<ResolvedSandbox, SessionError> {
+    let kernel = match backend.kernel.clone() {
+        Some(p) => p,
+        None => crate::kernel::ensure_kernel().await.map_err(|e| {
+            SessionError::Git {
+                context: "ensure_kernel".into(),
+                stderr: format!("{e:#}"),
+            }
+        })?,
+    };
+    let rootfs = match backend.rootfs.clone() {
+        Some(p) => p,
+        None => {
+            let oci_ref = spec.oci_image.as_deref().ok_or_else(|| SessionError::Git {
+                context: "resolve_sandbox_inputs".into(),
+                stderr: "sandbox mode requires either RunBackend.rootfs or RunSpec.oci_image"
+                    .into(),
+            })?;
+            crate::oci_cache::resolve_rootfs(oci_ref)
+                .await
+                .map_err(|e| SessionError::Git {
+                    context: format!("resolve_rootfs({oci_ref})"),
+                    stderr: format!("{e:#}"),
+                })?
+        }
+    };
+    Ok(ResolvedSandbox { kernel, rootfs })
 }
 
 // ── Session handle ─────────────────────────────────────────────────────────
@@ -493,21 +560,51 @@ impl Session {
 
     /// Run the spec under a caller-chosen backend.
     ///
-    /// See [`RunBackend`] for the dispatch rules. With the default backend
-    /// this is equivalent to [`Session::run`].
+    /// **Dispatch rules** (mirror the legacy CLI):
+    ///
+    /// - Sandbox is intended when the [`RunSpec`] has `oci_image` **or**
+    ///   the caller supplied any override on `backend` (kernel, rootfs,
+    ///   firecracker_bin). Otherwise the host-subprocess supervisor runs.
+    /// - When the sandbox is intended but a field is missing, lazy
+    ///   resolution kicks in: missing kernel ⇒
+    ///   [`crate::kernel::ensure_kernel`]; missing rootfs ⇒
+    ///   [`crate::oci_cache::resolve_rootfs`] against `spec.oci_image`.
+    /// - Sandbox intent on non-Linux returns
+    ///   [`SessionError::SandboxUnsupportedOnPlatform`] before any disk
+    ///   side-effects.
+    ///
+    /// With a default `RunBackend` and a spec without `oci_image`, this is
+    /// equivalent to [`Session::run`].
     pub async fn run_with_backend(
         &mut self,
         spec: RunSpec,
         backend: RunBackend,
     ) -> Result<RunResult, SessionError> {
-        // Platform gate: asking for Firecracker on non-Linux must fail before
-        // any disk side-effects so the Session and `runs/` dir are untouched
-        // for the caller. The host-subprocess fallback stays reachable via
-        // the default RunBackend on every platform.
+        // Sandbox intent: explicit backend override OR an OCI image in the
+        // spec. This mirrors the legacy CLI's rule.
+        let sandbox_intended = backend.requests_sandbox() || spec.oci_image.is_some();
+
+        // Platform gate first: asking for Firecracker on non-Linux must
+        // fail before any disk side-effects so the Session and `runs/` dir
+        // are untouched for the caller. The host-subprocess fallback stays
+        // reachable on every platform when neither the spec nor the
+        // backend asks for the sandbox.
         #[cfg(not(target_os = "linux"))]
-        if backend.kernel.is_some() {
+        if sandbox_intended {
             return Err(SessionError::SandboxUnsupportedOnPlatform);
         }
+
+        // Lazy resolution of the kernel (and rootfs from spec.oci_image)
+        // happens here, BEFORE any run_dir / transcript / encoder
+        // side-effects, so a resolution failure leaves the Session bit-
+        // identical on disk. The host-subprocess path skips this entire
+        // block — no network, no fs writes.
+        #[cfg(target_os = "linux")]
+        let resolved = if sandbox_intended {
+            Some(resolve_sandbox_inputs(&backend, &spec).await?)
+        } else {
+            None
+        };
 
         // State check: open | failed_to_close accept new Runs; everything else
         // refuses. The state does not change as a result of the Run itself.
@@ -579,22 +676,27 @@ impl Session {
             }),
         )?;
 
-        // Run the agent. The host-subprocess supervisor is the default
-        // backend on every platform; Firecracker is selected when the
-        // caller hands us a kernel via `RunBackend`. The sandbox path
-        // performs ext4 extraction into the Pool inline, so the
+        // Run the agent. Host-subprocess supervisor or Firecracker sandbox,
+        // depending on what `sandbox_intended` decided above. The sandbox
+        // path performs ext4 extraction into the Pool inline, so the
         // host-subprocess `extract_run_output` step is replaced with a
         // Pool-side read of the audit ref to compute `pool_sha`.
         let agent_history_path = run_dir.agent_history_path();
+        #[cfg(target_os = "linux")]
         let dispatch = self
             .run_dispatch(
                 backend,
+                resolved,
                 &spec,
                 &run_id,
                 &mut enc,
                 &workspace_path,
                 &agent_history_path,
             )
+            .await;
+        #[cfg(not(target_os = "linux"))]
+        let dispatch = self
+            .run_dispatch(backend, &spec, &run_id, &mut enc, &workspace_path, &agent_history_path)
             .await;
         let (supervisor_result, extraction): (
             Result<(), SessionError>,
@@ -676,25 +778,25 @@ impl Session {
     }
 
     /// Dispatch to either the host-subprocess supervisor or the Firecracker
-    /// sandbox depending on the backend. Returns a value the caller pattern-
-    /// matches to decide how to compute `RunResult` (the host-subprocess
-    /// path inspects the on-host workspace; the sandbox path reads the
-    /// already-populated Pool).
+    /// sandbox. The caller has already done the dispatch decision and the
+    /// lazy resolution; on Linux it passes `resolved` to ask for the
+    /// sandbox path, or `None` for the host-subprocess fallback.
+    #[cfg(target_os = "linux")]
     async fn run_dispatch(
         &self,
         backend: RunBackend,
+        resolved: Option<ResolvedSandbox>,
         spec: &RunSpec,
         run_id: &str,
         enc: &mut Encoder,
         workspace_path: &Path,
         agent_history_dst: &Path,
     ) -> DispatchOutcome {
-        #[cfg(target_os = "linux")]
-        if let Some(kernel) = backend.kernel {
+        if let Some(r) = resolved {
             let user_script_uid = current_uid();
             let sandbox_result = crate::sandbox_run::run(
-                kernel,
-                backend.rootfs.unwrap_or_default(),
+                r.kernel,
+                r.rootfs,
                 backend.firecracker_bin,
                 backend.manage_firewall,
                 spec,
@@ -711,18 +813,32 @@ impl Session {
             .await;
             return DispatchOutcome::Sandbox { sandbox_result };
         }
-        // Non-Linux always lands here. On Linux without a kernel, also lands
-        // here. The supervisor performs no agent-history copy of its own —
-        // that's done by extract_run_output via the narrow copy helper.
         let supervisor_result = crate::supervisor::run(spec, run_id, enc, workspace_path, None)
             .await
             .map_err(|e| SessionError::AgentExit { stderr: e.to_string() });
-        // On non-Linux we never reach the `backend.kernel.is_some()` branch
-        // above (the early `SandboxUnsupportedOnPlatform` check in the
-        // caller guards it), but on Linux we still need to silence
-        // unused-field warnings when the kernel branch was skipped.
-        #[cfg(not(target_os = "linux"))]
+        DispatchOutcome::HostSubprocess { supervisor_result }
+    }
+
+    /// Non-Linux dispatch: sandbox intent is already rejected by the platform
+    /// gate, so this only ever runs the host-subprocess supervisor.
+    #[cfg(not(target_os = "linux"))]
+    async fn run_dispatch(
+        &self,
+        backend: RunBackend,
+        spec: &RunSpec,
+        run_id: &str,
+        enc: &mut Encoder,
+        workspace_path: &Path,
+        agent_history_dst: &Path,
+    ) -> DispatchOutcome {
+        let supervisor_result = crate::supervisor::run(spec, run_id, enc, workspace_path, None)
+            .await
+            .map_err(|e| SessionError::AgentExit { stderr: e.to_string() });
+        // On non-Linux the sandbox branch is unreachable (the platform gate in
+        // run_with_backend returned early), so the backend overrides aren't
+        // load-bearing on this platform. Silence unused-field warnings.
         let _ = (
+            backend.kernel,
             backend.rootfs,
             backend.firecracker_bin,
             backend.manage_firewall,
@@ -2596,6 +2712,42 @@ mod tests {
             result.is_err(),
             "with a non-existent kernel the Firecracker path must fail, \
              not silently fall through to the host-subprocess supervisor"
+        );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `spec.oci_image` alone (no kernel/rootfs in the backend) triggers
+    /// sandbox intent — the legacy CLI's "trigger for sandbox is rootfs
+    /// or oci_image" rule, lifted into the Session layer.
+    ///
+    /// On non-Linux this surfaces as `SandboxUnsupportedOnPlatform`, which
+    /// is the cleanest cross-platform proof that the spec's `oci_image`
+    /// field was consulted by the dispatch logic. (On Linux the same input
+    /// triggers real OCI resolution + Firecracker; that path is exercised
+    /// by the end-to-end smoke on a real Linux box.)
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn run_with_oci_image_in_spec_triggers_sandbox_intent() {
+        let host = make_host_repo("sr-oci-intent");
+        let root = make_temp_dir("sr-oci-intent-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+
+        // Spec with oci_image set; default RunBackend (no explicit kernel).
+        let body = serde_json::json!({
+            "adapter": "black-box",
+            "cmd": ["true"],
+            "branching-strategy": {"kind": "pool-clone", "base": "host/main"},
+            "oci-image": "ghcr.io/example/agent@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        });
+        let spec = RunSpec::from_json(&serde_json::to_string(&body).unwrap()).unwrap();
+        let err = s.run_with_backend(spec, RunBackend::default()).await.unwrap_err();
+        assert!(
+            matches!(err, SessionError::SandboxUnsupportedOnPlatform),
+            "expected SandboxUnsupportedOnPlatform from spec.oci_image alone, got {err:?}"
         );
 
         std::fs::remove_dir_all(&host).ok();
