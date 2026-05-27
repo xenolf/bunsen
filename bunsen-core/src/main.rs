@@ -316,7 +316,7 @@ async fn run_sandbox(
 ) -> std::io::Result<()> {
     use firecracker::{
         apply_nftables_ruleset, create_tap, delete_nftables_table, delete_tap,
-        extract_workspace_from_ext4, spawn_drop_log_emitter, start_firecracker,
+        spawn_drop_log_emitter, start_firecracker,
     };
     use sandbox::SandboxConfig;
     use sandbox_net::{derive_run_network, derive_tap_name};
@@ -525,10 +525,6 @@ async fn run_sandbox(
         tap_name,
     };
 
-    // Populate workspace ext4 from the materialized workspace directory.
-    let workspace_ext4 = std::env::temp_dir()
-        .join(format!("bunsen-fc-{run_id}"))
-        .join("workspace.ext4");
     // The workspace ext4 is created inside start_firecracker; here we just
     // need to ensure the host dir exists so mkfs.ext4 -d can read it.
     // start_firecracker creates the run_dir, so we pass config with the
@@ -546,12 +542,13 @@ async fn run_sandbox(
     };
     let result = sandbox_supervisor::run(&mut handle, spec, enc, egress_ctx).await;
 
-    // After VM exits, extract workspace files back to the host path.
-    if workspace_ext4.exists() {
-        if let Err(e) = extract_workspace_from_ext4(&workspace_ext4, workspace_path).await {
-            eprintln!("[fc] workspace extraction warning: {e:#}");
-        }
-    }
+    // Workspace extraction is now driven by Session::run via Sandbox Fetch
+    // into the Pool (slice 09). The CLI does not yet have a Session, so
+    // no host-side extraction happens here — slice 11 wires `bunsen run
+    // --session <id>` and the agent's commits land in the Session's Pool.
+    // Until then, CLI invocations of bunsen-core lose workspace state at
+    // VM exit, matching ADR-0010's "Pool is the source of truth" rule.
+    let _ = workspace_path;
 
     // Remove the per-Run nftables table. Idempotent; safe even if loading
     // earlier failed.

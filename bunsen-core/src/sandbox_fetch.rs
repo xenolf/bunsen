@@ -55,6 +55,29 @@ pub const HARDENING_ENV_VARS: &[(&str, &str)] = &[
 /// hostile-filesystem hardening triad.
 pub const MOUNT_OPTIONS: &str = "ro,nosuid,nodev,noexec";
 
+/// Known agent-history subpaths to extract from a Workspace after a Run.
+///
+/// Each entry is a path relative to the Workspace root. Files and directories
+/// are both supported. The set is per-adapter; unknown adapters get the
+/// claude-code default of `.claude/`. The list is intentionally explicit and
+/// short so a future addition (e.g. a new adapter's history file) is a single
+/// diff in this module, not scattered across copy helpers.
+pub fn agent_history_subpaths(adapter: &str) -> &'static [&'static str] {
+    match adapter {
+        "aider" => AIDER_HISTORY_SUBPATHS,
+        // claude-code stores everything under `.claude/`; unknown adapters
+        // fall back to the same convention so they keep working without a
+        // per-adapter entry.
+        _ => &[".claude"],
+    }
+}
+
+const AIDER_HISTORY_SUBPATHS: &[&str] = &[
+    ".aider.chat.history.md",
+    ".aider.input.history",
+    ".aider.llm.history",
+];
+
 // ── Errors ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -148,6 +171,92 @@ pub fn build_mount_argv(loop_dev: &str, mountpoint: &Path) -> Vec<String> {
         loop_dev.into(),
         mountpoint.to_string_lossy().to_string(),
     ]
+}
+
+// ── Narrow agent-history copy ─────────────────────────────────────────────
+
+/// Copy a small, explicit list of subpaths from `source_root` to `dst_root`,
+/// refusing to follow symlinks whose targets escape `source_root`.
+///
+/// Used after a Run to preserve the agent's native history (e.g. claude-code's
+/// `.claude/`, aider's `.aider.*.history` files) on the host so the User
+/// Script can debug agent behaviour. These files are NOT pulled into the
+/// Pool — the Pool only carries the agent's commits.
+///
+/// Behaviour:
+/// - Missing subpaths are skipped silently.
+/// - Symbolic links are not followed. Any symlink found while walking is
+///   skipped entirely — recreating it in `dst_root` would be load-bearing
+///   only if the agent intentionally produced one, and we'd rather lose the
+///   symlink than copy out-of-tree data into the host's filesystem.
+/// - Only regular files and directories are traversed/copied. Special files
+///   (sockets, devices, FIFOs) are skipped.
+///
+/// The symlink-escape guard is the load-bearing part: even though we don't
+/// follow symlinks at all in the current implementation, `source_root` is
+/// canonicalised up front so a future relaxation that wants to allow
+/// in-tree symlinks has a `starts_with(canonical)` check to apply.
+pub fn copy_agent_history_narrow(
+    adapter: &str,
+    source_root: &Path,
+    dst_root: &Path,
+) -> std::io::Result<()> {
+    let canonical_source = match std::fs::canonicalize(source_root) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for sub in agent_history_subpaths(adapter) {
+        let src = canonical_source.join(sub);
+        let dst = dst_root.join(sub);
+        copy_narrow_entry(&canonical_source, &src, &dst)?;
+    }
+    Ok(())
+}
+
+fn copy_narrow_entry(
+    source_root: &Path,
+    src: &Path,
+    dst: &Path,
+) -> std::io::Result<()> {
+    let meta = match std::fs::symlink_metadata(src) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        // Refuse to follow. Even when the target stays inside source_root,
+        // we skip rather than recreate — `agent-history/` is a snapshot of
+        // the agent's session memory, not a faithful reproduction of the
+        // workspace layout. The canonical guard below documents the
+        // tighter check a future relaxation would apply.
+        if let Ok(resolved) = std::fs::canonicalize(src) {
+            // Verifies the symlink doesn't point outside the source tree.
+            // We never follow regardless, but if a future change opts to
+            // follow internal symlinks this is the predicate it'd use.
+            let _ = resolved.starts_with(source_root);
+        }
+        return Ok(());
+    }
+    if ft.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            copy_narrow_entry(source_root, &entry.path(), &dst.join(&name))?;
+        }
+        return Ok(());
+    }
+    if ft.is_file() {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+        return Ok(());
+    }
+    // Sockets / devices / FIFOs — skip.
+    Ok(())
 }
 
 // ── Fetch step (cross-platform, used by both fixtures and the ext4 lifecycle) ─
@@ -600,5 +709,142 @@ mod tests {
         {
             0
         }
+    }
+
+    // ── Narrow agent-history copy ─────────────────────────────────────────
+
+    #[test]
+    fn agent_history_subpaths_claude_code_uses_dot_claude() {
+        assert_eq!(agent_history_subpaths("claude-code"), &[".claude"]);
+    }
+
+    #[test]
+    fn agent_history_subpaths_aider_uses_known_history_files() {
+        let subs = agent_history_subpaths("aider");
+        assert!(subs.contains(&".aider.chat.history.md"));
+        assert!(subs.contains(&".aider.input.history"));
+        assert!(subs.contains(&".aider.llm.history"));
+    }
+
+    #[test]
+    fn agent_history_subpaths_unknown_adapter_falls_back_to_dot_claude() {
+        assert_eq!(agent_history_subpaths("black-box"), &[".claude"]);
+    }
+
+    #[test]
+    fn copy_agent_history_narrow_copies_claude_dir_recursively() {
+        let src = make_temp_dir("ah-claude-src");
+        let dst = make_temp_dir("ah-claude-dst");
+        std::fs::create_dir_all(src.join(".claude").join("sub")).unwrap();
+        std::fs::write(src.join(".claude").join("a.json"), b"a").unwrap();
+        std::fs::write(src.join(".claude").join("sub").join("b.json"), b"b").unwrap();
+        // A file outside `.claude/` must NOT be copied — only the known
+        // subpath list is in scope.
+        std::fs::write(src.join("README.md"), b"readme").unwrap();
+
+        copy_agent_history_narrow("claude-code", &src, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join(".claude").join("a.json")).unwrap(), b"a");
+        assert_eq!(
+            std::fs::read(dst.join(".claude").join("sub").join("b.json")).unwrap(),
+            b"b"
+        );
+        assert!(!dst.join("README.md").exists(), "out-of-list file must not be copied");
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dst).ok();
+    }
+
+    #[test]
+    fn copy_agent_history_narrow_skips_missing_subpaths() {
+        let src = make_temp_dir("ah-empty-src");
+        let dst = make_temp_dir("ah-empty-dst");
+        // No `.claude/` exists.
+        copy_agent_history_narrow("claude-code", &src, &dst).unwrap();
+        assert!(!dst.join(".claude").exists());
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dst).ok();
+    }
+
+    #[test]
+    fn copy_agent_history_narrow_does_not_follow_out_of_tree_symlink() {
+        // The adversarial case from ADR-0011: an agent plants a symlink
+        // pointing to `/etc/passwd`. The narrow copy must not read it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let src = make_temp_dir("ah-sym-src");
+            let dst = make_temp_dir("ah-sym-dst");
+            std::fs::create_dir_all(src.join(".claude")).unwrap();
+            // Symlink pointing to a host file the agent should never reach.
+            symlink("/etc/passwd", src.join(".claude").join("escape")).unwrap();
+
+            copy_agent_history_narrow("claude-code", &src, &dst).unwrap();
+            let copied = dst.join(".claude").join("escape");
+            // The symlink target must NOT have been read into a regular file.
+            assert!(
+                !copied.exists() || std::fs::symlink_metadata(&copied).map(|m| m.file_type().is_symlink()).unwrap_or(false),
+                "out-of-tree symlink must not be materialised as a regular file"
+            );
+            // And nothing matching /etc/passwd's content (which starts with "root:")
+            // should have leaked through.
+            if let Ok(bytes) = std::fs::read(&copied) {
+                assert!(
+                    !bytes.starts_with(b"root:"),
+                    "out-of-tree symlink content leaked through narrow copy"
+                );
+            }
+            std::fs::remove_dir_all(&src).ok();
+            std::fs::remove_dir_all(&dst).ok();
+        }
+    }
+
+    #[test]
+    fn copy_agent_history_narrow_skips_in_tree_symlink_too() {
+        // The conservative posture: even in-tree symlinks are skipped, since
+        // `agent-history/` is a memory snapshot, not a workspace mirror.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let src = make_temp_dir("ah-sym-in-src");
+            let dst = make_temp_dir("ah-sym-in-dst");
+            std::fs::create_dir_all(src.join(".claude")).unwrap();
+            std::fs::write(src.join(".claude").join("real.txt"), b"real").unwrap();
+            symlink("real.txt", src.join(".claude").join("alias.txt")).unwrap();
+
+            copy_agent_history_narrow("claude-code", &src, &dst).unwrap();
+            assert_eq!(
+                std::fs::read(dst.join(".claude").join("real.txt")).unwrap(),
+                b"real",
+                "real file inside .claude/ is copied"
+            );
+            // The in-tree symlink is skipped per the conservative rule.
+            let alias = dst.join(".claude").join("alias.txt");
+            assert!(!alias.exists(), "in-tree symlink must be skipped");
+            std::fs::remove_dir_all(&src).ok();
+            std::fs::remove_dir_all(&dst).ok();
+        }
+    }
+
+    #[test]
+    fn copy_agent_history_narrow_copies_aider_files_only() {
+        let src = make_temp_dir("ah-aider-src");
+        let dst = make_temp_dir("ah-aider-dst");
+        std::fs::write(src.join(".aider.chat.history.md"), b"chat").unwrap();
+        std::fs::write(src.join(".aider.input.history"), b"in").unwrap();
+        std::fs::write(src.join(".aider.llm.history"), b"llm").unwrap();
+        // The aider cache directory and unrelated workspace files are out
+        // of scope.
+        std::fs::create_dir_all(src.join(".aider.tags.cache.v3")).unwrap();
+        std::fs::write(src.join(".aider.tags.cache.v3").join("x"), b"cache").unwrap();
+        std::fs::write(src.join("README.md"), b"readme").unwrap();
+
+        copy_agent_history_narrow("aider", &src, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join(".aider.chat.history.md")).unwrap(), b"chat");
+        assert_eq!(std::fs::read(dst.join(".aider.input.history")).unwrap(), b"in");
+        assert_eq!(std::fs::read(dst.join(".aider.llm.history")).unwrap(), b"llm");
+        assert!(!dst.join(".aider.tags.cache.v3").exists(), "cache dir must not be copied");
+        assert!(!dst.join("README.md").exists());
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dst).ok();
     }
 }

@@ -15,7 +15,16 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::branch_pool::{BranchPool, BranchPoolError, ManifestEntry};
+use crate::encoder::Encoder;
+use crate::events::{BUNSEN_VERSION, SCHEMA_VERSION};
+use crate::redactor::Redactor;
+use crate::run_dir::{MetaJson, ResourceLimits, RunDir};
+use crate::run_spec::{BranchingStrategy, RunSpec};
+use crate::sandbox_fetch::{
+    copy_agent_history_narrow, fetch_pool_from_git_dir, SandboxFetchError,
+};
 use crate::ulid;
+use crate::workspace_materializer::{self, WorkspaceMaterializerError};
 
 // ── State machine ─────────────────────────────────────────────────────────
 
@@ -115,6 +124,10 @@ pub enum SessionError {
     NotFound { id: String },
     PurgeRequiresClosedState { id: String, state: SessionState },
     Serde(serde_json::Error),
+    Materialize(WorkspaceMaterializerError),
+    SandboxFetch(SandboxFetchError),
+    AgentExit { stderr: String },
+    BadRedactor(String),
 }
 
 impl std::fmt::Display for SessionError {
@@ -130,6 +143,10 @@ impl std::fmt::Display for SessionError {
                 "purge of session {id:?} not permitted from state {state:?} (closed required)"
             ),
             Self::Serde(e) => write!(f, "metadata parse error: {e}"),
+            Self::Materialize(e) => write!(f, "workspace materialize error: {e}"),
+            Self::SandboxFetch(e) => write!(f, "sandbox fetch error: {e}"),
+            Self::AgentExit { stderr } => write!(f, "agent supervisor error: {stderr}"),
+            Self::BadRedactor(e) => write!(f, "redactor build error: {e}"),
         }
     }
 }
@@ -160,6 +177,18 @@ impl From<TransitionError> for SessionError {
     }
 }
 
+impl From<WorkspaceMaterializerError> for SessionError {
+    fn from(e: WorkspaceMaterializerError) -> Self {
+        Self::Materialize(e)
+    }
+}
+
+impl From<SandboxFetchError> for SessionError {
+    fn from(e: SandboxFetchError) -> Self {
+        Self::SandboxFetch(e)
+    }
+}
+
 // ── List filter ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
@@ -177,6 +206,22 @@ pub struct SessionSummary {
     pub host_repo: PathBuf,
     pub labels: Vec<String>,
     pub created_at: String,
+}
+
+/// Outcome of a [`Session::run`].
+///
+/// `pool_sha` is the SHA the Pool's `runs/<run-id>` audit ref points at after
+/// the agent's commits are extracted. `None` when the agent produced zero
+/// commits (a successful, but warning-annotated, Run). When `output_branch`
+/// was declared on the [`RunSpec`] and the Run produced commits, the same
+/// SHA also lives under that branch name in the Pool — `output_branch_pushed`
+/// echoes the name back.
+#[derive(Debug, Clone)]
+pub struct RunResult {
+    pub run_id: String,
+    pub pool_sha: Option<String>,
+    pub output_branch_pushed: Option<String>,
+    pub uncommitted_paths: Vec<String>,
 }
 
 // ── Session handle ─────────────────────────────────────────────────────────
@@ -350,6 +395,257 @@ impl Session {
         Ok(())
     }
 
+    /// Orchestrate a Run end-to-end: materialise the Workspace from the
+    /// Session's Pool, run the agent, extract the agent's commits back into
+    /// the Pool via Sandbox Fetch, and emit transcript warnings for
+    /// zero-commit or uncommitted-changes outcomes.
+    ///
+    /// Per [ADR-0010] and [ADR-0011]:
+    ///
+    /// - The host repo is **never** read at materialise time; sourcing
+    ///   happens entirely from the Pool. A [`BranchingStrategy`] that names a
+    ///   ref the Session did not mirror at open fails loudly.
+    /// - On Linux + Firecracker (a future wiring), the Workspace lives
+    ///   inside an ext4 Sandbox disk and is extracted via the hardened
+    ///   [`crate::sandbox_fetch::sandbox_fetch_from_ext4`]. On the
+    ///   host-subprocess fallback (the dev path on macOS, and the path
+    ///   tested here), the Workspace materialises into an ephemeral
+    ///   directory outside `runs/<run-id>/` and is consumed via
+    ///   [`crate::sandbox_fetch::fetch_pool_from_git_dir`].
+    /// - The host-side `runs/<id>/workspace/` directory is **not** created.
+    ///   The Pool is the source of truth for Run output; the User Script
+    ///   inspects files via `git worktree add` from a Pool ref (slice 11
+    ///   documents the helper).
+    /// - A Run that produces zero commits is a **successful** completion
+    ///   with a `run_warning` event marking the empty Run.
+    /// - A Run that ends with uncommitted Workspace files is also
+    ///   successful; the file list is emitted as a `run_warning`, and the
+    ///   uncommitted files are dropped — only committed state lands in the
+    ///   Pool.
+    /// - Concurrent Runs publishing to **different** `output_branch` refs
+    ///   both succeed. Concurrent Runs racing on the **same**
+    ///   `output_branch` produce a [`BranchPoolError::RefAlreadyExists`]
+    ///   for the loser via [`BranchPool::validate_run_output_targets`].
+    ///
+    /// [ADR-0010]: ../../../docs/adr/0010-session-and-branch-pool.md
+    /// [ADR-0011]: ../../../docs/adr/0011-hardened-git-fetch-from-sandbox.md
+    pub async fn run(&mut self, spec: RunSpec) -> Result<RunResult, SessionError> {
+        // State check: open | failed_to_close accept new Runs; everything else
+        // refuses. The state does not change as a result of the Run itself.
+        let _ = self.meta.state.accept_new_run()?;
+
+        let run_id = ulid::generate();
+        let run_dir = RunDir::create(&self.path, &run_id)?;
+
+        // Ephemeral Workspace dir. We deliberately do NOT place it under
+        // `run_dir.path/workspace/` — that would resurrect the host-side
+        // workspace tree the slice exists to remove. A temp sibling outside
+        // the Session tree keeps the Run-dir on-disk shape as defined in
+        // slice 08.
+        let workspace_path = transient_workspace_path(&self.path, &run_id);
+        if workspace_path.exists() {
+            std::fs::remove_dir_all(&workspace_path)?;
+        }
+
+        workspace_materializer::materialize(
+            self.pool.path(),
+            &spec.branching_strategy,
+            &workspace_path,
+            &run_id,
+            spec.output_branch.as_deref(),
+        )
+        .await?;
+
+        // Persist the spec next to the Run dir so reattach/audit can see it.
+        run_dir.write_spec(
+            &serde_json::to_string(&serde_json::to_value(serialize_run_spec_lite(&spec))?)?,
+        )
+        .ok();
+
+        let started_at = now_iso8601();
+        let resource_limits = ResourceLimits {
+            memory_mb: spec.memory_mb,
+            vcpus: spec.vcpus,
+            workspace_disk_mb: spec.workspace_disk_mb,
+            wall_clock_seconds: spec.wall_clock_seconds,
+        };
+        let meta = MetaJson {
+            run_id: run_id.clone(),
+            started_at: started_at.clone(),
+            ended_at: None,
+            exit_reason: None,
+            schema_version: SCHEMA_VERSION,
+            bunsen_version: BUNSEN_VERSION.to_string(),
+            parent_run_id: None,
+            resource_limits: Some(resource_limits.clone()),
+        };
+        run_dir.write_meta(&meta).ok();
+
+        let redactor = if spec.secrets.is_empty() {
+            None
+        } else {
+            Some(
+                Redactor::new(spec.secrets.clone())
+                    .map_err(|e| SessionError::BadRedactor(e.to_string()))?,
+            )
+        };
+        let mut enc = Encoder::new(&run_id, &run_dir.transcript_path(), redactor)?;
+
+        enc.emit(
+            "run_started",
+            serde_json::json!({
+                "adapter": spec.adapter,
+                "session_id": self.meta.id,
+                "transcript_path": run_dir.transcript_path().to_string_lossy().into_owned(),
+            }),
+        )?;
+
+        // Run the agent. The supervisor is the host-subprocess fallback —
+        // a future slice can branch into Firecracker here when the Session
+        // is given a kernel/rootfs config.
+        let agent_history_path = run_dir.agent_history_path();
+        let supervisor_result = crate::supervisor::run(
+            &spec,
+            &run_id,
+            &mut enc,
+            &workspace_path,
+            // We perform the narrow agent-history copy ourselves after the
+            // supervisor returns so the same logic covers both the
+            // host-subprocess and the future Firecracker path. Passing
+            // `None` here suppresses the supervisor's older recursive copy.
+            None,
+        )
+        .await;
+
+        // Inspect the Workspace and (best-effort) push to the Pool. We do
+        // this even if the supervisor returned an error so a crashed agent
+        // can still surface its partial state via the audit ref.
+        let extraction =
+            self.extract_run_output(&workspace_path, &run_id, &spec, &mut enc, &agent_history_path)
+                .await;
+
+        // Final meta with end timestamps.
+        let ended_at = now_iso8601();
+        let exit_reason = match (&supervisor_result, &extraction) {
+            (Ok(()), Ok(_)) => "agent_exit",
+            (Err(_), _) => "supervisor_error",
+            (_, Err(_)) => "extraction_error",
+        };
+        let meta = MetaJson {
+            run_id: run_id.clone(),
+            started_at,
+            ended_at: Some(ended_at),
+            exit_reason: Some(exit_reason.to_string()),
+            schema_version: SCHEMA_VERSION,
+            bunsen_version: BUNSEN_VERSION.to_string(),
+            parent_run_id: None,
+            resource_limits: Some(resource_limits),
+        };
+        run_dir.write_meta(&meta).ok();
+
+        // Tear down the transient Workspace regardless of how the Run
+        // ended. The agent's commits already live in the Pool (when
+        // extraction succeeded); the dir is no longer needed.
+        let _ = std::fs::remove_dir_all(&workspace_path);
+
+        supervisor_result.map_err(|e| SessionError::AgentExit { stderr: e.to_string() })?;
+        extraction
+    }
+
+    async fn extract_run_output(
+        &self,
+        workspace_path: &Path,
+        run_id: &str,
+        spec: &RunSpec,
+        enc: &mut Encoder,
+        agent_history_dst: &Path,
+    ) -> Result<RunResult, SessionError> {
+        // Best-effort: preserve agent-native history (claude-code's
+        // `.claude/`, aider's `.aider.*.history` files). Failures are
+        // logged but do not fail the Run.
+        if let Err(e) = copy_agent_history_narrow(&spec.adapter, workspace_path, agent_history_dst)
+        {
+            eprintln!("[session] agent-history narrow copy warning: {e}");
+        }
+
+        // BranchingStrategy::None produces a workspace with no `.git`, so
+        // there is nothing to extract. A future slice may revisit this if
+        // we want such Runs to leave any audit trace at all; today they
+        // simply do not produce a Pool ref.
+        let git_dir = workspace_path.join(".git");
+        if !git_dir.exists() {
+            enc.emit(
+                "run_warning",
+                serde_json::json!({
+                    "reason": "no_git_in_workspace",
+                    "detail": "BranchingStrategy::None — no commits possible",
+                }),
+            )?;
+            enc.emit("run_ended", serde_json::json!({ "reason": "agent_exit" }))?;
+            return Ok(RunResult {
+                run_id: run_id.into(),
+                pool_sha: None,
+                output_branch_pushed: None,
+                uncommitted_paths: Vec::new(),
+            });
+        }
+
+        let head_sha = rev_parse(workspace_path, "HEAD").await?;
+        let base_sha = resolve_base_sha_for_strategy(workspace_path, &spec.branching_strategy)
+            .await
+            .unwrap_or_else(|_| head_sha.clone());
+        let produced_commits = head_sha != base_sha;
+
+        let uncommitted_paths = list_uncommitted(workspace_path).await.unwrap_or_default();
+        if !uncommitted_paths.is_empty() {
+            enc.emit(
+                "run_warning",
+                serde_json::json!({
+                    "reason": "uncommitted_changes",
+                    "count": uncommitted_paths.len(),
+                    "paths": uncommitted_paths,
+                    "detail": "uncommitted files are dropped — Pool ref reflects commits only",
+                }),
+            )?;
+        }
+
+        if !produced_commits {
+            enc.emit(
+                "run_warning",
+                serde_json::json!({
+                    "reason": "no_commits",
+                    "detail": "agent produced no commits; no Pool ref written",
+                }),
+            )?;
+            enc.emit("run_ended", serde_json::json!({ "reason": "agent_exit" }))?;
+            return Ok(RunResult {
+                run_id: run_id.into(),
+                pool_sha: None,
+                output_branch_pushed: None,
+                uncommitted_paths,
+            });
+        }
+
+        let uid = current_uid();
+        fetch_pool_from_git_dir(
+            &self.pool,
+            &git_dir,
+            run_id,
+            spec.output_branch.as_deref(),
+            uid,
+        )
+        .await?;
+
+        enc.emit("run_ended", serde_json::json!({ "reason": "agent_exit" }))?;
+
+        Ok(RunResult {
+            run_id: run_id.into(),
+            pool_sha: Some(head_sha),
+            output_branch_pushed: spec.output_branch.clone(),
+            uncommitted_paths,
+        })
+    }
+
     /// Push the supplied manifest from the Pool to the Session's host repo.
     ///
     /// This is the **only** path by which Pool refs reach the host repo.
@@ -474,6 +770,112 @@ fn read_meta(session_path: &Path) -> Result<SessionMeta, SessionError> {
     let s = std::fs::read_to_string(&p)?;
     let meta: SessionMeta = serde_json::from_str(&s)?;
     Ok(meta)
+}
+
+/// Path the Run's transient Workspace materialises into. Deliberately a
+/// sibling of the Session tree, NOT a child of `runs/<run-id>/`, so the
+/// "no host-side workspace under runs/" invariant from slice 09 is
+/// observable: after the Run, this dir is removed unconditionally.
+fn transient_workspace_path(session_path: &Path, run_id: &str) -> PathBuf {
+    let parent = session_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    parent.join(".workspace").join(format!(
+        "{}-{}",
+        session_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        run_id,
+    ))
+}
+
+/// Snapshot of the user-relevant fields of a [`RunSpec`] for `spec.json`.
+/// The spec carries non-serializable bits (a `HashMap<String, String>` of
+/// secrets) and we redact those out of the on-disk record so a stray reader
+/// of `runs/<id>/spec.json` cannot recover them.
+fn serialize_run_spec_lite(spec: &RunSpec) -> serde_json::Value {
+    serde_json::json!({
+        "adapter": spec.adapter,
+        "cmd": spec.cmd,
+        "env_keys": spec.env.keys().collect::<Vec<_>>(),
+        "branching_strategy": match &spec.branching_strategy {
+            BranchingStrategy::None => serde_json::json!({"kind": "none"}),
+            BranchingStrategy::PoolClone { base, import } => serde_json::json!({
+                "kind": "pool-clone",
+                "base": base,
+                "import": import,
+            }),
+        },
+        "output_branch": spec.output_branch,
+        "wall_clock_seconds": spec.wall_clock_seconds,
+    })
+}
+
+async fn rev_parse(workspace: &Path, ref_name: &str) -> Result<String, SessionError> {
+    let out = tokio::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["rev-parse", ref_name])
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(SessionError::Git {
+            context: format!("rev-parse {ref_name} in {}", workspace.display()),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+async fn resolve_base_sha_for_strategy(
+    workspace: &Path,
+    strategy: &BranchingStrategy,
+) -> Result<String, SessionError> {
+    let base_ref = match strategy {
+        BranchingStrategy::PoolClone { base, .. } => base.clone(),
+        BranchingStrategy::None => return rev_parse(workspace, "HEAD").await,
+    };
+    // The materialiser fetched the base into the workspace as a local branch
+    // with the same name. If lookup fails (e.g. someone renamed it), fall
+    // back to HEAD — produced_commits then trivially evaluates to false and
+    // the no-commits warning fires.
+    rev_parse(workspace, &format!("refs/heads/{base_ref}")).await
+}
+
+async fn list_uncommitted(workspace: &Path) -> Result<Vec<String>, SessionError> {
+    let out = tokio::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["status", "--porcelain"])
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(SessionError::Git {
+            context: format!("status --porcelain in {}", workspace.display()),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        });
+    }
+    let mut paths = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        // Porcelain v1 format: "XY <path>" — strip the two status chars
+        // plus the space. `?? ` (untracked) is the most common shape; renames
+        // are rare here since the workspace is fresh.
+        if line.len() > 3 {
+            paths.push(line[3..].to_string());
+        }
+    }
+    Ok(paths)
+}
+
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        nix::unistd::getuid().as_raw()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 async fn default_branch(host_repo: &Path) -> Result<String, SessionError> {
@@ -1515,6 +1917,378 @@ mod tests {
         // attach still works (it's a live Session).
         let re = Session::attach_in(&root, &id).unwrap();
         assert_eq!(re.state(), SessionState::Open);
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Session::run (slice 09) ─────────────────────────────────────────────
+    //
+    // Cover the AC for slice 09 by exercising the host-subprocess fallback
+    // path (the Firecracker integration is identical post-extraction and
+    // cannot run on macOS CI). Each test builds a real host repo, opens a
+    // Session, runs a small shell agent that produces a commit (or
+    // doesn't), and inspects both the transcript and the Pool.
+
+    fn run_spec_with_cmd(cmd: &str, base_ref: &str, output_branch: Option<&str>) -> RunSpec {
+        let body = match output_branch {
+            Some(b) => serde_json::json!({
+                "adapter": "black-box",
+                "cmd": ["sh", "-c", cmd],
+                "branching-strategy": {"kind": "pool-clone", "base": base_ref},
+                "output-branch": b,
+            }),
+            None => serde_json::json!({
+                "adapter": "black-box",
+                "cmd": ["sh", "-c", cmd],
+                "branching-strategy": {"kind": "pool-clone", "base": base_ref},
+            }),
+        };
+        RunSpec::from_json(&serde_json::to_string(&body).unwrap()).unwrap()
+    }
+
+    fn pool_ref_sha(pool_dir: &Path, full_ref: &str) -> String {
+        let out = StdCommand::new("git")
+            .current_dir(pool_dir)
+            .args(["rev-parse", full_ref])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "rev-parse {full_ref} failed: {}",
+                String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn pool_has_ref(pool_dir: &Path, full_ref: &str) -> bool {
+        StdCommand::new("git")
+            .current_dir(pool_dir)
+            .args(["rev-parse", "--verify", "--quiet", full_ref])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn transcript_contains(run_dir: &Path, marker: &str) -> bool {
+        let t = run_dir.join("transcript.ndjson");
+        std::fs::read_to_string(&t)
+            .map(|s| s.contains(marker))
+            .unwrap_or(false)
+    }
+
+    const AGENT_COMMIT_CMD: &str = "\
+        git config user.email agent@test && \
+        git config user.name Agent && \
+        echo hello > agent.txt && \
+        git add agent.txt && \
+        git commit -m 'agent work' --quiet";
+
+    const AGENT_NOOP_CMD: &str = "true";
+
+    const AGENT_DIRTY_CMD: &str = "\
+        git config user.email agent@test && \
+        git config user.name Agent && \
+        echo committed > committed.txt && \
+        git add committed.txt && \
+        git commit -m 'one commit' --quiet && \
+        echo dirty > leftover.txt";
+
+    #[tokio::test]
+    async fn run_writes_audit_ref_and_output_branch_at_same_sha() {
+        let host = make_host_repo("sr-ok");
+        let root = make_temp_dir("sr-ok-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let pool_dir = s.path().join("pool");
+
+        let spec = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", Some("feature/done"));
+        let res = s.run(spec).await.unwrap();
+
+        assert!(res.pool_sha.is_some(), "expected a Pool SHA after a real commit");
+        assert_eq!(res.output_branch_pushed.as_deref(), Some("feature/done"));
+        assert!(res.uncommitted_paths.is_empty());
+
+        let audit = format!("refs/heads/runs/{}", res.run_id);
+        let user = "refs/heads/feature/done";
+        assert!(pool_has_ref(&pool_dir, &audit), "audit ref missing");
+        assert!(pool_has_ref(&pool_dir, user), "output_branch missing");
+        assert_eq!(
+            pool_ref_sha(&pool_dir, &audit),
+            pool_ref_sha(&pool_dir, user),
+            "audit ref and output_branch must point at the same SHA"
+        );
+        assert_eq!(pool_ref_sha(&pool_dir, &audit), res.pool_sha.unwrap());
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn run_with_no_commits_succeeds_and_emits_warning() {
+        let host = make_host_repo("sr-empty");
+        let root = make_temp_dir("sr-empty-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let session_dir = s.path().to_path_buf();
+        let pool_dir = session_dir.join("pool");
+
+        let spec = run_spec_with_cmd(AGENT_NOOP_CMD, "host/main", Some("feature/x"));
+        let res = s.run(spec).await.unwrap();
+
+        assert!(res.pool_sha.is_none(), "zero-commit Runs must not write a Pool ref");
+
+        // Pool has no audit ref and no output_branch.
+        let audit = format!("refs/heads/runs/{}", res.run_id);
+        assert!(!pool_has_ref(&pool_dir, &audit));
+        assert!(!pool_has_ref(&pool_dir, "refs/heads/feature/x"));
+
+        // Transcript carries the warning marker.
+        let run_dir = session_dir.join("runs").join(&res.run_id);
+        assert!(
+            transcript_contains(&run_dir, "no_commits"),
+            "transcript must carry the no_commits warning"
+        );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn run_with_uncommitted_changes_emits_warning_with_file_list() {
+        let host = make_host_repo("sr-dirty");
+        let root = make_temp_dir("sr-dirty-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let session_dir = s.path().to_path_buf();
+        let pool_dir = session_dir.join("pool");
+
+        let spec = run_spec_with_cmd(AGENT_DIRTY_CMD, "host/main", Some("feature/y"));
+        let res = s.run(spec).await.unwrap();
+
+        // Successful Run with a Pool SHA from the one committed file.
+        assert!(res.pool_sha.is_some());
+        assert!(
+            res.uncommitted_paths.iter().any(|p| p.contains("leftover.txt")),
+            "leftover.txt must appear in uncommitted_paths: {:?}",
+            res.uncommitted_paths,
+        );
+
+        let audit = format!("refs/heads/runs/{}", res.run_id);
+        assert!(pool_has_ref(&pool_dir, &audit));
+
+        let run_dir = session_dir.join("runs").join(&res.run_id);
+        assert!(
+            transcript_contains(&run_dir, "uncommitted_changes"),
+            "transcript must carry uncommitted_changes warning"
+        );
+        assert!(
+            transcript_contains(&run_dir, "leftover.txt"),
+            "transcript must list the uncommitted file by name"
+        );
+
+        // Inspect the Pool ref's tree — leftover.txt must NOT be there.
+        let ls = StdCommand::new("git")
+            .current_dir(&pool_dir)
+            .args(["ls-tree", "-r", "--name-only", &audit])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&ls.stdout);
+        assert!(listing.contains("committed.txt"));
+        assert!(
+            !listing.contains("leftover.txt"),
+            "uncommitted leftover must not be in the Pool ref: {listing}",
+        );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn run_does_not_create_workspace_subdir_under_run_dir() {
+        let host = make_host_repo("sr-no-ws");
+        let root = make_temp_dir("sr-no-ws-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let session_dir = s.path().to_path_buf();
+
+        let spec = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", None);
+        let res = s.run(spec).await.unwrap();
+
+        let run_dir = session_dir.join("runs").join(&res.run_id);
+        assert!(run_dir.exists(), "run dir must exist");
+        assert!(
+            !run_dir.join("workspace").exists(),
+            "host-side workspace/ under runs/<id>/ must not be created (slice 09)"
+        );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn run_cleans_up_transient_workspace_after_extraction() {
+        let host = make_host_repo("sr-transient");
+        let root = make_temp_dir("sr-transient-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let session_dir = s.path().to_path_buf();
+
+        let spec = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", None);
+        let res = s.run(spec).await.unwrap();
+
+        // The transient workspace dir under the sessions root is wiped on
+        // run completion. We don't expose the exact path; instead we
+        // assert the sibling `.workspace/` directory holds nothing for
+        // this Run.
+        let transient_parent = root.join(".workspace");
+        if transient_parent.exists() {
+            let remaining: Vec<_> = std::fs::read_dir(&transient_parent)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(&res.run_id))
+                .collect();
+            assert!(
+                remaining.is_empty(),
+                "transient workspace for run {} must be removed",
+                res.run_id
+            );
+        }
+
+        // And just to be sure the Run actually wrote a Pool ref so we know
+        // the test isn't trivially passing on an early-exit path.
+        assert!(res.pool_sha.is_some());
+
+        std::fs::remove_dir_all(session_dir.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&host).ok();
+    }
+
+    #[tokio::test]
+    async fn two_runs_to_different_output_branches_both_succeed() {
+        let host = make_host_repo("sr-par-diff");
+        let root = make_temp_dir("sr-par-diff-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let pool_dir = s.path().join("pool");
+
+        let spec_a = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", Some("feature/a"));
+        let res_a = s.run(spec_a).await.unwrap();
+        let spec_b = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", Some("feature/b"));
+        let res_b = s.run(spec_b).await.unwrap();
+
+        assert!(res_a.pool_sha.is_some() && res_b.pool_sha.is_some());
+        assert!(pool_has_ref(&pool_dir, "refs/heads/feature/a"));
+        assert!(pool_has_ref(&pool_dir, "refs/heads/feature/b"));
+        assert!(pool_has_ref(&pool_dir, &format!("refs/heads/runs/{}", res_a.run_id)));
+        assert!(pool_has_ref(&pool_dir, &format!("refs/heads/runs/{}", res_b.run_id)));
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn two_runs_to_same_output_branch_second_fails_loudly() {
+        let host = make_host_repo("sr-par-same");
+        let root = make_temp_dir("sr-par-same-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let pool_dir = s.path().join("pool");
+
+        let spec_a = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", Some("feature/contested"));
+        let res_a = s.run(spec_a).await.unwrap();
+        assert!(res_a.pool_sha.is_some());
+
+        let spec_b = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", Some("feature/contested"));
+        let err = s.run(spec_b).await.unwrap_err();
+        match err {
+            SessionError::SandboxFetch(SandboxFetchError::Pool(
+                BranchPoolError::RefAlreadyExists { name },
+            )) => {
+                assert_eq!(name, "feature/contested");
+            }
+            other => panic!("expected RefAlreadyExists for loser, got {other:?}"),
+        }
+
+        // Winner's ref survives untouched.
+        let winner_sha = res_a.pool_sha.unwrap();
+        assert_eq!(
+            pool_ref_sha(&pool_dir, "refs/heads/feature/contested"),
+            winner_sha,
+        );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn run_refuses_when_session_is_closed() {
+        // Hand-build a Closed Session on disk and assert Session::run rejects
+        // any new Run from that state (the state machine's accept_new_run).
+        let host = make_host_repo("sr-closed");
+        let root = make_temp_dir("sr-closed-root");
+        let id = "01CLOSEDSRUN0000000000000A".to_string();
+        let dir = root.join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        BranchPool::init(dir.join("pool")).await.unwrap();
+        let meta = SessionMeta {
+            id: id.clone(),
+            state: SessionState::Closed,
+            host_repo: host.clone(),
+            mirror_refs: vec!["main".into()],
+            labels: vec![],
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            discarded_at: None,
+            last_close_failure: None,
+        };
+        write_meta_atomic(&dir, &meta).unwrap();
+
+        let mut s = Session::attach_in(&root, &id).unwrap();
+        let spec = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", None);
+        let err = s.run(spec).await.unwrap_err();
+        assert!(
+            matches!(err, SessionError::Transition(_)),
+            "Closed → Run must be a Transition error, got {err:?}",
+        );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn run_preserves_agent_history_to_run_dir() {
+        // The narrow agent-history copy: the agent's `.claude/` dir under
+        // the Workspace is preserved into the Run dir's agent-history/.
+        let host = make_host_repo("sr-history");
+        let root = make_temp_dir("sr-history-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let session_dir = s.path().to_path_buf();
+
+        let cmd = "\
+            git config user.email a@b && \
+            git config user.name A && \
+            mkdir -p .claude && \
+            echo memo > .claude/notes.json && \
+            echo committed > x.txt && \
+            git add x.txt && \
+            git commit -m c --quiet";
+
+        let spec = run_spec_with_cmd(cmd, "host/main", None);
+        let res = s.run(spec).await.unwrap();
+
+        let history = session_dir
+            .join("runs")
+            .join(&res.run_id)
+            .join("agent-history")
+            .join(".claude")
+            .join("notes.json");
+        assert!(history.exists(), "agent .claude/notes.json must be preserved");
+        assert_eq!(std::fs::read_to_string(&history).unwrap().trim(), "memo");
+
         std::fs::remove_dir_all(&host).ok();
         std::fs::remove_dir_all(&root).ok();
     }

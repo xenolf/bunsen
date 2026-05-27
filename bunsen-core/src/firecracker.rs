@@ -583,11 +583,39 @@ pub async fn create_workspace_ext4_from_dir(path: &Path, source_dir: &Path, size
     Ok(())
 }
 
-/// Extract the contents of an ext4 workspace image back to `target_dir` after
-/// the VM exits, so agent writes are visible on the host.
-/// Requires root (uses losetup + mount).
-pub async fn extract_workspace_from_ext4(ext4_path: &Path, target_dir: &Path) -> Result<()> {
-    // Get the loop device for the ext4 image.
+/// Extract a Run's output from its Sandbox ext4 into the Pool.
+///
+/// Replaces the old `cp -a` of the whole workspace tree (see ADR-0011): the
+/// ext4 is mounted read-only with `ro,nosuid,nodev,noexec`, the agent's
+/// `.git/` is consumed through the hardened
+/// [`crate::sandbox_fetch::fetch_pool_from_git_dir`], the narrow
+/// agent-history copy preserves `.claude/` (or per-adapter equivalents)
+/// onto the host, and the mount is torn down — unconditionally, even if
+/// fetch or copy fails.
+///
+/// Both the fetch and the agent-history copy receive the mounted root, so a
+/// single mount lifecycle covers both. The `agent_history_dst`, when
+/// supplied, is the host-side `runs/<run-id>/agent-history/` location
+/// (slice 08).
+///
+/// The `user_script_uid` argument flows through to
+/// [`crate::sandbox_fetch::fetch_pool_from_git_dir`]; on a root bunsen the
+/// `git fetch` drops to that uid, otherwise it is a no-op.
+#[allow(clippy::too_many_arguments)]
+pub async fn extract_workspace_from_ext4(
+    ext4_path: &Path,
+    pool: &crate::branch_pool::BranchPool,
+    run_id: &str,
+    output_branch: Option<&str>,
+    user_script_uid: u32,
+    adapter: &str,
+    agent_history_dst: Option<&Path>,
+) -> Result<()> {
+    use crate::sandbox_fetch::{
+        build_mount_argv, copy_agent_history_narrow, fetch_pool_from_git_dir,
+    };
+
+    // losetup attach.
     let losetup = Command::new("losetup")
         .args(["-f", "--show", &ext4_path.to_string_lossy()])
         .output()
@@ -598,38 +626,56 @@ pub async fn extract_workspace_from_ext4(ext4_path: &Path, target_dir: &Path) ->
     }
     let loop_dev = String::from_utf8_lossy(&losetup.stdout).trim().to_string();
 
-    // Mount the loop device to a temp dir.
-    let mnt = std::env::temp_dir().join(format!("bunsen-mnt-{}", std::process::id()));
+    // Mount the loop device to a temp dir with the hardening quad.
+    let mnt = std::env::temp_dir().join(format!(
+        "bunsen-mnt-{}-{}",
+        std::process::id(),
+        run_id,
+    ));
     std::fs::create_dir_all(&mnt)?;
 
+    let mount_argv = build_mount_argv(&loop_dev, &mnt);
+    let argv_refs: Vec<&str> = mount_argv.iter().map(String::as_str).collect();
     let mount_status = Command::new("mount")
-        .args(["-o", "ro", &loop_dev, &mnt.to_string_lossy()])
+        .args(&argv_refs)
         .status()
         .await
-        .context("mount ext4")?;
+        .context("mount ext4 ro,nosuid,nodev,noexec")?;
     if !mount_status.success() {
         // Clean up loop device before returning error.
         Command::new("losetup").args(["-d", &loop_dev]).status().await.ok();
+        std::fs::remove_dir_all(&mnt).ok();
         bail!("mount failed for {loop_dev}");
     }
 
-    // Copy contents back to target_dir.
-    let src = format!("{}/.", mnt.display());
-    let copy_status = Command::new("cp")
-        .args(["-a", &src, &target_dir.to_string_lossy()])
+    // Try fetch + narrow copy. Both happen against the same mount, so a
+    // single inner block lets us bail out cleanly while still running the
+    // tear-down below.
+    let inner = async {
+        let source_git_dir = mnt.join(".git");
+        fetch_pool_from_git_dir(pool, &source_git_dir, run_id, output_branch, user_script_uid)
+            .await
+            .map_err(|e| anyhow!("sandbox fetch into pool failed: {e}"))?;
+
+        if let Some(hist_dst) = agent_history_dst {
+            copy_agent_history_narrow(adapter, &mnt, hist_dst)
+                .map_err(|e| anyhow!("agent-history narrow copy failed: {e}"))?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let result = inner.await;
+
+    // Always unmount + detach, regardless of inner result.
+    Command::new("umount")
+        .arg(&mnt.to_string_lossy().to_string())
         .status()
         .await
-        .context("cp workspace back")?;
-
-    // Always unmount and detach, even on copy failure.
-    Command::new("umount").args([&mnt.to_string_lossy().to_string()]).status().await.ok();
+        .ok();
     Command::new("losetup").args(["-d", &loop_dev]).status().await.ok();
     std::fs::remove_dir_all(&mnt).ok();
 
-    if !copy_status.success() {
-        bail!("cp workspace back failed");
-    }
-    Ok(())
+    result
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
