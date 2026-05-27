@@ -1,0 +1,235 @@
+name: Images
+
+# Builds the canonical bunsen-base rootfs (adapters/base/Dockerfile) as a
+# multi-arch OCI image, publishes it to GHCR, and opens an automated PR
+# updating DEFAULT_ROOTFS_IMAGE in bunsen-core/src/oci_cache.rs with the
+# new manifest digest.
+#
+# Decoupled from the wheel release lifecycle: triggers on the base-image
+# Dockerfile changing on main, plus manual dispatch. See ADR-0012.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'adapters/base/Dockerfile'
+  workflow_dispatch:
+
+permissions:
+  contents: write       # auto-PR creates the digest-update branch
+  packages: write       # push to GHCR
+  pull-requests: write  # open the auto-PR
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: xenolf/bunsen/bunsen-base
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU is needed for `docker buildx build --platform linux/arm64` on
+      # an x86_64 runner. Mirrors the pattern in release.yml.
+      - name: Set up QEMU
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # bunsen-init's deps are pure Rust (libc bindings, serde, base64) so
+      # no C compiler is needed at build time — only a linker that
+      # understands the target's ELF format. musl-tools provides musl-gcc
+      # for x86_64; gcc-aarch64-linux-gnu provides the aarch64 cross-linker
+      # (used here only to link Rust's bundled musl libc into a static
+      # binary, not to compile C code).
+      - name: Install cross-compilation linkers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools gcc-aarch64-linux-gnu
+
+      - name: Cross-compile bunsen-init
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }} -p bunsen-init
+
+      # Docker COPY can only reach files inside the build context, so stage
+      # the Dockerfile and the freshly compiled binary into a temp dir.
+      # Mirrors adapters/_smoke-test/build-rootfs.sh.
+      - name: Stage build context
+        run: |
+          mkdir -p build-context
+          cp adapters/base/Dockerfile build-context/Dockerfile
+          cp "target/${{ matrix.target }}/release/bunsen-init" build-context/bunsen-init
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push by digest without a tag — the publish job below stitches the
+      # per-platform digests into the multi-arch manifest list. This is the
+      # canonical buildx multi-arch matrix pattern.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: build-context
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish multi-arch manifest
+    needs: [build]
+    runs-on: ubuntu-latest
+    outputs:
+      manifest_digest: ${{ steps.inspect.outputs.digest }}
+      short_sha: ${{ steps.sha.outputs.short }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Create multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          refs=""
+          for f in *; do
+            refs+=" ${REGISTRY}/${IMAGE_NAME}@sha256:${f}"
+          done
+          # shellcheck disable=SC2086
+          docker buildx imagetools create \
+            -t "${REGISTRY}/${IMAGE_NAME}:latest" \
+            -t "${REGISTRY}/${IMAGE_NAME}:${SHORT_SHA}" \
+            ${refs}
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          SHORT_SHA: ${{ steps.sha.outputs.short }}
+
+      - name: Inspect manifest digest
+        id: inspect
+        run: |
+          set -euo pipefail
+          digest=$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:latest" --format '{{json .Manifest}}' | jq -r '.digest')
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "::error::failed to extract manifest digest"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Manifest digest: ${digest}"
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+
+  auto-pr:
+    name: Update DEFAULT_ROOTFS_IMAGE
+    needs: [publish]
+    runs-on: ubuntu-latest
+    steps:
+      # Always target main: workflow_dispatch may run from a branch but the
+      # digest update belongs on main (the source of truth that gets shipped
+      # in the wheel).
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Rewrite DEFAULT_ROOTFS_IMAGE
+        env:
+          DIGEST: ${{ needs.publish.outputs.manifest_digest }}
+        run: |
+          set -euo pipefail
+          file=bunsen-core/src/oci_cache.rs
+          sed -i -E \
+            's|"ghcr\.io/xenolf/bunsen/bunsen-base@sha256:[0-9a-f]{64}"|"ghcr.io/xenolf/bunsen/bunsen-base@'"${DIGEST}"'"|' \
+            "${file}"
+          if git diff --quiet -- "${file}"; then
+            echo "::notice::DEFAULT_ROOTFS_IMAGE already at ${DIGEST}; no PR needed"
+            echo "changed=false" >> "$GITHUB_ENV"
+          else
+            echo "changed=true" >> "$GITHUB_ENV"
+            git --no-pager diff -- "${file}"
+          fi
+
+      - name: Open auto-PR
+        if: env.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: ci/update-default-rootfs-digest
+          delete-branch: true
+          commit-message: |
+            Update DEFAULT_ROOTFS_IMAGE to ${{ needs.publish.outputs.manifest_digest }}
+
+            Auto-generated by .github/workflows/images.yml after publishing
+            ghcr.io/xenolf/bunsen/bunsen-base:${{ needs.publish.outputs.short_sha }}
+            from ${{ github.sha }}.
+          title: "Update DEFAULT_ROOTFS_IMAGE digest"
+          body: |
+            Auto-generated by `.github/workflows/images.yml` after a successful
+            multi-arch publish of `ghcr.io/xenolf/bunsen/bunsen-base`.
+
+            - **New manifest digest:** `${{ needs.publish.outputs.manifest_digest }}`
+            - **Tags pushed:** `latest`, `${{ needs.publish.outputs.short_sha }}`
+            - **Source commit:** ${{ github.sha }}
+
+            See ADR-0012 for why this constant is digest-pinned and updated via
+            an automated PR rather than at runtime.
