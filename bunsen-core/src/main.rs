@@ -18,6 +18,7 @@ mod sandbox_fetch;
 mod sandbox_net;
 mod sandbox_nft;
 mod session;
+mod session_cli;
 mod supervisor;
 mod ulid;
 mod workspace_materializer;
@@ -56,6 +57,13 @@ async fn main() {
         }
     }
 
+    // Slice 11: `session` subcommand surface — User-Script-facing verbs that
+    // wrap the Rust [`Session`] API. Each subcommand prints JSON on stdout
+    // for parseability from the Python wrappers.
+    if args.get(1).map(|s| s.as_str()) == Some("session") {
+        std::process::exit(session_cli::run(&args[2..]).await);
+    }
+
     let cli = parse_cli_args(&args);
 
     let spec_json = cli.spec.unwrap_or_else(|| {
@@ -67,6 +75,39 @@ async fn main() {
         eprintln!("invalid spec: {e}");
         std::process::exit(1);
     });
+
+    // Slice 11: `bunsen-core --session <id> --spec <json>` ties a Run to an
+    // existing Session and drives it through [`Session::run`], which owns
+    // workspace materialisation, supervisor dispatch, and Sandbox Fetch back
+    // into the Pool. The pre-Session legacy CLI path remains live for
+    // callers without a Session (and for transitional Firecracker testing).
+    if let Some(sid) = cli.session_id.clone() {
+        let mut sess = match session::Session::attach(&sid) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("session attach {sid:?} failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        match sess.run(spec).await {
+            Ok(res) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "run_id": res.run_id,
+                        "pool_sha": res.pool_sha,
+                        "output_branch_pushed": res.output_branch_pushed,
+                        "uncommitted_paths": res.uncommitted_paths,
+                    })
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("session run failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // ── Slice 02 (v1.1): lazy kernel resolve ──────────────────────────────
     // On Linux, when sandbox mode is intended but the user didn't pass an
@@ -563,6 +604,11 @@ struct CliArgs {
     rootfs: Option<std::path::PathBuf>,
     firecracker: Option<std::path::PathBuf>,
     manage_firewall: bool,
+    /// Slice 11: tie the Run to a Session by ULID. When set, Session::run
+    /// drives the Run end-to-end (materialise from Pool → run agent →
+    /// extract back into Pool). Without it, the legacy CLI path keeps the
+    /// pre-Session behaviour for backwards compatibility.
+    session_id: Option<String>,
 }
 
 /// Transitional sessions-root subdir for CLI invocations. Used until
@@ -593,6 +639,7 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
     let mut rootfs = None;
     let mut firecracker = None;
     let mut manage_firewall = false;
+    let mut session_id: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -600,17 +647,19 @@ fn parse_cli_args(args: &[String]) -> CliArgs {
             "--kernel" if i + 1 < args.len() => { kernel = Some(std::path::PathBuf::from(&args[i+1])); i += 2; }
             "--rootfs" if i + 1 < args.len() => { rootfs = Some(std::path::PathBuf::from(&args[i+1])); i += 2; }
             "--firecracker" if i + 1 < args.len() => { firecracker = Some(std::path::PathBuf::from(&args[i+1])); i += 2; }
+            "--session" if i + 1 < args.len() => { session_id = Some(args[i+1].clone()); i += 2; }
             "--manage-firewall" => { manage_firewall = true; i += 1; }
             other => {
                 if let Some(v) = other.strip_prefix("--spec=") { spec = Some(v.to_string()); }
                 else if let Some(v) = other.strip_prefix("--kernel=") { kernel = Some(std::path::PathBuf::from(v)); }
                 else if let Some(v) = other.strip_prefix("--rootfs=") { rootfs = Some(std::path::PathBuf::from(v)); }
                 else if let Some(v) = other.strip_prefix("--firecracker=") { firecracker = Some(std::path::PathBuf::from(v)); }
+                else if let Some(v) = other.strip_prefix("--session=") { session_id = Some(v.to_string()); }
                 i += 1;
             }
         }
     }
-    CliArgs { spec, kernel, rootfs, firecracker, manage_firewall }
+    CliArgs { spec, kernel, rootfs, firecracker, manage_firewall, session_id }
 }
 
 
@@ -662,5 +711,26 @@ mod tests {
         let args = strs(&["bunsen-core", "--kernel", "/k", "--rootfs", "/r", "--spec", "{}"]);
         let cli = parse_cli_args(&args);
         assert!(!cli.manage_firewall);
+    }
+
+    #[test]
+    fn parse_cli_session_flag_space_form() {
+        let args = strs(&["bunsen-core", "--session", "01HSESSION0000000000000000", "--spec", "{}"]);
+        let cli = parse_cli_args(&args);
+        assert_eq!(cli.session_id.as_deref(), Some("01HSESSION0000000000000000"));
+    }
+
+    #[test]
+    fn parse_cli_session_flag_equals_form() {
+        let args = strs(&["bunsen-core", "--session=01HSESSION0000000000000000", "--spec", "{}"]);
+        let cli = parse_cli_args(&args);
+        assert_eq!(cli.session_id.as_deref(), Some("01HSESSION0000000000000000"));
+    }
+
+    #[test]
+    fn parse_cli_session_default_none() {
+        let args = strs(&["bunsen-core", "--spec", "{}"]);
+        let cli = parse_cli_args(&args);
+        assert!(cli.session_id.is_none());
     }
 }

@@ -7,11 +7,27 @@ from ._events import (
     RunStarted, RunEnded, Output, EgressDenied, UnknownEvent,
     SchemaVersionError, SCHEMA_VERSION,
 )
+from ._session import (
+    BranchingStrategy,
+    NoneStrategy,
+    PoolClone,
+    ManifestPair,
+    Run,
+    Session,
+    SessionError,
+    open_session,
+    attach_session,
+    list_sessions,
+)
 
 __all__ = [
     "run", "run_sync",
     "RunStarted", "RunEnded", "Output", "EgressDenied", "UnknownEvent",
     "SchemaVersionError", "SCHEMA_VERSION",
+    # Slice 11: Session/Pool/Run surface
+    "BranchingStrategy", "NoneStrategy", "PoolClone",
+    "ManifestPair", "Run", "Session", "SessionError",
+    "open_session", "attach_session", "list_sessions",
 ]
 
 

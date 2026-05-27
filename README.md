@@ -102,9 +102,27 @@ BUNSEN_ROOTFS=$(pwd)/target/smoke-rootfs.ext4 \
 pytest -v python/tests/test_egress_acceptance.py
 ```
 
+## Inspecting a Pool ref
+
+After a Session runs an agent, the agent's commits live in the Session's
+Pool — a bare git repo at `~/.local/share/bunsen/sessions/<id>/pool/`.
+There is no host-side workspace tree under `runs/<run-id>/` to browse
+(see ADR-0010). To inspect files at a Pool ref (an audit ref like
+`runs/<run-id>`, or the user-named `output_branch`):
+
+```bash
+SESSION_DIR=~/.local/share/bunsen/sessions/<session-id>
+git -C "$SESSION_DIR/pool" worktree add /tmp/inspect-<run-id> runs/<run-id>
+# ...inspect files under /tmp/inspect-<run-id>...
+git -C "$SESSION_DIR/pool" worktree remove /tmp/inspect-<run-id>
+```
+
+A `bunsen inspect <run-id>` ergonomic wrapper is intentionally not built
+— see the PRD's "Out of Scope" section.
+
 ## Documentation
 
 - `CONTEXT.md` — domain glossary
-- `docs/adr/` — architectural decisions (ADR-0001…0008)
+- `docs/adr/` — architectural decisions (ADR-0001…0011)
 - `docs/adapter-contract.md` — how to implement a new Adapter
 - `docs/macos.md` — macOS / remote Linux setup

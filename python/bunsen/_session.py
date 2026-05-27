@@ -1,0 +1,385 @@
+"""Session, BranchingStrategy, ManifestPair, and top-level functions.
+
+Slice 11: Python surface for the Session/Pool/Run model from ADR-0010.
+The Python wrappers shell out to `bunsen-core session ...` and parse the
+JSON output. Each verb's success exits 0 with a single JSON document on
+stdout; errors land on stderr and produce a non-zero exit code.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+from dataclasses import dataclass, field
+from typing import Optional, Sequence, Union
+
+from ._core_path import find_core_bin
+
+
+# ── BranchingStrategy variants ────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class NoneStrategy:
+    """No materialisation — empty Workspace, no `.git`.
+
+    Serializes to `{"kind": "none"}`. See [ADR-0010] for the typed
+    BranchingStrategy contract.
+    """
+
+
+@dataclass(frozen=True)
+class PoolClone:
+    """Clone `base` from the Session's Pool and additionally fetch each
+    name in `import_refs` as a local ref under the same name.
+
+    The materialiser refuses to start if any referenced ref is not in
+    the Pool — there is no fallback to the host repo at materialise time.
+    """
+    base: str
+    import_refs: Sequence[str] = field(default_factory=tuple)
+
+
+BranchingStrategy = Union[NoneStrategy, PoolClone]
+
+
+def _strategy_to_json(s: BranchingStrategy) -> dict:
+    if isinstance(s, NoneStrategy):
+        return {"kind": "none"}
+    if isinstance(s, PoolClone):
+        return {"kind": "pool-clone", "base": s.base, "import": list(s.import_refs)}
+    raise TypeError(f"unknown BranchingStrategy variant: {type(s).__name__}")
+
+
+# ── RunSpec helper ────────────────────────────────────────────────────────
+
+
+def _spec_to_json(
+    spec: dict,
+) -> str:
+    """Lightweight passthrough — the dict is already in the shape
+    bunsen-core's `RunSpec::from_json` accepts. We only translate the
+    `branching_strategy` field when it's been supplied as a typed
+    Python variant, since dicts are accepted as-is.
+    """
+    out = dict(spec)
+    bs = out.get("branching_strategy") or out.get("branching-strategy")
+    if isinstance(bs, (NoneStrategy, PoolClone)):
+        # Normalise to the kebab-case form the Rust deserialiser expects.
+        out.pop("branching_strategy", None)
+        out["branching-strategy"] = _strategy_to_json(bs)
+    return json.dumps(out)
+
+
+# ── ManifestPair ──────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ManifestPair:
+    """One line of a close-time manifest.
+
+    `force=True` opts this pair into a non-fast-forward push. Default
+    `False` keeps the FF safety net (the Pool layer aborts the whole
+    close on the first non-FF pair).
+    """
+    pool_ref: str
+    host_ref: str
+    force: bool = False
+
+    def to_flag(self) -> str:
+        suffix = ":force" if self.force else ""
+        return f"{self.pool_ref}:{self.host_ref}{suffix}"
+
+
+# ── Session error ─────────────────────────────────────────────────────────
+
+
+class SessionError(RuntimeError):
+    """Raised when `bunsen-core session ...` exits non-zero. `stderr` is
+    the captured error text and `returncode` is the process exit code.
+    """
+
+    def __init__(self, message: str, *, stderr: str = "", returncode: int = 1):
+        super().__init__(message)
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+# ── Run result ────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Run:
+    """Outcome of a `Session.run(spec)` call.
+
+    `pool_sha` is `None` when the agent produced zero commits (a successful
+    but warning-annotated Run). `output_branch_pushed` echoes back the
+    spec's `output-branch` when commits landed, otherwise `None`.
+    """
+    run_id: str
+    pool_sha: Optional[str]
+    output_branch_pushed: Optional[str]
+    uncommitted_paths: Sequence[str]
+
+
+# ── Subprocess helpers ────────────────────────────────────────────────────
+
+
+def _core_argv(_core_bin: Optional[str] = None) -> list[str]:
+    return _core_bin.split() if _core_bin else find_core_bin()
+
+
+def _run_core(
+    argv_extra: Sequence[str],
+    *,
+    _core_bin: Optional[str] = None,
+    extra_env: Optional[dict] = None,
+) -> dict:
+    """Run `bunsen-core ...` and parse the trailing JSON summary from stdout.
+
+    Some invocations (notably `--session <id> --spec ...`) interleave NDJSON
+    event lines on stdout from the transcript encoder before the final
+    summary line. We pick the LAST non-empty JSON line as the authoritative
+    summary; event lines carry a `seq` field and a `type` field which the
+    summary does not, so the parse is unambiguous.
+
+    Raises `SessionError` on non-zero exit.
+    """
+    import os
+
+    argv = _core_argv(_core_bin) + list(argv_extra)
+    env = None
+    if extra_env:
+        env = os.environ.copy()
+        env.update(extra_env)
+    proc = subprocess.run(argv, capture_output=True, text=True, env=env)
+    if proc.returncode != 0:
+        raise SessionError(
+            f"bunsen-core {' '.join(argv_extra)!r} exited {proc.returncode}",
+            stderr=proc.stderr,
+            returncode=proc.returncode,
+        )
+    out = proc.stdout.strip()
+    if not out:
+        return {}
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    last = lines[-1]
+    return json.loads(last)
+
+
+# ── Session class ─────────────────────────────────────────────────────────
+
+
+class Session:
+    """A bounded orchestration context owning a Pool of git refs.
+
+    Created via `open_session(...)` or `attach_session(id)`. Use
+    `Session.run(spec)` to drive a Run end-to-end, `Session.close(manifest)`
+    to push selected Pool refs to the host repo, `Session.discard()` to
+    tombstone, and `Session.purge()` (only from `closed`) to wipe.
+
+    Context-manager form:
+
+        with bunsen.open_session(host_repo) as s:
+            r = s.run(spec)
+            s.close([ManifestPair(...)])
+
+    Important: leaving the `with` block WITHOUT calling `close` leaves
+    the Session in its current state on disk (typically `open`). The
+    context manager exists for binding ergonomics, not for auto-close.
+    Per ADR-0010 user story 13, close is never implicit — the Rust
+    `Session` has no `Drop` impl, and the Python `__exit__` mirrors
+    that invariant.
+    """
+
+    def __init__(self, summary: dict, *, _core_bin: Optional[str] = None):
+        self._summary = summary
+        self._core_bin = _core_bin
+
+    @property
+    def id(self) -> str:
+        return self._summary["id"]
+
+    @property
+    def state(self) -> str:
+        return self._summary["state"]
+
+    @property
+    def host_repo(self) -> str:
+        return self._summary["host_repo"]
+
+    @property
+    def mirror_refs(self) -> Sequence[str]:
+        return tuple(self._summary.get("mirror_refs", ()))
+
+    @property
+    def labels(self) -> Sequence[str]:
+        return tuple(self._summary.get("labels", ()))
+
+    @property
+    def path(self) -> str:
+        return self._summary["path"]
+
+    @property
+    def last_close_failure(self) -> Optional[str]:
+        return self._summary.get("last_close_failure")
+
+    def __repr__(self) -> str:
+        return (
+            f"Session(id={self.id!r}, state={self.state!r}, "
+            f"host_repo={self.host_repo!r}, labels={list(self.labels)!r})"
+        )
+
+    # Context manager — does NOT call close on exit (ADR-0010 us. 13).
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        # Deliberately no-op. Close is never implicit.
+        return None
+
+    def _refresh(self) -> None:
+        """Re-read the Session's on-disk metadata via `session show`."""
+        self._summary = _run_core(
+            ["session", "show", self.id],
+            _core_bin=self._core_bin,
+        )
+
+    def label(self, label: str) -> None:
+        result = _run_core(
+            ["session", "label", self.id, label],
+            _core_bin=self._core_bin,
+        )
+        self._summary["labels"] = list(result.get("labels", ()))
+
+    def discard(self) -> None:
+        _run_core(
+            ["session", "discard", self.id],
+            _core_bin=self._core_bin,
+        )
+        self._summary["state"] = "discarded"
+
+    def purge(self) -> None:
+        _run_core(
+            ["session", "purge", self.id],
+            _core_bin=self._core_bin,
+        )
+        self._summary["state"] = "purged"
+
+    def close(self, manifest: Sequence[ManifestPair]) -> None:
+        if not manifest:
+            raise SessionError("close requires at least one ManifestPair")
+        argv: list[str] = ["session", "close", self.id]
+        for p in manifest:
+            argv.extend(["--pair", p.to_flag()])
+        try:
+            _run_core(argv, _core_bin=self._core_bin)
+        finally:
+            # On failure the Session lands in failed_to_close on disk;
+            # mirror that into the handle's view.
+            try:
+                self._refresh()
+            except Exception:
+                pass
+
+    def run(self, spec: dict) -> Run:
+        """Drive a Run inside this Session.
+
+        `spec` is a dict matching `RunSpec` (no `host_repo_path`; the
+        Session provides it). `branching_strategy` may be either a dict
+        (the JSON shape) or a typed `NoneStrategy` / `PoolClone` instance.
+        `output_branch` is optional.
+        """
+        spec_json = _spec_to_json(spec)
+        result = _run_core(
+            ["--session", self.id, "--spec", spec_json],
+            _core_bin=self._core_bin,
+        )
+        return Run(
+            run_id=result["run_id"],
+            pool_sha=result.get("pool_sha"),
+            output_branch_pushed=result.get("output_branch_pushed"),
+            uncommitted_paths=tuple(result.get("uncommitted_paths", ())),
+        )
+
+
+# ── Top-level constructors ────────────────────────────────────────────────
+
+
+def open_session(
+    host_repo: str,
+    *,
+    mirror_refs: Optional[Sequence[str]] = None,
+    label: Optional[str] = None,
+    _core_bin: Optional[str] = None,
+) -> Session:
+    """Open a new Session backed by `host_repo`.
+
+    Default `mirror_refs` is the host repo's default branch (resolved
+    server-side via `git symbolic-ref --short HEAD`). See [ADR-0010].
+    """
+    argv: list[str] = ["session", "open", host_repo]
+    if mirror_refs:
+        for r in mirror_refs:
+            argv.extend(["--mirror", r])
+    if label is not None:
+        argv.extend(["--label", label])
+    opened = _run_core(argv, _core_bin=_core_bin)
+    # `session open` prints only `id` + `path`; fill in the rest via show.
+    return attach_session(opened["id"], _core_bin=_core_bin)
+
+
+def attach_session(id: str, *, _core_bin: Optional[str] = None) -> Session:
+    """Attach by ULID to an existing Session."""
+    summary = _run_core(
+        ["session", "show", id],
+        _core_bin=_core_bin,
+    )
+    return Session(summary, _core_bin=_core_bin)
+
+
+def list_sessions(
+    *,
+    all: bool = False,
+    with_tombstones: bool = False,
+    _core_bin: Optional[str] = None,
+) -> list[Session]:
+    """List Sessions on disk.
+
+    Default returns only live Sessions (`open` and `failed_to_close`).
+    Pass `all=True` to include `closed`; `with_tombstones=True` to
+    include `discarded`.
+    """
+    argv: list[str] = ["session", "list"]
+    if all:
+        argv.append("--all")
+    if with_tombstones:
+        argv.append("--with-tombstones")
+
+
+    proc = subprocess.run(
+        _core_argv(_core_bin) + argv,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise SessionError(
+            f"bunsen-core session list exited {proc.returncode}",
+            stderr=proc.stderr,
+            returncode=proc.returncode,
+        )
+    raw = json.loads(proc.stdout)
+    return [Session(item, _core_bin=_core_bin) for item in raw]
+
+
+__all__ = [
+    "BranchingStrategy",
+    "NoneStrategy",
+    "PoolClone",
+    "ManifestPair",
+    "Run",
+    "Session",
+    "SessionError",
+    "open_session",
+    "attach_session",
+    "list_sessions",
+]
