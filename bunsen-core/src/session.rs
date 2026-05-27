@@ -293,10 +293,16 @@ pub struct RunBackend {
 }
 
 impl RunBackend {
-    /// Whether the caller has supplied anything that, by itself, asks for
-    /// the sandbox backend regardless of what the [`RunSpec`] says.
+    /// Whether the caller has supplied an override that, by itself, asks
+    /// for the sandbox backend regardless of what the [`RunSpec`] says.
+    ///
+    /// `firecracker_bin` is **not** a trigger — it's purely a `$PATH`
+    /// override of the `firecracker` binary location, and without
+    /// kernel/rootfs/oci_image there's nothing to feed it. Matches the
+    /// legacy CLI's "sandbox iff `--kernel` or `--rootfs` or
+    /// `spec.oci_image`" rule.
     fn requests_sandbox(&self) -> bool {
-        self.kernel.is_some() || self.rootfs.is_some() || self.firecracker_bin.is_some()
+        self.kernel.is_some() || self.rootfs.is_some()
     }
 }
 
@@ -2713,6 +2719,34 @@ mod tests {
             "with a non-existent kernel the Firecracker path must fail, \
              not silently fall through to the host-subprocess supervisor"
         );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `firecracker_bin` alone is NOT a sandbox trigger — it's a `$PATH`
+    /// override, not a "use the sandbox" signal. Matches the legacy CLI's
+    /// behaviour where `bunsen-core --firecracker /path/to/firecracker
+    /// --spec ...` (without `--kernel` or `--rootfs` or `oci_image`) stays
+    /// in the host-subprocess path.
+    #[tokio::test]
+    async fn run_with_firecracker_bin_alone_does_not_trigger_sandbox() {
+        let host = make_host_repo("sr-fcbin-noop");
+        let root = make_temp_dir("sr-fcbin-noop-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+
+        // `firecracker_bin` set, but no kernel/rootfs/oci_image. The Run
+        // should go through the host-subprocess supervisor on every
+        // platform, including non-Linux (no SandboxUnsupportedOnPlatform).
+        let backend = RunBackend {
+            firecracker_bin: Some(PathBuf::from("/usr/local/bin/firecracker")),
+            ..RunBackend::default()
+        };
+        let spec = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", None);
+        let res = s.run_with_backend(spec, backend).await.unwrap();
+        assert!(res.pool_sha.is_some(), "host-subprocess path produced no Pool ref");
 
         std::fs::remove_dir_all(&host).ok();
         std::fs::remove_dir_all(&root).ok();
