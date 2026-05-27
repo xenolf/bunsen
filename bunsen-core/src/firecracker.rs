@@ -601,6 +601,17 @@ pub async fn create_workspace_ext4_from_dir(path: &Path, source_dir: &Path, size
 /// The `user_script_uid` argument flows through to
 /// [`crate::sandbox_fetch::fetch_pool_from_git_dir`]; on a root bunsen the
 /// `git fetch` drops to that uid, otherwise it is a no-op.
+// Slice 09 rewired this function to drive the Pool fetch + narrow agent-history
+// copy under a single ext4 mount lifecycle. It currently has no production
+// caller because `Session::run` (slice 09) uses the cross-platform
+// `fetch_pool_from_git_dir` against the host-subprocess Workspace; the
+// Firecracker dispatch through `Session::run` is a future slice (see slice
+// 11's commit notes). Until that wiring lands the function is reachable only
+// from its Linux-only ext4 tests, which is fine but trips dead-code on the
+// musl target. `allow(dead_code)` is the right posture: removing the function
+// would mean re-introducing it for the Firecracker path, and the tests under
+// `#[cfg(target_os = "linux")]` keep it warm.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub async fn extract_workspace_from_ext4(
     ext4_path: &Path,
