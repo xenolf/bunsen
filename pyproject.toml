@@ -4,10 +4,32 @@ build-backend = "maturin"
 
 [project]
 name = "bunsen"
-description = "Python library for orchestrating coding agent Runs via bunsen-core"
+description = "Python library for orchestrating coding-agent Runs inside Firecracker microVMs"
 requires-python = ">=3.11"
 dynamic = ["version"]
 dependencies = []
+readme = "README.md"
+license = {text = "MPL-2.0"}
+authors = [{name = "xenolf"}]
+keywords = ["agents", "sandbox", "firecracker", "microvm", "orchestration", "ai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Software Development",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.urls]
+Homepage = "https://github.com/xenolf/bunsen"
+Repository = "https://github.com/xenolf/bunsen"
+Issues = "https://github.com/xenolf/bunsen/issues"
 
 [project.optional-dependencies]
 dev = [
