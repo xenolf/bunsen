@@ -64,15 +64,17 @@ jobs:
           args: --release --out dist
           # `ring`'s build.rs feeds ARM assembly to the bare cross-gcc in the
           # rust-cross manylinux container (`aarch64-unknown-linux-gnu-gcc`),
-          # which doesn't auto-define `__ARM_ARCH` and so trips the ring asm
-          # header's `#error "ARM assembler must define __ARM_ARCH"`. cc-rs
-          # honours CFLAGS_<target> (underscore form); setting `-march=armv8-a`
-          # there gives the compiler the architecture context ring needs.
-          # No-op for the x86_64 matrix entry — the var only feeds the aarch64
-          # cc-rs path.
+          # which trips the asm header's `#error "ARM assembler must define
+          # __ARM_ARCH"`. First-pass fix used `-march=armv8-a` alone; it
+          # propagates to the gcc command line but this particular cross-gcc
+          # does *not* expand it into the `__ARM_ARCH` preprocessor define
+          # the asm header checks for. Explicit `-D__ARM_ARCH=8` forces the
+          # define regardless of whether the compiler infers it from -march.
+          # cc-rs honours CFLAGS_<target> (underscore form); no-op for the
+          # x86_64 entry since cc-rs only consults the per-target var.
           before-script-linux: |
             set -euo pipefail
-            export CFLAGS_aarch64_unknown_linux_gnu="-march=armv8-a"
+            export CFLAGS_aarch64_unknown_linux_gnu="-march=armv8-a -D__ARM_ARCH=8"
             echo "[before-script] cross-compiling bunsen-core for ${{ matrix.target }}"
             cargo build --release --target ${{ matrix.target }} -p bunsen-core
             mkdir -p python/bunsen/bin
