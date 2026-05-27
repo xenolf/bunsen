@@ -952,6 +952,104 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    // ── RunDir relocation (slice 08) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn freshly_opened_session_has_no_runs_subdir() {
+        // Run dirs are created lazily on first Run. A Session that's
+        // never run anything must have no `runs/` directory.
+        let host = make_host_repo("no-runs-subdir");
+        let root = make_temp_dir("no-runs-subdir-root");
+        let s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let dir = s.path().to_path_buf();
+        assert!(dir.exists(), "session dir exists");
+        assert!(!dir.join("runs").exists(), "runs/ must not be created at open()");
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn run_dir_create_nests_under_session_dir() {
+        // End-to-end ADR-0010 layout: open a Session, create a Run dir
+        // against its path, and assert it lands at
+        // sessions/<id>/runs/<run-id>/.
+        use crate::run_dir::RunDir;
+        let host = make_host_repo("rd-nest");
+        let root = make_temp_dir("rd-nest-root");
+        let s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let sid = s.id().to_string();
+        let session_dir = s.path().to_path_buf();
+        let rd = RunDir::create(&session_dir, "01HRUNFIXTURE0000000000000").unwrap();
+        assert_eq!(
+            rd.path,
+            root.join(&sid).join("runs").join("01HRUNFIXTURE0000000000000")
+        );
+        assert!(rd.path.exists());
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn discard_removes_run_dirs_with_the_session() {
+        // `rm -rf <session>` is a clean discard — and `Session::discard`
+        // already does that. After discarding, no Run dirs survive
+        // outside the (now-tombstoned) Session tree.
+        use crate::run_dir::RunDir;
+        let host = make_host_repo("rd-discard");
+        let root = make_temp_dir("rd-discard-root");
+        let s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let session_dir = s.path().to_path_buf();
+        RunDir::create(&session_dir, "01HRUNA0000000000000000000").unwrap();
+        RunDir::create(&session_dir, "01HRUNB0000000000000000000").unwrap();
+        assert!(session_dir.join("runs").exists());
+
+        s.discard().unwrap();
+
+        // Tombstone keeps the session dir but the runs/ subtree is gone.
+        assert!(session_dir.exists());
+        assert!(!session_dir.join("runs").exists());
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn purge_removes_run_dirs_too() {
+        // Same property via purge: a closed Session's `rm -rf` removes
+        // every Run dir it owns.
+        use crate::run_dir::RunDir;
+        let host = make_host_repo("rd-purge");
+        let root = make_temp_dir("rd-purge-root");
+        let id = "01CLOSEDRUNS00000000000000".to_string();
+        let dir = root.join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        BranchPool::init(dir.join("pool")).await.unwrap();
+        let meta = SessionMeta {
+            id: id.clone(),
+            state: SessionState::Closed,
+            host_repo: host.clone(),
+            mirror_refs: vec!["main".into()],
+            labels: vec![],
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            discarded_at: None,
+            last_close_failure: None,
+        };
+        write_meta_atomic(&dir, &meta).unwrap();
+        RunDir::create(&dir, "01HRUNINSIDE000000000000000").unwrap();
+        assert!(dir.join("runs").exists());
+
+        let s = Session::attach_in(&root, &id).unwrap();
+        s.purge().unwrap();
+        assert!(!dir.exists(), "purge wipes the session dir and all run dirs");
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[tokio::test]
     async fn purge_rejects_failed_to_close_session() {
         let host = make_host_repo("purge-ftc");

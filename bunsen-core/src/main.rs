@@ -113,7 +113,18 @@ async fn main() {
     let run_id = ulid::generate();
     eprintln!("{run_id}");
 
-    let run_dir = RunDir::create(&run_id).unwrap_or_else(|e| {
+    // Slice 08: Run dirs nest under their owning Session at
+    // sessions/<id>/runs/<run-id>/. The CLI doesn't yet have a Session
+    // (slice 11 wires `bunsen run --session <id>`), so until then we
+    // synthesize a `__cli__` session dir under the sessions root. The
+    // synthetic id has no meta.json, so Session::list silently ignores
+    // it — no risk of it surfacing as a real Session.
+    let session_path = cli_session_dir();
+    if let Err(e) = std::fs::create_dir_all(&session_path) {
+        eprintln!("failed to create cli session dir: {e}");
+        std::process::exit(1);
+    }
+    let run_dir = RunDir::create(&session_path, &run_id).unwrap_or_else(|e| {
         eprintln!("failed to create run dir: {e}");
         std::process::exit(1);
     });
@@ -123,8 +134,14 @@ async fn main() {
     // Workspace materialisation runs inside Session::run starting at slice 09.
     // The CLI path (bunsen-core --spec ...) doesn't yet have a Session, so the
     // workspace stays empty here — the adapter is responsible for whatever
-    // host-side state it needs until that wiring lands.
-    let workspace_path = run_dir.workspace_path();
+    // host-side state it needs until that wiring lands. We allocate it as a
+    // sibling of the Run dir (not a child) so that nothing downstream relies
+    // on the removed `RunDir::workspace_path()` accessor.
+    let workspace_path = run_dir.path.join("workspace");
+    if let Err(e) = std::fs::create_dir_all(&workspace_path) {
+        eprintln!("failed to create workspace dir: {e}");
+        std::process::exit(1);
+    }
 
     let started_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
@@ -549,6 +566,28 @@ struct CliArgs {
     rootfs: Option<std::path::PathBuf>,
     firecracker: Option<std::path::PathBuf>,
     manage_firewall: bool,
+}
+
+/// Transitional sessions-root subdir for CLI invocations. Used until
+/// slice 11 wires `bunsen run --session <id>`. Carries no `meta.json`,
+/// so `Session::list` ignores it.
+fn cli_session_dir() -> std::path::PathBuf {
+    xdg_data_home()
+        .join("bunsen")
+        .join("sessions")
+        .join("__cli__")
+}
+
+fn xdg_data_home() -> std::path::PathBuf {
+    if let Ok(v) = std::env::var("XDG_DATA_HOME") {
+        std::path::PathBuf::from(v)
+    } else {
+        std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .join(".local")
+            .join("share")
+    }
 }
 
 fn parse_cli_args(args: &[String]) -> CliArgs {
