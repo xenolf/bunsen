@@ -620,14 +620,15 @@ impl Session {
                 // so we report an empty list for the sandbox path.
                 match sandbox_result {
                     Ok(()) => {
+                        // `sandbox_supervisor::run` already emitted
+                        // `run_ended` at vsock EOF; do NOT emit a second
+                        // one here. The transcript invariant is one
+                        // `run_ended` per Run, carried by the supervisor
+                        // layer with its richer `exit_code` payload.
                         let pool_sha = self
                             .read_pool_ref_sha(&format!("refs/heads/runs/{run_id}"))
                             .await
                             .ok();
-                        let _ = enc.emit(
-                            "run_ended",
-                            serde_json::json!({ "reason": "agent_exit" }),
-                        );
                         (
                             Ok(()),
                             Ok(RunResult {
@@ -769,6 +770,11 @@ impl Session {
         // there is nothing to extract. A future slice may revisit this if
         // we want such Runs to leave any audit trace at all; today they
         // simply do not produce a Pool ref.
+        // The supervisor layer (`crate::supervisor::run` for host-subprocess,
+        // `crate::sandbox_supervisor::run` for Firecracker) already emitted
+        // `run_ended` at agent exit. Warnings from the extraction phase are
+        // emitted AFTER that — they're post-mortem annotations rather than
+        // events on the agent timeline — and there is no second `run_ended`.
         let git_dir = workspace_path.join(".git");
         if !git_dir.exists() {
             enc.emit(
@@ -778,7 +784,6 @@ impl Session {
                     "detail": "BranchingStrategy::None — no commits possible",
                 }),
             )?;
-            enc.emit("run_ended", serde_json::json!({ "reason": "agent_exit" }))?;
             return Ok(RunResult {
                 run_id: run_id.into(),
                 pool_sha: None,
@@ -814,7 +819,6 @@ impl Session {
                     "detail": "agent produced no commits; no Pool ref written",
                 }),
             )?;
-            enc.emit("run_ended", serde_json::json!({ "reason": "agent_exit" }))?;
             return Ok(RunResult {
                 run_id: run_id.into(),
                 pool_sha: None,
@@ -832,8 +836,6 @@ impl Session {
             uid,
         )
         .await?;
-
-        enc.emit("run_ended", serde_json::json!({ "reason": "agent_exit" }))?;
 
         Ok(RunResult {
             run_id: run_id.into(),
@@ -2491,6 +2493,40 @@ mod tests {
     }
 
     // ── Session::run_with_backend (Firecracker dispatch wiring) ─────────────
+
+    /// The transcript contract: exactly one `run_ended` event per Run. The
+    /// supervisor layer (`crate::supervisor::run` for host-subprocess,
+    /// `crate::sandbox_supervisor::run` for Firecracker) is responsible for
+    /// emitting it; no other layer may add a second.
+    #[tokio::test]
+    async fn run_emits_exactly_one_run_ended_event() {
+        let host = make_host_repo("sr-one-run-ended");
+        let root = make_temp_dir("sr-one-run-ended-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let session_dir = s.path().to_path_buf();
+
+        let spec = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", None);
+        let res = s.run(spec).await.unwrap();
+
+        let transcript = session_dir
+            .join("runs")
+            .join(&res.run_id)
+            .join("transcript.ndjson");
+        let body = std::fs::read_to_string(&transcript).unwrap();
+        let count = body
+            .lines()
+            .filter(|l| l.contains("\"type\":\"run_ended\""))
+            .count();
+        assert_eq!(
+            count, 1,
+            "transcript must carry exactly one run_ended event; got {count}\n{body}"
+        );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// Tracer bullet for the Firecracker dispatch wiring: the new
     /// `Session::run_with_backend` entry point, given the default backend
