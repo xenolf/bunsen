@@ -119,18 +119,11 @@ async fn main() {
 
     run_dir.write_spec(&spec_json).ok();
 
+    // Workspace materialisation runs inside Session::run starting at slice 09.
+    // The CLI path (bunsen-core --spec ...) doesn't yet have a Session, so the
+    // workspace stays empty here — the adapter is responsible for whatever
+    // host-side state it needs until that wiring lands.
     let workspace_path = run_dir.workspace_path();
-    workspace_materializer::materialize(
-        spec.branching_strategy.as_deref(),
-        spec.host_repo_path.as_deref(),
-        &workspace_path,
-        &run_id,
-    )
-    .await
-    .unwrap_or_else(|e| {
-        eprintln!("failed to materialize workspace: {e}");
-        std::process::exit(1);
-    });
 
     let started_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
