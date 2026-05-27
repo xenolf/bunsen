@@ -1,6 +1,6 @@
-# crucible
+# bunsen
 
-A Python library for orchestrating Coding Agent **Runs** inside Firecracker microVMs. Crucible launches an agent (Claude Code, aider, …) inside a sandbox, streams its output as a normalised event stream, and enforces a default-deny network egress policy.
+A Python library for orchestrating Coding Agent **Runs** inside Firecracker microVMs. Bunsen launches an agent (Claude Code, aider, …) inside a sandbox, streams its output as a normalised event stream, and enforces a default-deny network egress policy.
 
 See `CONTEXT.md` for the domain glossary and `docs/adr/` for the architectural decisions behind v1.
 
@@ -20,15 +20,15 @@ A Hetzner CCX13 (or any cloud instance that exposes nested virtualization) is en
 ## Install
 
 ```sh
-git clone https://github.com/<you>/crucible.git
-cd crucible
+git clone https://github.com/<you>/bunsen.git
+cd bunsen
 
 # 1. Build the host binary and the in-guest init
 cargo build --release
-cargo build --release -p crucible-init --target x86_64-unknown-linux-musl
+cargo build --release -p bunsen-init --target x86_64-unknown-linux-musl
 
 # 2. Fetch the pinned Firecracker guest kernel (~30 MB, cached at
-#    ${XDG_CACHE_HOME:-~/.cache}/crucible/kernel/vmlinux).
+#    ${XDG_CACHE_HOME:-~/.cache}/bunsen/kernel/vmlinux).
 ./kernel/fetch-vmlinux.sh
 
 # 3. Install the Python library (editable install from repo root; maturin backend)
@@ -42,21 +42,21 @@ pip install -e .
 
 After step 4, the rootfs lives at `target/smoke-rootfs.ext4`.
 
-### `crucible-core` discovery
+### `bunsen-core` discovery
 
-The Python library finds the `crucible-core` host binary in this order:
+The Python library finds the `bunsen-core` host binary in this order:
 
-1. `CRUCIBLE_CORE_BIN` environment variable (a full argv string, space-separated)
-2. `crucible/bin/crucible-core` adjacent to the installed `crucible/` package (the published-wheel layout)
-3. `target/release/crucible-core` walking up from the installed `crucible/` package (cargo dev build)
-4. `crucible-core` on `$PATH`
+1. `BUNSEN_CORE_BIN` environment variable (a full argv string, space-separated)
+2. `bunsen/bin/bunsen-core` adjacent to the installed `bunsen/` package (the published-wheel layout)
+3. `target/release/bunsen-core` walking up from the installed `bunsen/` package (cargo dev build)
+4. `bunsen-core` on `$PATH`
 
-If none match, `crucible.run(...)` raises `FileNotFoundError` with all four options.
+If none match, `bunsen.run(...)` raises `FileNotFoundError` with all four options.
 
 ## First Run
 
 ```python
-import asyncio, crucible
+import asyncio, bunsen
 
 async def main():
     spec = {
@@ -64,41 +64,41 @@ async def main():
         "cmd": ["sh", "-c", "echo hello from inside the sandbox"],
         "workspace-disk-mb": 128,
     }
-    async with crucible.run(spec) as r:
+    async with bunsen.run(spec) as r:
         async for event in r.events:
             print(event)
 
 asyncio.run(main())
 ```
 
-To run it under a real Firecracker sandbox, point `CRUCIBLE_CORE_BIN` at the binary plus the kernel/rootfs flags:
+To run it under a real Firecracker sandbox, point `BUNSEN_CORE_BIN` at the binary plus the kernel/rootfs flags:
 
 ```sh
-export CRUCIBLE_CORE_BIN="$(pwd)/target/release/crucible-core \
-    --kernel ${XDG_CACHE_HOME:-$HOME/.cache}/crucible/kernel/vmlinux \
+export BUNSEN_CORE_BIN="$(pwd)/target/release/bunsen-core \
+    --kernel ${XDG_CACHE_HOME:-$HOME/.cache}/bunsen/kernel/vmlinux \
     --rootfs $(pwd)/target/smoke-rootfs.ext4"
 python examples/hello.py
 ```
 
-On a stock Ubuntu host with UFW enabled, also pass `manage_firewall=True` so crucible can install a per-TAP allow rule for the lifetime of the Run:
+On a stock Ubuntu host with UFW enabled, also pass `manage_firewall=True` so bunsen can install a per-TAP allow rule for the lifetime of the Run:
 
 ```python
-async with crucible.run(spec, manage_firewall=True) as r:
+async with bunsen.run(spec, manage_firewall=True) as r:
     ...
 ```
 
-A Run's outputs land under `${XDG_RUNTIME_DIR:-/tmp}/crucible/runs/<run_id>/`: the normalised transcript (`transcript.jsonl`), the materialised workspace (`workspace/`), and any agent-native history files (`agent-history/`).
+A Run's outputs land under `${XDG_RUNTIME_DIR:-/tmp}/bunsen/runs/<run_id>/`: the normalised transcript (`transcript.jsonl`), the materialised workspace (`workspace/`), and any agent-native history files (`agent-history/`).
 
 ## Running the tests
 
 ```sh
-cargo test                              # host-side Rust + crucible-init unit tests
-cargo check --target x86_64-unknown-linux-musl -p crucible-core   # cross-check
+cargo test                              # host-side Rust + bunsen-init unit tests
+cargo check --target x86_64-unknown-linux-musl -p bunsen-core   # cross-check
 pip install -e '.[dev]' && pytest -q python/tests                  # Python unit tests
 
 # Acceptance suite (Linux + KVM required)
-CRUCIBLE_KERNEL=~/.cache/crucible/kernel/vmlinux \
-CRUCIBLE_ROOTFS=$(pwd)/target/smoke-rootfs.ext4 \
+BUNSEN_KERNEL=~/.cache/bunsen/kernel/vmlinux \
+BUNSEN_ROOTFS=$(pwd)/target/smoke-rootfs.ext4 \
 pytest -v python/tests/test_egress_acceptance.py
 ```
 

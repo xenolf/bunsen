@@ -1,6 +1,6 @@
 # Adapter contract with built-in adapters and black-box fallback
 
-A Coding Agent is integrated through an Adapter — a Rust-side component that knows how to launch the agent, parse its output into structured events, and locate its native conversation history. Crucible ships Adapters for Claude Code and aider in v1. Users can register their own. When no Adapter matches, crucible falls back to black-box behaviour: events are opaque output lines and conversation history is "whatever's in the Workspace".
+A Coding Agent is integrated through an Adapter — a Rust-side component that knows how to launch the agent, parse its output into structured events, and locate its native conversation history. Bunsen ships Adapters for Claude Code and aider in v1. Users can register their own. When no Adapter matches, bunsen falls back to black-box behaviour: events are opaque output lines and conversation history is "whatever's in the Workspace".
 
 ## Why not pure black-box
 

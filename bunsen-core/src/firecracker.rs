@@ -72,7 +72,7 @@ pub async fn start_firecracker(
     firecracker_bin: &Path,
 ) -> Result<FirecrackerHandle> {
     let run_dir = std::env::temp_dir()
-        .join(format!("crucible-fc-{}", &config.run_id));
+        .join(format!("bunsen-fc-{}", &config.run_id));
 
     let api_socket = run_dir.join("api.sock");
     let vsock_path = run_dir.join("vsock.sock");
@@ -599,7 +599,7 @@ pub async fn extract_workspace_from_ext4(ext4_path: &Path, target_dir: &Path) ->
     let loop_dev = String::from_utf8_lossy(&losetup.stdout).trim().to_string();
 
     // Mount the loop device to a temp dir.
-    let mnt = std::env::temp_dir().join(format!("crucible-mnt-{}", std::process::id()));
+    let mnt = std::env::temp_dir().join(format!("bunsen-mnt-{}", std::process::id()));
     std::fs::create_dir_all(&mnt)?;
 
     let mount_status = Command::new("mount")

@@ -280,7 +280,7 @@ pub fn dns_event_reason(qtype: u16) -> String {
 ///
 /// Port is always `53` — `resolv.conf` doesn't carry a port field. Air-
 /// gapped hosts that need a non-53 upstream still go through
-/// `CRUCIBLE_DNS_UPSTREAM`.
+/// `BUNSEN_DNS_UPSTREAM`.
 pub fn parse_resolv_conf(contents: &str) -> Option<SocketAddr> {
     for line in contents.lines() {
         // Strip a trailing comment if present — glibc's parser doesn't honour
@@ -317,7 +317,7 @@ pub fn parse_resolv_conf(contents: &str) -> Option<SocketAddr> {
 /// the bring-up path is still functional on hosts with no resolver
 /// configured at all.
 ///
-/// Callers should still respect the `CRUCIBLE_DNS_UPSTREAM` env var ahead of
+/// Callers should still respect the `BUNSEN_DNS_UPSTREAM` env var ahead of
 /// this — that's an explicit operator override; this function is the
 /// implicit default chain.
 pub fn default_dns_upstream() -> SocketAddr {

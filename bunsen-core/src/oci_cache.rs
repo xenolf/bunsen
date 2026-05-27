@@ -1,7 +1,7 @@
 //! OCI image pull → ext4 rootfs cache.
 //!
 //! `resolve_rootfs(image_ref)` → PathBuf to a cached .ext4 file.
-//! Cache: `${XDG_CACHE_HOME:-~/.cache}/crucible/rootfs/<sha256hex>.ext4`.
+//! Cache: `${XDG_CACHE_HOME:-~/.cache}/bunsen/rootfs/<sha256hex>.ext4`.
 //
 // Network/async code only runs on Linux where Firecracker is available.
 // Suppress dead_code on macOS dev builds.
@@ -21,7 +21,7 @@ pub fn cache_dir() -> PathBuf {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             PathBuf::from(home).join(".cache")
         });
-    base.join("crucible").join("rootfs")
+    base.join("bunsen").join("rootfs")
 }
 
 // ── Image reference parsing ────────────────────────────────────────────────────
@@ -226,7 +226,7 @@ const OCI_ACCEPT_HEADERS: &[&str] = &[
 
 fn build_http_client() -> Result<reqwest::Client> {
     reqwest::ClientBuilder::new()
-        .user_agent("crucible-core/0.1")
+        .user_agent("bunsen-core/0.1")
         .build()
         .context("build HTTP client")
 }
@@ -544,7 +544,7 @@ mod tests {
         let path = cache_dir().join(format!("{HEX64}.ext4"));
         assert!(path.to_string_lossy().contains(HEX64));
         assert!(path.to_string_lossy().ends_with(".ext4"));
-        assert!(path.to_string_lossy().contains("crucible/rootfs"));
+        assert!(path.to_string_lossy().contains("bunsen/rootfs"));
     }
 
     // Cycle 8: parse Www-Authenticate Bearer header.

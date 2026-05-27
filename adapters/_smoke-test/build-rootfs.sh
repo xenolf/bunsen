@@ -13,16 +13,16 @@ OUTPUT="${1:-${REPO_ROOT}/target/smoke-rootfs.ext4}"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-CRUCIBLE_INIT="${REPO_ROOT}/target/x86_64-unknown-linux-musl/release/crucible-init"
+BUNSEN_INIT="${REPO_ROOT}/target/x86_64-unknown-linux-musl/release/bunsen-init"
 
 die() { echo "build-rootfs: error: $*" >&2; exit 1; }
 info() { echo "build-rootfs: $*"; }
 
 # ── Verify prerequisites ──────────────────────────────────────────────────────
 
-[[ -f "$CRUCIBLE_INIT" ]] || die \
-    "crucible-init not found at $CRUCIBLE_INIT — build it first:
-  cargo build --release -p crucible-init --target x86_64-unknown-linux-musl"
+[[ -f "$BUNSEN_INIT" ]] || die \
+    "bunsen-init not found at $BUNSEN_INIT — build it first:
+  cargo build --release -p bunsen-init --target x86_64-unknown-linux-musl"
 
 command -v docker &>/dev/null || die "docker is required"
 
@@ -30,11 +30,11 @@ command -v docker &>/dev/null || die "docker is required"
 # Docker COPY can only reach files inside the build context directory.
 
 cp "${REPO_ROOT}/adapters/_smoke-test/Dockerfile" "$TMPDIR/Dockerfile"
-cp "$CRUCIBLE_INIT" "$TMPDIR/crucible-init"
+cp "$BUNSEN_INIT" "$TMPDIR/bunsen-init"
 
 # ── Build Docker image ────────────────────────────────────────────────────────
 
-IMAGE="crucible-smoke-rootfs-$$"
+IMAGE="bunsen-smoke-rootfs-$$"
 info "building Docker image…"
 docker buildx build \
     --platform linux/amd64 \

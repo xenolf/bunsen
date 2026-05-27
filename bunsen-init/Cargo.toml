@@ -1,5 +1,5 @@
 [package]
-name = "crucible-init"
+name = "bunsen-init"
 version = "0.1.0"
 edition = "2021"
 

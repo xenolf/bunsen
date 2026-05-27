@@ -1,4 +1,4 @@
-"""Typed event dataclasses for crucible's NDJSON event stream."""
+"""Typed event dataclasses for bunsen's NDJSON event stream."""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
@@ -7,7 +7,7 @@ SCHEMA_VERSION = 1
 
 
 class SchemaVersionError(Exception):
-    """Raised when crucible-core emits a schema_version the library can't handle."""
+    """Raised when bunsen-core emits a schema_version the library can't handle."""
 
 
 @dataclass

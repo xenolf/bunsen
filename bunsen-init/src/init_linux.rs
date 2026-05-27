@@ -2,7 +2,7 @@
 //!
 //! Boot sequence:
 //!   1. Mount /proc /sys /dev /tmp
-//!   2. Read spec from kernel cmdline (crucible_spec=<base64-json>)
+//!   2. Read spec from kernel cmdline (bunsen_spec=<base64-json>)
 //!   3. Mount /dev/vdb (workspace ext4) at /workspace
 //!   4. Connect stdout/stderr vsock sockets to the host (ports 5001 / 5002)
 //!   5. Listen on vsock port 5003; accept one control connection from the host
@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::network::GuestNetwork;
 
-/// Toggled on at startup if the kernel cmdline contains `crucible_init_debug=1`.
+/// Toggled on at startup if the kernel cmdline contains `bunsen_init_debug=1`.
 /// When false, [`dbg`] is a no-op.
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -87,7 +87,7 @@ pub fn run() -> ! {
         DEBUG_ENABLED.store(true, Ordering::Relaxed);
     }
     let spec_json = crate::cmdline::extract_spec(&cmdline)
-        .expect("crucible_spec not found in kernel cmdline");
+        .expect("bunsen_spec not found in kernel cmdline");
     let spec: InitSpec = serde_json::from_str(&spec_json)
         .expect("invalid spec JSON");
 
@@ -104,7 +104,7 @@ pub fn run() -> ! {
             net.guest_ip, net.host_ip, net.prefix_len
         ));
         if let Err(e) = crate::network::configure_eth0(net) {
-            eprintln!("crucible-init: configure_eth0 failed: {e}");
+            eprintln!("bunsen-init: configure_eth0 failed: {e}");
             dbg(&format!("configure_eth0 failed: {e}"));
         }
         // Point libc resolvers at the host-side DNS listener. Agents that
@@ -114,7 +114,7 @@ pub fn run() -> ! {
         // image lacks /etc/resolv.conf (rare) or when it's a symlink, in
         // which case the agent still has HTTPS_PROXY as the fallback.
         if let Err(e) = crate::network::install_resolv_conf(net) {
-            eprintln!("crucible-init: install_resolv_conf failed: {e}");
+            eprintln!("bunsen-init: install_resolv_conf failed: {e}");
             dbg(&format!("install_resolv_conf failed: {e}"));
         } else {
             dbg(&format!("installed resolv.conf -> {}", net.host_ip));
@@ -197,7 +197,7 @@ fn mount_filesystems() {
     let _ = std::fs::create_dir_all("/tmp");
     let _ = std::fs::create_dir_all("/dev");
     let _ = std::fs::create_dir_all("/workspace");
-    let _ = std::fs::create_dir_all("/run/crucible");
+    let _ = std::fs::create_dir_all("/run/bunsen");
 
     mount_fs("proc", "/proc", "proc", 0, None);
     mount_fs("sysfs", "/sys", "sysfs", 0, None);
@@ -235,7 +235,7 @@ fn mount_fs(source: &str, target: &str, fs: &str, flags: libc::c_ulong, data: Op
     };
     if ret != 0 {
         let err = io::Error::last_os_error();
-        eprintln!("crucible-init: mount {source} → {target} failed: {err}");
+        eprintln!("bunsen-init: mount {source} → {target} failed: {err}");
     }
 }
 
@@ -322,10 +322,10 @@ fn fork_exec(spec: &InitSpec) -> (pid_t, RawFd, RawFd) {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
-    // Build envp without duplicate keys: spec.env wins, then crucible defaults,
+    // Build envp without duplicate keys: spec.env wins, then bunsen defaults,
     // then PID-1's inherited env. De-duplicate so getenv-order assumptions
     // can't bite us.
-    let crucible_defaults: &[(&str, &str)] = &[("HOME", "/root")];
+    let bunsen_defaults: &[(&str, &str)] = &[("HOME", "/root")];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut env_pairs: Vec<(String, String)> = Vec::new();
     for (k, v) in spec.env.iter() {
@@ -333,15 +333,15 @@ fn fork_exec(spec: &InitSpec) -> (pid_t, RawFd, RawFd) {
             env_pairs.push((k.clone(), v.clone()));
         }
     }
-    for (k, v) in crucible_defaults.iter() {
+    for (k, v) in bunsen_defaults.iter() {
         if seen.insert((*k).to_string()) {
             env_pairs.push(((*k).to_string(), (*v).to_string()));
         }
     }
     for (k, v) in std::env::vars() {
-        // crucible_spec is a base64 blob containing secrets; never forward to
+        // bunsen_spec is a base64 blob containing secrets; never forward to
         // the agent. Other kernel-cmdline-derived vars are filtered defensively.
-        if k == "crucible_spec" || k.starts_with("crucible_") {
+        if k == "bunsen_spec" || k.starts_with("bunsen_") {
             continue;
         }
         if seen.insert(k.clone()) {

@@ -24,7 +24,7 @@ pub struct MetaJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_reason: Option<String>,
     pub schema_version: u32,
-    pub crucible_version: String,
+    pub bunsen_version: String,
     pub parent_run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimits>,
@@ -32,7 +32,7 @@ pub struct MetaJson {
 
 impl RunDir {
     pub fn create(run_id: &str) -> std::io::Result<Self> {
-        let base = xdg_data_home().join("crucible").join("runs").join(run_id);
+        let base = xdg_data_home().join("bunsen").join("runs").join(run_id);
         std::fs::create_dir_all(&base)?;
         std::fs::create_dir_all(base.join("workspace"))?;
         Ok(RunDir { path: base, run_id: run_id.to_string() })
@@ -77,7 +77,7 @@ fn dirs_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{SCHEMA_VERSION, CRUCIBLE_VERSION};
+    use crate::events::{SCHEMA_VERSION, BUNSEN_VERSION};
 
     #[test]
     fn resource_limits_serialized_in_meta() {
@@ -87,7 +87,7 @@ mod tests {
             ended_at: None,
             exit_reason: None,
             schema_version: SCHEMA_VERSION,
-            crucible_version: CRUCIBLE_VERSION.to_string(),
+            bunsen_version: BUNSEN_VERSION.to_string(),
             parent_run_id: None,
             resource_limits: Some(ResourceLimits {
                 memory_mb: 512,
@@ -117,7 +117,7 @@ mod tests {
             ended_at: None,
             exit_reason: None,
             schema_version: SCHEMA_VERSION,
-            crucible_version: CRUCIBLE_VERSION.to_string(),
+            bunsen_version: BUNSEN_VERSION.to_string(),
             parent_run_id: None,
             resource_limits: None,
         };

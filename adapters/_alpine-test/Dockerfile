@@ -6,7 +6,7 @@
 # closer approximation of a real OCI agent image: dynamically-linked
 # binaries, full /etc layout, and an apk-installed `git` for AC7.
 #
-# build-rootfs.sh sets up a temp context with this file + the crucible-init binary.
+# build-rootfs.sh sets up a temp context with this file + the bunsen-init binary.
 
 FROM alpine:3.19
 
@@ -14,9 +14,9 @@ FROM alpine:3.19
 # `git` is the only extra binary the acceptance suite needs.
 RUN apk add --no-cache git
 RUN rm -f /sbin/init
-RUN mkdir -p /workspace /run/crucible /proc /sys /dev /tmp
+RUN mkdir -p /workspace /run/bunsen /proc /sys /dev /tmp
 
-# Bind-mount target for the resolv.conf installed by crucible-init at boot.
+# Bind-mount target for the resolv.conf installed by bunsen-init at boot.
 # Alpine's minimal base doesn't ship /etc/resolv.conf because Docker normally
 # writes it at container start; we boot under Firecracker with a read-only
 # rootfs, so the file must exist up-front for `mount --bind` to succeed.
@@ -24,9 +24,9 @@ RUN mkdir -p /workspace /run/crucible /proc /sys /dev /tmp
 # making it impossible to create the file via `RUN`. `COPY` operates on the
 # layer's filesystem directly, bypassing the bind-mount.
 COPY <<EOF /etc/resolv.conf
-# placeholder for crucible-init bind-mount
+# placeholder for bunsen-init bind-mount
 EOF
 
-# crucible-init is copied into the build context by build-rootfs.sh
-COPY crucible-init /sbin/crucible-init
-RUN chmod 755 /sbin/crucible-init && ln -sf /sbin/crucible-init /sbin/init
+# bunsen-init is copied into the build context by build-rootfs.sh
+COPY bunsen-init /sbin/bunsen-init
+RUN chmod 755 /sbin/bunsen-init && ln -sf /sbin/bunsen-init /sbin/init

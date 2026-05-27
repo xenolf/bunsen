@@ -14,7 +14,7 @@ fn main() {
 
     #[cfg(not(target_os = "linux"))]
     {
-        eprintln!("crucible-init: Linux-only binary");
+        eprintln!("bunsen-init: Linux-only binary");
         std::process::exit(1);
     }
 }

@@ -6,7 +6,7 @@
 //!
 //! Direct ioctls are used (not a shell-out to `/sbin/ip`) so the bring-up
 //! has no dependency on the agent's OCI rootfs — `iproute2` / `busybox` may
-//! not be present on every Adapter image, but `crucible-init` itself is the
+//! not be present on every Adapter image, but `bunsen-init` itself is the
 //! same static binary in every rootfs.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -17,7 +17,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 /// Per-Run network configuration handed to the guest by the host. Mirrors
-/// `crucible_core::sandbox_net::RunNetwork` on the wire (kebab-case JSON).
+/// `bunsen_core::sandbox_net::RunNetwork` on the wire (kebab-case JSON).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GuestNetwork {
@@ -30,7 +30,7 @@ pub struct GuestNetwork {
 /// bind mount lands it at the canonical location. `/run` is tmpfs (mounted
 /// by [`crate::init_linux::mount_filesystems`]) so this path is writable
 /// even though the rootfs is read-only.
-pub const RESOLV_CONF_SCRATCH: &str = "/run/crucible/resolv.conf";
+pub const RESOLV_CONF_SCRATCH: &str = "/run/bunsen/resolv.conf";
 
 /// Canonical location of the guest's resolver config; bind-mount target.
 pub const RESOLV_CONF_TARGET: &str = "/etc/resolv.conf";
@@ -171,7 +171,7 @@ mod linux {
 
     fn add_default_route(sock: RawFd, gateway: Ipv4Addr) -> io::Result<()> {
         // `rtentry` is defined for the linux glibc + musl + uclibc targets.
-        // We build the request by hand because crucible-init targets musl.
+        // We build the request by hand because bunsen-init targets musl.
         let mut rt: libc::rtentry = unsafe { mem::zeroed() };
         write_sockaddr(&mut rt.rt_dst, Ipv4Addr::UNSPECIFIED);
         write_sockaddr(&mut rt.rt_gateway, gateway);
@@ -194,7 +194,7 @@ mod linux {
         Ok(())
     }
 
-    /// Stage `nameserver <host_ip>` to a tmpfs file under `/run/crucible/`
+    /// Stage `nameserver <host_ip>` to a tmpfs file under `/run/bunsen/`
     /// and bind-mount it over `/etc/resolv.conf` so the guest's libc
     /// resolver routes through the host-side DNS listener.
     ///
@@ -411,8 +411,8 @@ mod tests {
 
     #[test]
     fn stage_resolv_conf_creates_parent_dir_if_missing() {
-        // Caller may pass /run/crucible/resolv.conf before mount_filesystems
-        // has reached /run/crucible. Defensive: create parents.
+        // Caller may pass /run/bunsen/resolv.conf before mount_filesystems
+        // has reached /run/bunsen. Defensive: create parents.
         let dir = tempfile::tempdir().unwrap();
         let scratch = dir.path().join("nested").join("resolv.conf");
         let net = GuestNetwork {

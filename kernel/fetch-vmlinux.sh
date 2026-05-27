@@ -6,12 +6,12 @@
 #   ./kernel/fetch-vmlinux.sh --check  # exit 0 if cache matches, non-zero otherwise
 #
 # The cached kernel lands at:
-#   ${XDG_CACHE_HOME:-~/.cache}/crucible/kernel/vmlinux-<VERSION>
+#   ${XDG_CACHE_HOME:-~/.cache}/bunsen/kernel/vmlinux-<VERSION>
 # and is symlinked as:
-#   ${XDG_CACHE_HOME:-~/.cache}/crucible/kernel/vmlinux  (the default for builds)
+#   ${XDG_CACHE_HOME:-~/.cache}/bunsen/kernel/vmlinux  (the default for builds)
 #
 # Host architecture is detected from `uname -m`; the constants below must agree
-# with crucible-core/src/kernel.rs (KERNEL_VERSION / KERNEL_URL / KERNEL_SHA256)
+# with bunsen-core/src/kernel.rs (KERNEL_VERSION / KERNEL_URL / KERNEL_SHA256)
 # so the two implementations share a cache.
 
 set -euo pipefail
@@ -42,7 +42,7 @@ case "$ARCH" in
         ;;
 esac
 
-CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/crucible/kernel"
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/bunsen/kernel"
 DEST="${CACHE_DIR}/vmlinux-${KERNEL_VERSION}"
 LINK="${CACHE_DIR}/vmlinux"
 

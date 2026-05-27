@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Stub crucible-core for testing. Reads --spec, emits scripted NDJSON to stdout."""
+"""Stub bunsen-core for testing. Reads --spec, emits scripted NDJSON to stdout."""
 import json
 import sys
 import time
 
 RUN_ID = "01HWTEST00000000000000000A"
-WORKSPACE = f"/tmp/crucible-test-runs/{RUN_ID}/workspace"
-TRANSCRIPT = f"/tmp/crucible-test-runs/{RUN_ID}/transcript.ndjson"
+WORKSPACE = f"/tmp/bunsen-test-runs/{RUN_ID}/workspace"
+TRANSCRIPT = f"/tmp/bunsen-test-runs/{RUN_ID}/transcript.ndjson"
 
 # Parse --mode and --spec from args
 mode = "normal"

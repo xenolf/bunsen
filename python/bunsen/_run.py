@@ -1,4 +1,4 @@
-"""Run handle — async context manager wrapping crucible-core subprocess."""
+"""Run handle — async context manager wrapping bunsen-core subprocess."""
 from __future__ import annotations
 import asyncio
 import json

@@ -1,19 +1,19 @@
 """Acceptance tests for issue 10 (egress enforcer). Requires Linux + KVM.
 
 Run with:
-    CRUCIBLE_KERNEL=/path/vmlinux \\
-    CRUCIBLE_ROOTFS=/path/rootfs.ext4 \\
+    BUNSEN_KERNEL=/path/vmlinux \\
+    BUNSEN_ROOTFS=/path/rootfs.ext4 \\
     pytest python/tests/test_egress_acceptance.py -v -s
 
 Can be run from any directory — no pytest plugin required beyond pytest itself.
 
 Optional env vars:
-    CRUCIBLE_ALPINE_ROOTFS=/path  also run every AC against an alpine-derived
+    BUNSEN_ALPINE_ROOTFS=/path  also run every AC against an alpine-derived
                                   rootfs (see adapters/_alpine-test/). When
                                   set, each test runs twice — once per rootfs
                                   — with pytest ids `[smoke]` and `[alpine]`.
-    CRUCIBLE_MANAGE_FIREWALL=0    disable --manage-firewall (default: enabled)
-    CRUCIBLE_FIRECRACKER=/path    path to firecracker binary (default: "firecracker")
+    BUNSEN_MANAGE_FIREWALL=0    disable --manage-firewall (default: enabled)
+    BUNSEN_FIRECRACKER=/path    path to firecracker binary (default: "firecracker")
 
 Assumes busybox is available inside the guest (wget, nc, nslookup, sh).
 The rootfs must have git for AC7 (User Story 21 demo); that test is skipped
@@ -35,11 +35,11 @@ pytestmark = pytest.mark.skipif(
     reason="acceptance tests require Linux + /dev/kvm",
 )
 
-_KERNEL = os.environ.get("CRUCIBLE_KERNEL", "")
-_ROOTFS = os.environ.get("CRUCIBLE_ROOTFS", "")
-_ALPINE_ROOTFS = os.environ.get("CRUCIBLE_ALPINE_ROOTFS", "")
-_FIRECRACKER = os.environ.get("CRUCIBLE_FIRECRACKER", "")
-_MANAGE_FIREWALL = os.environ.get("CRUCIBLE_MANAGE_FIREWALL", "1") != "0"
+_KERNEL = os.environ.get("BUNSEN_KERNEL", "")
+_ROOTFS = os.environ.get("BUNSEN_ROOTFS", "")
+_ALPINE_ROOTFS = os.environ.get("BUNSEN_ALPINE_ROOTFS", "")
+_FIRECRACKER = os.environ.get("BUNSEN_FIRECRACKER", "")
+_MANAGE_FIREWALL = os.environ.get("BUNSEN_MANAGE_FIREWALL", "1") != "0"
 
 
 def _rootfs_params() -> list:
@@ -59,7 +59,7 @@ def _rootfs_params() -> list:
             None,
             id="no-rootfs",
             marks=pytest.mark.skip(
-                reason="set CRUCIBLE_ROOTFS and/or CRUCIBLE_ALPINE_ROOTFS to run acceptance tests"
+                reason="set BUNSEN_ROOTFS and/or BUNSEN_ALPINE_ROOTFS to run acceptance tests"
             ),
         ))
     return specs
@@ -69,17 +69,17 @@ def _rootfs_params() -> list:
 def rootfs(request) -> str:
     """Yield each rootfs path the suite should exercise.
 
-    Skips when CRUCIBLE_KERNEL is missing — the rootfs alone isn't enough.
+    Skips when BUNSEN_KERNEL is missing — the rootfs alone isn't enough.
     """
     if not _KERNEL:
-        pytest.skip("set CRUCIBLE_KERNEL to run acceptance tests")
+        pytest.skip("set BUNSEN_KERNEL to run acceptance tests")
     return request.param
 
 
 def _kvm_core_bin(rootfs_path: str) -> str:
     """Build the _core_bin string with --kernel/--rootfs flags.
 
-    Intentionally bypasses CRUCIBLE_CORE_BIN — conftest.py sets that to the
+    Intentionally bypasses BUNSEN_CORE_BIN — conftest.py sets that to the
     stub for unit tests; acceptance tests always need the real binary.
     """
     import shutil
@@ -87,17 +87,17 @@ def _kvm_core_bin(rootfs_path: str) -> str:
     here = Path(__file__).resolve()
     binary: Optional[str] = None
     for parent in here.parents:
-        candidate = parent / "target" / "release" / "crucible-core"
+        candidate = parent / "target" / "release" / "bunsen-core"
         if candidate.is_file() and os.access(candidate, os.X_OK):
             binary = str(candidate)
             break
     if binary is None:
-        found = shutil.which("crucible-core")
+        found = shutil.which("bunsen-core")
         if found:
             binary = found
     if binary is None:
         pytest.skip(
-            "real crucible-core binary not found; build with `cargo build --release`"
+            "real bunsen-core binary not found; build with `cargo build --release`"
         )
     parts = [binary, "--kernel", _KERNEL, "--rootfs", rootfs_path]
     if _FIRECRACKER:
@@ -106,11 +106,11 @@ def _kvm_core_bin(rootfs_path: str) -> str:
 
 
 async def _collect(spec: dict, timeout: float, rootfs_path: str) -> tuple:
-    """Spawn crucible-core, collect events until RunEnded, capture stderr via temp file.
+    """Spawn bunsen-core, collect events until RunEnded, capture stderr via temp file.
 
     Returns (events, stderr).
 
-    crucible-core hangs after emitting run_ended (workspace extraction + nftables
+    bunsen-core hangs after emitting run_ended (workspace extraction + nftables
     cleanup keep stdout open). We break on RunEnded and kill the process rather
     than waiting for EOF.
 
@@ -122,7 +122,7 @@ async def _collect(spec: dict, timeout: float, rootfs_path: str) -> tuple:
     import os
     import tempfile
     import time
-    from crucible._events import decode_event, RunEnded as _RunEnded
+    from bunsen._events import decode_event, RunEnded as _RunEnded
 
     cmd = _kvm_core_bin(rootfs_path).split()
     if _MANAGE_FIREWALL:
@@ -130,7 +130,7 @@ async def _collect(spec: dict, timeout: float, rootfs_path: str) -> tuple:
     cmd += ["--spec", _json.dumps(spec)]
 
     # Open a temp file for stderr and pass the raw FD to the subprocess.
-    stderr_fd, stderr_path = tempfile.mkstemp(suffix=".crucible-stderr")
+    stderr_fd, stderr_path = tempfile.mkstemp(suffix=".bunsen-stderr")
     os.close(stderr_fd)
     stderr_fd = os.open(stderr_path, os.O_WRONLY)
 
@@ -157,7 +157,7 @@ async def _collect(spec: dict, timeout: float, rootfs_path: str) -> tuple:
                         event = decode_event(_json.loads(line))
                         events.append(event)
                         if isinstance(event, _RunEnded):
-                            break  # crucible-core hangs after RunEnded; don't wait for EOF
+                            break  # bunsen-core hangs after RunEnded; don't wait for EOF
                     except Exception:
                         pass
         except TimeoutError:
@@ -182,14 +182,14 @@ async def _collect(spec: dict, timeout: float, rootfs_path: str) -> tuple:
         pytest.fail(
             f"sandbox run timed out after {elapsed:.1f}s\n"
             f"events so far: {events}\n"
-            f"crucible-core stderr:\n{stderr or '(empty)'}"
+            f"bunsen-core stderr:\n{stderr or '(empty)'}"
         )
 
     if not events:
         pytest.fail(
-            f"crucible-core emitted no events "
+            f"bunsen-core emitted no events "
             f"(exit {proc.returncode}, elapsed {elapsed:.1f}s)\n"
-            f"crucible-core stderr:\n{stderr or '(empty)'}"
+            f"bunsen-core stderr:\n{stderr or '(empty)'}"
         )
 
     return events, stderr
@@ -200,17 +200,17 @@ def _run_and_collect(spec: dict, rootfs_path: str, timeout: float = 90.0) -> lis
     events, stderr = asyncio.run(_collect(spec, timeout, rootfs_path))
     if stderr:
         # Printed to pytest's captured output — visible with -s and in failure reports.
-        print(f"\n[crucible-core stderr]\n{stderr}\n", flush=True)
+        print(f"\n[bunsen-core stderr]\n{stderr}\n", flush=True)
     return events
 
 
 def _denials(events) -> list:
-    from crucible._events import EgressDenied
+    from bunsen._events import EgressDenied
     return [e for e in events if isinstance(e, EgressDenied)]
 
 
 def _run_ended(events):
-    from crucible._events import RunEnded
+    from bunsen._events import RunEnded
     return next((e for e in events if isinstance(e, RunEnded)), None)
 
 
@@ -233,7 +233,7 @@ def _spec(cmd: str, egress_endpoints: Optional[list] = None) -> dict:
 def test_ac1_allowed_domain_produces_no_egress_denied(rootfs):
     """AC1: a domain in the egress allowlist produces no EgressDenied.
 
-    wget connects via HTTPS_PROXY (injected by crucible). The proxy allows
+    wget connects via HTTPS_PROXY (injected by bunsen). The proxy allows
     the CONNECT to api.anthropic.com because it is in egress-endpoints.
     The underlying request may fail (no API key) — that is irrelevant; we
     only care that no EgressDenied event is emitted.
@@ -304,7 +304,7 @@ def test_ac4_raw_tcp_bypass_produces_egress_denied_raw_tcp(rootfs):
     """AC4: a direct TCP connection that bypasses the proxy is dropped at L3.
 
     nc connects directly to 1.1.1.1:443 — not to the proxy. The nftables
-    ruleset installed by crucible drops the SYN; the kernel logs the drop;
+    ruleset installed by bunsen drops the SYN; the kernel logs the drop;
     the journalctl tailer emits EgressDenied(protocol='raw_tcp').
 
     A 2-second sleep after nc gives the kernel log pipeline time to flush
@@ -325,7 +325,7 @@ def test_ac4_raw_tcp_bypass_produces_egress_denied_raw_tcp(rootfs):
 def test_ac5_dns_for_non_allowed_domain_produces_egress_denied_dns(rootfs):
     """AC5: DNS lookup for a domain not in the allowlist produces EgressDenied(dns).
 
-    crucible-init wrote /etc/resolv.conf pointing at the host-side DNS
+    bunsen-init wrote /etc/resolv.conf pointing at the host-side DNS
     listener (slice 10n). nslookup sends a UDP query to that listener;
     the listener evaluates the domain against the egress policy, returns
     REFUSED, and emits DenialEvent(protocol=dns).
@@ -391,7 +391,7 @@ def test_ac7_user_story_21_clone_public_repo(rootfs):
     A successful clone prints CLONE_OK; the test asserts that string appears
     in the agent's stdout output and that no github.com EgressDenied was emitted.
     """
-    from crucible._events import Output
+    from bunsen._events import Output
 
     # The command first checks for git; if absent it prints NO_GIT and exits 0
     # so we can skip cleanly without a test failure.

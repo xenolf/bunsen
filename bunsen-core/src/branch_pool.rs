@@ -1,6 +1,6 @@
-//! Branch Pool — the crucible-managed git store owned by a Session.
+//! Branch Pool — the bunsen-managed git store owned by a Session.
 //!
-//! All git invocations crucible makes against the Pool funnel through this
+//! All git invocations bunsen makes against the Pool funnel through this
 //! module's public verbs so the future hardening surface (ADR-0011 et al.)
 //! is single-sited. See ADR-0010 for the surrounding Session model.
 
@@ -247,7 +247,7 @@ impl BranchPool {
                 continue;
             }
             // Pull host_sha into a unique temp ref so the ancestor check is local
-            let temp = format!("refs/crucible-validate/{i}");
+            let temp = format!("refs/bunsen-validate/{i}");
             run_git(
                 &[
                     "fetch",
@@ -370,7 +370,7 @@ mod tests {
         let pid = std::process::id();
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!(
-            "crucible-bp-{suffix}-{pid}-{nanos}-{n}"
+            "bunsen-bp-{suffix}-{pid}-{nanos}-{n}"
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -833,7 +833,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_manifest_validation_leaves_no_temp_refs() {
-        // Validation fetches host refs into refs/crucible-validate/<i>;
+        // Validation fetches host refs into refs/bunsen-validate/<i>;
         // assert these are cleaned up regardless of validation outcome.
         let host = make_bare_host_repo("pm-clean-host");
         let _ = seed_bare_with_commit(&host);
@@ -858,10 +858,10 @@ mod tests {
         }];
         let _ = pool.push_manifest(&host, &manifest).await; // expected NotFastForward
 
-        // No refs/crucible-validate/* should remain.
+        // No refs/bunsen-validate/* should remain.
         let listing = StdCommand::new("git")
             .current_dir(&pool_dir)
-            .args(["for-each-ref", "--format=%(refname)", "refs/crucible-validate/"])
+            .args(["for-each-ref", "--format=%(refname)", "refs/bunsen-validate/"])
             .output()
             .unwrap();
         let out = String::from_utf8_lossy(&listing.stdout);

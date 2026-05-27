@@ -5,14 +5,14 @@ A Run streams events out and accepts coarse control signals (`stop`, `kill`, `pa
 ## Why
 
 - The "branch the conversation and reprompt" use case is expressed as a *new* Run with a Branching Strategy that forks from the prior Run's state — not as mutation of a live Run.
-- Driving an agent turn-by-turn requires the agent to expose pause/intercept hooks. Most CLI agents do not. Coupling crucible's primitive to that capability would make the supported-agent set tiny and brittle.
+- Driving an agent turn-by-turn requires the agent to expose pause/intercept hooks. Most CLI agents do not. Coupling bunsen's primitive to that capability would make the supported-agent set tiny and brittle.
 - Keeping the Run primitive narrow means Adapters need to do less; black-box fallback is meaningful.
 
 ## Considered Options
 
 - **Single-shot, terminal Run** (`subprocess.run`-style) — too thin for a Rust core to add value.
 - **Streamed observable Run** (chosen) — events stream, control signals coarse, agent runs unsupervised internally.
-- **Interactive interruptible Run** — User Script can veto tool calls, inject prompts, etc. Couples crucible to specific agents' internals; rejected.
+- **Interactive interruptible Run** — User Script can veto tool calls, inject prompts, etc. Couples bunsen to specific agents' internals; rejected.
 
 ## Consequences
 

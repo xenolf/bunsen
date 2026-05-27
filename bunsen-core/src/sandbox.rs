@@ -88,21 +88,21 @@ pub struct SandboxConfig {
 
 /// Build the kernel boot args string, embedding the spec as base64.
 ///
-/// When the host process has `CRUCIBLE_INIT_DEBUG=1` in its environment, append
-/// `crucible_init_debug=1` so the guest init writes a per-run init.log to
+/// When the host process has `BUNSEN_INIT_DEBUG=1` in its environment, append
+/// `bunsen_init_debug=1` so the guest init writes a per-run init.log to
 /// /workspace. Off by default — the diagnostics are noisy and meant for
 /// development.
 pub fn build_boot_args(spec_json: &str) -> String {
     let encoded = STANDARD.encode(spec_json.as_bytes());
-    let debug = if std::env::var("CRUCIBLE_INIT_DEBUG").as_deref() == Ok("1") {
-        " crucible_init_debug=1"
+    let debug = if std::env::var("BUNSEN_INIT_DEBUG").as_deref() == Ok("1") {
+        " bunsen_init_debug=1"
     } else {
         ""
     };
     format!(
         "console=ttyS0 reboot=k panic=1 pci=off nomodule \
-         root=/dev/vda rw init=/sbin/crucible-init \
-         crucible_spec={encoded}{debug}"
+         root=/dev/vda rw init=/sbin/bunsen-init \
+         bunsen_spec={encoded}{debug}"
     )
 }
 
@@ -208,11 +208,11 @@ mod tests {
         let vc = FcVsockConfig {
             vsock_id: "vsock0".to_string(),
             guest_cid: 3,
-            uds_path: "/tmp/crucible-vsock.sock".to_string(),
+            uds_path: "/tmp/bunsen-vsock.sock".to_string(),
         };
         let v = serde_json::to_value(&vc).unwrap();
         assert_eq!(v["guest_cid"], 3);
-        assert_eq!(v["uds_path"], "/tmp/crucible-vsock.sock");
+        assert_eq!(v["uds_path"], "/tmp/bunsen-vsock.sock");
     }
 
     // ── Cycle 3: boot args builder ─────────────────────────────────────────
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn boot_args_contain_init_path() {
         let args = build_boot_args(r#"{"cmd":["echo"]}"#);
-        assert!(args.contains("init=/sbin/crucible-init"));
+        assert!(args.contains("init=/sbin/bunsen-init"));
     }
 
     #[test]
@@ -228,9 +228,9 @@ mod tests {
         let spec = r#"{"adapter":"black-box","cmd":["echo","hi"]}"#;
         let args = build_boot_args(spec);
         let token = args.split_whitespace()
-            .find(|t| t.starts_with("crucible_spec="))
-            .expect("crucible_spec token missing");
-        let encoded = token.strip_prefix("crucible_spec=").unwrap();
+            .find(|t| t.starts_with("bunsen_spec="))
+            .expect("bunsen_spec token missing");
+        let encoded = token.strip_prefix("bunsen_spec=").unwrap();
         let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), spec);
     }
@@ -430,14 +430,14 @@ mod tests {
 
     #[test]
     fn vsock_socket_path_appends_port() {
-        let base = Path::new("/tmp/crucible-vsock.sock");
+        let base = Path::new("/tmp/bunsen-vsock.sock");
         assert_eq!(
             vsock_socket_path(base, 5001),
-            PathBuf::from("/tmp/crucible-vsock.sock_5001")
+            PathBuf::from("/tmp/bunsen-vsock.sock_5001")
         );
         assert_eq!(
             vsock_socket_path(base, 5002),
-            PathBuf::from("/tmp/crucible-vsock.sock_5002")
+            PathBuf::from("/tmp/bunsen-vsock.sock_5002")
         );
     }
 }

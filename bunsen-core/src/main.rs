@@ -29,7 +29,7 @@ mod sandbox_supervisor;
 #[cfg(target_os = "linux")]
 mod smoke_test;
 
-use events::{SCHEMA_VERSION, CRUCIBLE_VERSION};
+use events::{SCHEMA_VERSION, BUNSEN_VERSION};
 use run_dir::{RunDir, MetaJson, ResourceLimits};
 use serde_json::json;
 
@@ -57,7 +57,7 @@ async fn main() {
     let cli = parse_cli_args(&args);
 
     let spec_json = cli.spec.unwrap_or_else(|| {
-        eprintln!("usage: crucible-core --spec <json>");
+        eprintln!("usage: bunsen-core --spec <json>");
         std::process::exit(1);
     });
 
@@ -84,7 +84,7 @@ async fn main() {
         match kernel::ensure_kernel().await {
             Ok(p) => Some(p),
             Err(e) => {
-                eprintln!("[crucible-core] failed to acquire guest kernel: {e:#}");
+                eprintln!("[bunsen-core] failed to acquire guest kernel: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -146,7 +146,7 @@ async fn main() {
         ended_at: None,
         exit_reason: None,
         schema_version: SCHEMA_VERSION,
-        crucible_version: CRUCIBLE_VERSION.to_string(),
+        bunsen_version: BUNSEN_VERSION.to_string(),
         parent_run_id: None,
         resource_limits: Some(resource_limits.clone()),
     };
@@ -191,7 +191,7 @@ async fn main() {
         ended_at: Some(ended_at),
         exit_reason: Some(exit_reason.to_string()),
         schema_version: SCHEMA_VERSION,
-        crucible_version: CRUCIBLE_VERSION.to_string(),
+        bunsen_version: BUNSEN_VERSION.to_string(),
         parent_run_id: None,
         resource_limits: Some(resource_limits),
     };
@@ -281,9 +281,9 @@ async fn check_host_firewall(manage_firewall: bool) -> Result<(), String> {
 
     if matches!(probe, Decision::Blocked) && !manage_firewall {
         return Err(
-            "[crucible-core] ERROR: host iptables INPUT policy is DROP and no allow rule covers \
+            "[bunsen-core] ERROR: host iptables INPUT policy is DROP and no allow rule covers \
              169.254.0.0/16, so the sandbox's L7 proxy will be unreachable from the guest. \
-             Re-run with --manage-firewall (Python: manage_firewall=True) to let crucible add \
+             Re-run with --manage-firewall (Python: manage_firewall=True) to let bunsen add \
              a per-TAP allow rule for the lifetime of this Run, or open the link-local range \
              manually: sudo ufw allow from 169.254.0.0/16".to_string()
         );
@@ -401,11 +401,11 @@ async fn run_sandbox(
     // hosts behind a corporate or split-horizon resolver work without
     // setting anything.
     use std::env;
-    let upstream: SocketAddr = match env::var("CRUCIBLE_DNS_UPSTREAM") {
+    let upstream: SocketAddr = match env::var("BUNSEN_DNS_UPSTREAM") {
         Ok(s) => s.parse().unwrap_or_else(|_| {
             let fallback = dns::default_dns_upstream();
             eprintln!(
-                "[egress] WARNING: invalid CRUCIBLE_DNS_UPSTREAM={s:?}, \
+                "[egress] WARNING: invalid BUNSEN_DNS_UPSTREAM={s:?}, \
                  falling back to {fallback}"
             );
             fallback
@@ -515,7 +515,7 @@ async fn run_sandbox(
 
     // Populate workspace ext4 from the materialized workspace directory.
     let workspace_ext4 = std::env::temp_dir()
-        .join(format!("crucible-fc-{run_id}"))
+        .join(format!("bunsen-fc-{run_id}"))
         .join("workspace.ext4");
     // The workspace ext4 is created inside start_firecracker; here we just
     // need to ensure the host dir exists so mkfs.ext4 -d can read it.
@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn parse_cli_kernel_rootfs_spec() {
-        let args = strs(&["crucible-core", "--kernel", "/vmlinux", "--rootfs", "/rootfs.ext4", "--spec", r#"{"adapter":"black-box","cmd":["echo"]}"#]);
+        let args = strs(&["bunsen-core", "--kernel", "/vmlinux", "--rootfs", "/rootfs.ext4", "--spec", r#"{"adapter":"black-box","cmd":["echo"]}"#]);
         let cli = parse_cli_args(&args);
         assert_eq!(cli.kernel.unwrap().to_str().unwrap(), "/vmlinux");
         assert_eq!(cli.rootfs.unwrap().to_str().unwrap(), "/rootfs.ext4");
@@ -603,14 +603,14 @@ mod tests {
 
     #[test]
     fn parse_cli_firecracker_optional() {
-        let args = strs(&["crucible-core", "--kernel", "/k", "--rootfs", "/r", "--firecracker", "/fc", "--spec", "{}"]);
+        let args = strs(&["bunsen-core", "--kernel", "/k", "--rootfs", "/r", "--firecracker", "/fc", "--spec", "{}"]);
         let cli = parse_cli_args(&args);
         assert_eq!(cli.firecracker.unwrap().to_str().unwrap(), "/fc");
     }
 
     #[test]
     fn parse_cli_no_sandbox_flags() {
-        let args = strs(&["crucible-core", "--spec", r#"{"adapter":"black-box","cmd":["echo"]}"#]);
+        let args = strs(&["bunsen-core", "--spec", r#"{"adapter":"black-box","cmd":["echo"]}"#]);
         let cli = parse_cli_args(&args);
         assert!(cli.kernel.is_none());
         assert!(cli.rootfs.is_none());
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn parse_cli_manage_firewall_flag() {
-        let args = strs(&["crucible-core", "--manage-firewall", "--spec", "{}"]);
+        let args = strs(&["bunsen-core", "--manage-firewall", "--spec", "{}"]);
         let cli = parse_cli_args(&args);
         assert!(cli.manage_firewall);
         assert!(cli.spec.is_some());
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn parse_cli_manage_firewall_default_false() {
-        let args = strs(&["crucible-core", "--kernel", "/k", "--rootfs", "/r", "--spec", "{}"]);
+        let args = strs(&["bunsen-core", "--kernel", "/k", "--rootfs", "/r", "--spec", "{}"]);
         let cli = parse_cli_args(&args);
         assert!(!cli.manage_firewall);
     }

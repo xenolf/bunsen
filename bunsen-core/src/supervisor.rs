@@ -149,7 +149,7 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
         .current_dir(workspace_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // Child gets its own stdin (closed/null) — crucible-core's stdin is for control commands
+        // Child gets its own stdin (closed/null) — bunsen-core's stdin is for control commands
         .stdin(Stdio::null());
 
     // Place child in its own process group
@@ -192,7 +192,7 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
         let _ = out_tx2.send(OutputLine::Done).await;
     });
 
-    // Read crucible-core's own stdin for control commands
+    // Read bunsen-core's own stdin for control commands
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCmd>(16);
     let stdin_tx = cmd_tx.clone();
     tokio::spawn(async move {
@@ -369,7 +369,7 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         // copy_dir_all only called when src exists; test the guard in run() directly:
         // If workspace .claude/ doesn't exist, no copy happens — dst stays empty.
-        let nonexistent = std::path::Path::new("/tmp/crucible-nonexistent-12345/.claude");
+        let nonexistent = std::path::Path::new("/tmp/bunsen-nonexistent-12345/.claude");
         if !nonexistent.exists() {
             // Guard: copy_dir_all is NOT called — simulate the guard condition
             let hist = dst.path().join("agent-history");

@@ -34,7 +34,7 @@ pub fn derive_table_name(run_id: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    format!("crucible-{suffix}")
+    format!("bunsen-{suffix}")
 }
 
 /// The log prefix the kernel writes for a dropped packet on this Run's TAP.
@@ -45,7 +45,7 @@ pub fn derive_table_name(run_id: &str) -> String {
 /// the Run it belongs to.
 pub fn drop_log_prefix(table_name: &str) -> String {
     // Limit: nftables log prefix max is 127 chars. Our format stays far below.
-    format!("crucible-egress-drop[{table_name}]: ")
+    format!("bunsen-egress-drop[{table_name}]: ")
 }
 
 /// Build the nftables ruleset that allows only TCP to `proxy_host:proxy_port`
@@ -128,12 +128,12 @@ pub struct DropEvent {
 /// Parse a kernel-log line carrying an nftables drop emitted by our ruleset.
 ///
 /// Returns `None` if the line does not contain [`drop_log_prefix`]'s
-/// `crucible-egress-drop[<table>]: ` marker or if the required `DST=` field
+/// `bunsen-egress-drop[<table>]: ` marker or if the required `DST=` field
 /// is missing. Extra leading content (syslog timestamp, hostname, `kernel:`
 /// tag, kernel `[12345.678]` monotonic stamp) is tolerated so the same
 /// parser works on raw `dmesg -w`, `journalctl -k`, and `/dev/kmsg` lines.
 pub fn parse_drop_log_line(line: &str) -> Option<DropEvent> {
-    const MARKER: &str = "crucible-egress-drop[";
+    const MARKER: &str = "bunsen-egress-drop[";
     let start = line.find(MARKER)?;
     let after_marker = &line[start + MARKER.len()..];
     let bracket_end = after_marker.find(']')?;
@@ -245,35 +245,35 @@ mod tests {
     fn table_name_uses_first_sixteen_chars_of_run_id() {
         assert_eq!(
             derive_table_name("01HZXMSAMPLERUNID0000000000"),
-            "crucible-01HZXMSAMPLERUNI"
+            "bunsen-01HZXMSAMPLERUNI"
         );
     }
 
     #[test]
     fn table_name_handles_short_run_ids() {
-        assert_eq!(derive_table_name("abc"), "crucible-abc");
-        assert_eq!(derive_table_name(""), "crucible-");
+        assert_eq!(derive_table_name("abc"), "bunsen-abc");
+        assert_eq!(derive_table_name(""), "bunsen-");
     }
 
     #[test]
     fn table_name_sanitizes_non_identifier_chars() {
         // Anything not in [A-Za-z0-9_-] becomes '_'. Periods, slashes, spaces
         // would otherwise break `nft -f` parsing.
-        assert_eq!(derive_table_name("a.b/c d"), "crucible-a_b_c_d");
-        assert_eq!(derive_table_name("hi!"), "crucible-hi_");
+        assert_eq!(derive_table_name("a.b/c d"), "bunsen-a_b_c_d");
+        assert_eq!(derive_table_name("hi!"), "bunsen-hi_");
     }
 
     #[test]
     fn table_name_preserves_dash_and_underscore() {
-        assert_eq!(derive_table_name("a-b_c"), "crucible-a-b_c");
+        assert_eq!(derive_table_name("a-b_c"), "bunsen-a-b_c");
     }
 
     // ── drop_log_prefix ────────────────────────────────────────────────────
 
     #[test]
     fn drop_log_prefix_embeds_table_name() {
-        let p = drop_log_prefix("crucible-abc");
-        assert!(p.contains("crucible-abc"));
+        let p = drop_log_prefix("bunsen-abc");
+        assert!(p.contains("bunsen-abc"));
         // The trailing ": " is what the kernel log parser will split on; keep
         // it stable so the follow-up emitter slice can rely on it.
         assert!(p.ends_with(": "));
@@ -290,15 +290,15 @@ mod tests {
 
     #[test]
     fn ruleset_declares_table_in_inet_family() {
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
-        assert!(r.contains("table inet crucible-tt"));
+        let r = build_ruleset("bunsen-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
+        assert!(r.contains("table inet bunsen-tt"));
     }
 
     #[test]
     fn ruleset_filters_only_traffic_from_tap() {
         // input and forward chains both jump only when iifname matches the
         // TAP; traffic on any other host interface is untouched.
-        let r = build_ruleset("crucible-tt", "tap-xyz", ipv4("169.254.1.1"), 8080, None);
+        let r = build_ruleset("bunsen-tt", "tap-xyz", ipv4("169.254.1.1"), 8080, None);
         assert!(r.contains("iifname \"tap-xyz\" jump from-guest"));
         // Both hook chains should jump on iifname; count occurrences.
         let n = r.matches("iifname \"tap-xyz\" jump from-guest").count();
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn ruleset_accepts_only_tcp_to_proxy_host_and_port() {
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.42.1"), 34567, None);
+        let r = build_ruleset("bunsen-tt", "tap-tt", ipv4("169.254.42.1"), 34567, None);
         assert!(r.contains("ip daddr 169.254.42.1 tcp dport 34567 accept"));
     }
 
@@ -316,7 +316,7 @@ mod tests {
         // Order matters: accept first, then log, then drop. nftables
         // evaluates rules top-to-bottom; if accept ever moves below drop the
         // proxy stops working.
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
+        let r = build_ruleset("bunsen-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
         let accept_pos = r.find("accept").expect("accept rule missing");
         let log_pos = r.find("log prefix").expect("log rule missing");
         let drop_pos = r.find("drop").expect("drop rule missing");
@@ -328,7 +328,7 @@ mod tests {
     fn ruleset_log_prefix_matches_helper() {
         // The log prefix in the ruleset must equal drop_log_prefix() so the
         // future kernel-log emitter and the rule loader agree.
-        let table = "crucible-runxyz";
+        let table = "bunsen-runxyz";
         let r = build_ruleset(table, "tap-runxyz", ipv4("169.254.1.1"), 8080, None);
         let prefix = drop_log_prefix(table);
         assert!(
@@ -342,14 +342,14 @@ mod tests {
         // We do NOT change the host's default chain policy — only Run-specific
         // traffic gets filtered. Otherwise loading the ruleset could break
         // the host's own networking.
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
+        let r = build_ruleset("bunsen-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
         assert!(r.contains("policy accept"));
     }
 
     #[test]
     fn ruleset_with_different_tap_names_produces_different_text() {
-        let r1 = build_ruleset("crucible-a", "tap-a", ipv4("169.254.1.1"), 8080, None);
-        let r2 = build_ruleset("crucible-b", "tap-b", ipv4("169.254.1.1"), 8080, None);
+        let r1 = build_ruleset("bunsen-a", "tap-a", ipv4("169.254.1.1"), 8080, None);
+        let r2 = build_ruleset("bunsen-b", "tap-b", ipv4("169.254.1.1"), 8080, None);
         assert_ne!(r1, r2);
     }
 
@@ -359,7 +359,7 @@ mod tests {
     fn ruleset_no_dns_port_omits_udp_rule() {
         // Default (no DNS listener bound) — UDP from the TAP is dropped along
         // with everything else.
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
+        let r = build_ruleset("bunsen-tt", "tap-tt", ipv4("169.254.1.1"), 8080, None);
         assert!(!r.contains("udp dport"), "no UDP rule should appear when dns_port=None:\n{r}");
     }
 
@@ -368,7 +368,7 @@ mod tests {
         // DNS listener bound on port 53 → ruleset must permit UDP to the
         // proxy host on that port. Without this rule, the guest's DNS
         // queries get dropped at L3 before they ever reach the listener.
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.42.1"), 34567, Some(53));
+        let r = build_ruleset("bunsen-tt", "tap-tt", ipv4("169.254.42.1"), 34567, Some(53));
         assert!(
             r.contains("ip daddr 169.254.42.1 udp dport 53 accept"),
             "ruleset missing DNS allow rule:\n{r}"
@@ -380,7 +380,7 @@ mod tests {
         // The accept-then-log-then-drop ordering must hold for the DNS rule
         // too. nftables walks the chain top-to-bottom; if DNS accept ends up
         // below `drop`, guest DNS would be silently denied.
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.1.1"), 8080, Some(53));
+        let r = build_ruleset("bunsen-tt", "tap-tt", ipv4("169.254.1.1"), 8080, Some(53));
         let udp_pos = r.find("udp dport 53 accept").expect("dns rule missing");
         let log_pos = r.find("log prefix").expect("log rule missing");
         let drop_pos = r.find("counter drop").expect("drop rule missing");
@@ -393,7 +393,7 @@ mod tests {
         // The DNS listener is bound on the same TAP host IP as the L7 proxy
         // (both bind on net.host in run_sandbox), so the accept rule's
         // destination must match the proxy host, not some other address.
-        let r = build_ruleset("crucible-tt", "tap-tt", ipv4("169.254.5.9"), 8080, Some(53));
+        let r = build_ruleset("bunsen-tt", "tap-tt", ipv4("169.254.5.9"), 8080, Some(53));
         assert!(r.contains("ip daddr 169.254.5.9 udp dport 53"));
         // Other addresses should not appear in a UDP rule.
         assert!(!r.contains("ip daddr 127.0.0.1 udp"));
@@ -404,7 +404,7 @@ mod tests {
     /// Sample after `dmesg -w` (or `journalctl -k --output=cat`) of an
     /// nftables `log prefix "<our-prefix>" level info` drop. Format is the
     /// standard `LOG` target output: space-separated `KEY=VALUE` tokens.
-    const SAMPLE_TCP_DROP: &str = "[12345.678] crucible-egress-drop[crucible-01HXY]: \
+    const SAMPLE_TCP_DROP: &str = "[12345.678] bunsen-egress-drop[bunsen-01HXY]: \
         IN=tap-abc OUT= MAC=02:00:00:00:00:01 \
         SRC=169.254.1.2 DST=8.8.8.8 LEN=60 TOS=0x00 PREC=0x00 TTL=64 \
         ID=54321 DF PROTO=TCP SPT=44321 DPT=443 WINDOW=65535 RES=0x00 SYN URGP=0";
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn parse_drop_extracts_table_and_destination() {
         let ev = parse_drop_log_line(SAMPLE_TCP_DROP).expect("must parse");
-        assert_eq!(ev.table, "crucible-01HXY");
+        assert_eq!(ev.table, "bunsen-01HXY");
         assert_eq!(ev.destination, "8.8.8.8:443");
         assert_eq!(ev.l4_proto, "TCP");
         // Wire-level protocol stays raw_tcp regardless of L4 type per ADR-0005.
@@ -424,17 +424,17 @@ mod tests {
         // `journalctl -k` (without --output=cat) prepends a syslog-style
         // header before the kernel message; the parser must still find the
         // marker via `line.find(...)`.
-        let line = "May 25 12:34:56 hostname kernel: crucible-egress-drop[crucible-RUN]: \
+        let line = "May 25 12:34:56 hostname kernel: bunsen-egress-drop[bunsen-RUN]: \
             IN=tap-x OUT= SRC=169.254.1.2 DST=1.1.1.1 PROTO=TCP SPT=33333 DPT=80";
         let ev = parse_drop_log_line(line).expect("must parse");
-        assert_eq!(ev.table, "crucible-RUN");
+        assert_eq!(ev.table, "bunsen-RUN");
         assert_eq!(ev.destination, "1.1.1.1:80");
     }
 
     #[test]
     fn parse_drop_handles_udp_with_port() {
         // UDP also carries DPT — same shape as TCP.
-        let line = "crucible-egress-drop[crucible-RUN]: \
+        let line = "bunsen-egress-drop[bunsen-RUN]: \
             IN=tap-x OUT= SRC=169.254.1.2 DST=8.8.8.8 PROTO=UDP SPT=11111 DPT=53 LEN=40";
         let ev = parse_drop_log_line(line).expect("must parse");
         assert_eq!(ev.destination, "8.8.8.8:53");
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn parse_drop_handles_icmp_without_port() {
         // ICMP has no DPT — destination is the bare IP.
-        let line = "crucible-egress-drop[crucible-RUN]: \
+        let line = "bunsen-egress-drop[bunsen-RUN]: \
             IN=tap-x OUT= SRC=169.254.1.2 DST=10.0.0.5 PROTO=ICMP TYPE=8 CODE=0";
         let ev = parse_drop_log_line(line).expect("must parse");
         assert_eq!(ev.destination, "10.0.0.5");
@@ -465,16 +465,16 @@ mod tests {
     fn parse_drop_requires_dst_field() {
         // A line that carries the marker but is missing DST= can't be turned
         // into a useful event — return None rather than emit `0.0.0.0`.
-        let line = "crucible-egress-drop[crucible-RUN]: IN=tap-x OUT= PROTO=TCP DPT=443";
+        let line = "bunsen-egress-drop[bunsen-RUN]: IN=tap-x OUT= PROTO=TCP DPT=443";
         assert!(parse_drop_log_line(line).is_none());
     }
 
     #[test]
     fn parse_drop_rejects_empty_table_name() {
-        // A malformed/truncated prefix like `crucible-egress-drop[]:` should
+        // A malformed/truncated prefix like `bunsen-egress-drop[]:` should
         // not produce an event we can route — without a table name there is
         // no Run to attribute the drop to.
-        let line = "crucible-egress-drop[]: IN=tap-x DST=8.8.8.8 PROTO=TCP DPT=443";
+        let line = "bunsen-egress-drop[]: IN=tap-x DST=8.8.8.8 PROTO=TCP DPT=443";
         assert!(parse_drop_log_line(line).is_none());
     }
 
@@ -496,7 +496,7 @@ mod tests {
         // If for some reason PROTO is absent, fall back to UNKNOWN rather
         // than dropping the event — the side-channel still wants to surface
         // the drop, just with a less specific reason.
-        let line = "crucible-egress-drop[crucible-RUN]: IN=tap-x OUT= DST=8.8.8.8 DPT=443";
+        let line = "bunsen-egress-drop[bunsen-RUN]: IN=tap-x OUT= DST=8.8.8.8 DPT=443";
         let ev = parse_drop_log_line(line).expect("must parse");
         assert_eq!(ev.l4_proto, "UNKNOWN");
         assert_eq!(ev.destination, "8.8.8.8:443");
@@ -507,7 +507,7 @@ mod tests {
         // IPv6 dst appears with colons; we store it verbatim with the port
         // suffix. Bracketed IPv6 host:port shape is the caller's problem —
         // for raw_tcp `destination` is informational, not a URL.
-        let line = "crucible-egress-drop[crucible-RUN]: IN=tap-x OUT= \
+        let line = "bunsen-egress-drop[bunsen-RUN]: IN=tap-x OUT= \
             SRC=fe80::1 DST=2001:db8::1 PROTO=TCP DPT=443";
         let ev = parse_drop_log_line(line).expect("must parse");
         assert_eq!(ev.destination, "2001:db8::1:443");
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn drop_event_reason_includes_l4_proto() {
         let ev = DropEvent {
-            table: "crucible-RUN".into(),
+            table: "bunsen-RUN".into(),
             destination: "8.8.8.8:443".into(),
             protocol: Protocol::RawTcp,
             l4_proto: "TCP".into(),

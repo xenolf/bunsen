@@ -3,8 +3,8 @@ requires = ["maturin>=1.5,<2"]
 build-backend = "maturin"
 
 [project]
-name = "crucible"
-description = "Python library for orchestrating coding agent Runs via crucible-core"
+name = "bunsen"
+description = "Python library for orchestrating coding agent Runs via bunsen-core"
 requires-python = ">=3.11"
 dynamic = ["version"]
 dependencies = []
@@ -17,8 +17,8 @@ dev = [
 
 [tool.maturin]
 bindings = "bin"
-manifest-path = "crucible-core/Cargo.toml"
-module-name = "crucible"
+manifest-path = "bunsen-core/Cargo.toml"
+module-name = "bunsen"
 python-source = "python"
 strip = true
 

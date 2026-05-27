@@ -11,4 +11,4 @@ We picked Firecracker over Bubblewrap as the v1 Sandbox Provider because the thr
 
 The Run primitive must be Sandbox Provider-agnostic from day one — provider-specific concerns (vsock, virtio-fs, TAP devices for Firecracker; bind mounts and netns for Bubblewrap) live behind the Sandbox Provider abstraction, not in the Run.
 
-Firecracker is Linux + KVM only. Mac developers run crucible inside a Linux VM. This is a known cost.
+Firecracker is Linux + KVM only. Mac developers run bunsen inside a Linux VM. This is a known cost.

@@ -3,6 +3,6 @@
 python/.venv/
 python/__pycache__/
 python/*.egg-info/
-python/crucible/bin/
+python/bunsen/bin/
 **/__pycache__/
 *.pyc

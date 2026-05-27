@@ -89,7 +89,7 @@ async fn worktree_add(
     git_ref: &str,
     run_id: &str,
 ) -> Result<(), WorkspaceMaterializerError> {
-    let branch = format!("crucible/run-{run_id}");
+    let branch = format!("bunsen/run-{run_id}");
 
     // git worktree add requires the target directory to not exist
     if workspace_path.exists() {
@@ -131,7 +131,7 @@ mod tests {
             .subsec_nanos();
         let pid = std::process::id();
         let dir = std::env::temp_dir()
-            .join(format!("crucible-test-{suffix}-{pid}-{nanos}"));
+            .join(format!("bunsen-test-{suffix}-{pid}-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -277,7 +277,7 @@ mod tests {
             .output()
             .unwrap();
         let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
-        assert_eq!(branch, "crucible/run-test-run-01");
+        assert_eq!(branch, "bunsen/run-test-run-01");
 
         // cleanup: remove worktree before deleting dirs
         Command::new("git")

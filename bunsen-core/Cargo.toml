@@ -1,10 +1,10 @@
 [package]
-name = "crucible-core"
+name = "bunsen-core"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "crucible-core"
+name = "bunsen-core"
 path = "src/main.rs"
 
 [dependencies]

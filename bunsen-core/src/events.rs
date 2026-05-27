@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const CRUCIBLE_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const BUNSEN_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Serialize)]
 pub struct Envelope {

@@ -1,6 +1,6 @@
 # Secrets passed as declared env vars, protected by redaction
 
-Secrets are declared explicitly per Run by the User Script and delivered into the Sandbox as env vars on the Coding Agent process. Crucible redacts known Secret values from the live event stream and the persistent transcript by byte-pattern replacement. The Sandbox itself sees the real Secret value — only the User Script's view is redacted.
+Secrets are declared explicitly per Run by the User Script and delivered into the Sandbox as env vars on the Coding Agent process. Bunsen redacts known Secret values from the live event stream and the persistent transcript by byte-pattern replacement. The Sandbox itself sees the real Secret value — only the User Script's view is redacted.
 
 ## Why not the Credential Broker (yet)
 
@@ -12,4 +12,4 @@ Redaction catches the common leak modes: agent prints env to stderr on crash, ag
 
 ## Consequences
 
-The User Script API never echoes Secret values back. Crucible never logs Secret values at any log level. Adapters that legitimately need to see a Secret value (e.g. to build an `Authorization` header) get it through a typed parameter that bypasses redaction at construction time, not by reading it back from the event stream.
+The User Script API never echoes Secret values back. Bunsen never logs Secret values at any log level. Adapters that legitimately need to see a Secret value (e.g. to build an `Authorization` header) get it through a typed parameter that bypasses redaction at construction time, not by reading it back from the event stream.

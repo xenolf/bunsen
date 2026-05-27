@@ -1,12 +1,12 @@
 //! Pure parser for `iptables -S` output (slice 10k).
 //!
 //! On Ubuntu (and most distros) `ufw` / `firewalld` enable an `iptables`
-//! `INPUT` chain whose default policy is `DROP`. Crucible's per-Run nftables
+//! `INPUT` chain whose default policy is `DROP`. Bunsen's per-Run nftables
 //! table uses `policy accept`, but iptables and our `inet` table both register
 //! on the netfilter `input` hook, and a packet has to survive *every* chain.
 //! A stock UFW host therefore silently drops the guest→proxy SYN before our
 //! allow rule ever runs — leaving the L7+L3 enforcer unusable until the user
-//! either opens the link-local range manually or asks crucible to manage the
+//! either opens the link-local range manually or asks bunsen to manage the
 //! host firewall for this Run.
 //!
 //! This module is platform-independent so the decision logic can be unit-

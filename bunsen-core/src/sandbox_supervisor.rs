@@ -1,7 +1,7 @@
 //! Sandbox-backed supervisor (Linux only).
 //!
 //! Reads agent output from vsock streams on a FirecrackerHandle, translates
-//! crucible-core stdin control commands into JSON messages on the control vsock,
+//! bunsen-core stdin control commands into JSON messages on the control vsock,
 //! and emits run_ended when both vsock streams reach EOF.
 
 use anyhow::Result;
@@ -68,7 +68,7 @@ pub async fn run(
     let drop_log_handle = egress.drop_log;
     let dns_handle = egress.dns_listener;
 
-    // Control commands from crucible-core's stdin.
+    // Control commands from bunsen-core's stdin.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCmd>(16);
     let stdin_cmd_tx = cmd_tx.clone();
     tokio::spawn(async move {

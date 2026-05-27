@@ -1,8 +1,8 @@
-//! `crucible-core sandbox-smoke-test` — boots a Firecracker microVM with a
+//! `bunsen-core sandbox-smoke-test` — boots a Firecracker microVM with a
 //! hello-world agent and verifies the full vsock plumbing end-to-end.
 //!
 //! Usage:
-//!   crucible-core sandbox-smoke-test \
+//!   bunsen-core sandbox-smoke-test \
 //!     --kernel  /path/to/vmlinux \
 //!     --rootfs  /path/to/rootfs.ext4 \
 //!     [--firecracker /path/to/firecracker]
@@ -39,7 +39,7 @@ struct Args {
 pub async fn run(raw_args: &[String]) -> Result<()> {
     let args = parse_args(raw_args)?;
 
-    println!("crucible sandbox-smoke-test");
+    println!("bunsen sandbox-smoke-test");
     println!("  kernel:      {}", args.kernel.display());
     println!("  rootfs:      {}", args.rootfs.display());
     println!("  firecracker: {}", args.firecracker.display());
@@ -59,7 +59,7 @@ pub async fn run(raw_args: &[String]) -> Result<()> {
     let config = SandboxConfig {
         kernel_path: args.kernel,
         rootfs_path: args.rootfs,
-        workspace_host_path: std::env::temp_dir().join("crucible-smoke-workspace"),
+        workspace_host_path: std::env::temp_dir().join("bunsen-smoke-workspace"),
         spec_json: SMOKE_SPEC_JSON.to_string(),
         vcpus: 1,
         mem_mib: 512,

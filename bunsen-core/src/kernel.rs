@@ -2,8 +2,8 @@
 //!
 //! `ensure_kernel().await` returns the path to a verified vmlinux on disk.
 //! Resolution order:
-//!   1. `CRUCIBLE_KERNEL` env var → returned as-is, no checks.
-//!   2. `$XDG_CACHE_HOME/crucible/kernel/vmlinux-<VERSION>` if SHA-256 matches.
+//!   1. `BUNSEN_KERNEL` env var → returned as-is, no checks.
+//!   2. `$XDG_CACHE_HOME/bunsen/kernel/vmlinux-<VERSION>` if SHA-256 matches.
 //!   3. Download from the compiled-in URL, SHA-verify, atomic-rename into cache.
 //
 // Network/async code only runs on Linux where Firecracker is available; suppress
@@ -54,7 +54,7 @@ pub fn cache_dir() -> PathBuf {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             PathBuf::from(home).join(".cache")
         });
-    base.join("crucible").join("kernel")
+    base.join("bunsen").join("kernel")
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -64,10 +64,10 @@ pub async fn ensure_kernel() -> Result<PathBuf> {
     if KERNEL_URL.is_empty() {
         bail!(
             "no embedded kernel for this target architecture (only x86_64 and aarch64 are \
-             supported); set CRUCIBLE_KERNEL=/path/to/vmlinux to bypass"
+             supported); set BUNSEN_KERNEL=/path/to/vmlinux to bypass"
         );
     }
-    let env_override = std::env::var("CRUCIBLE_KERNEL").ok();
+    let env_override = std::env::var("BUNSEN_KERNEL").ok();
     ensure_kernel_with(
         env_override.as_deref(),
         &cache_dir(),
@@ -80,7 +80,7 @@ pub async fn ensure_kernel() -> Result<PathBuf> {
 
 /// Implementation core, parameterised for tests.
 ///
-/// `env_override` is treated identically to a runtime `CRUCIBLE_KERNEL` lookup
+/// `env_override` is treated identically to a runtime `BUNSEN_KERNEL` lookup
 /// but is passed in so tests can exercise it without mutating process env vars.
 async fn ensure_kernel_with(
     env_override: Option<&str>,
@@ -229,12 +229,12 @@ mod tests {
         compute_sha256(bytes)
     }
 
-    // Cycle 1: CRUCIBLE_KERNEL override returns the path verbatim and makes
+    // Cycle 1: BUNSEN_KERNEL override returns the path verbatim and makes
     // no network request, no cache check.
     #[tokio::test]
     async fn env_override_returns_path_unverified_and_skips_network() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("crucible/kernel");
+        let cache = tmp.path().join("bunsen/kernel");
         // Server is set up but the override should make us bypass it.
         let (addr, hits, h) = spawn_mock("500 Internal Server Error", b"never read".to_vec()).await;
 
@@ -260,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn empty_env_override_does_not_short_circuit() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("crucible/kernel");
+        let cache = tmp.path().join("bunsen/kernel");
         let body = b"vmlinux-payload".to_vec();
         let want = sha_hex(&body);
         let (addr, hits, h) = spawn_mock("200 OK", body).await;
@@ -284,7 +284,7 @@ mod tests {
     #[tokio::test]
     async fn cache_hit_skips_network() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("crucible/kernel");
+        let cache = tmp.path().join("bunsen/kernel");
         std::fs::create_dir_all(&cache).unwrap();
         let payload = b"already cached payload".to_vec();
         let dest = cache.join("vmlinux-9.9.9");
@@ -312,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn cache_miss_downloads_and_writes_atomically() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("crucible/kernel");
+        let cache = tmp.path().join("bunsen/kernel");
         let body = b"fresh kernel bytes".to_vec();
         let want = sha_hex(&body);
         let (addr, hits, h) = spawn_mock("200 OK", body.clone()).await;
@@ -341,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn cache_miss_bad_sha_removes_tmp_and_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("crucible/kernel");
+        let cache = tmp.path().join("bunsen/kernel");
         let body = b"tampered bytes".to_vec();
         let actual = sha_hex(&body);
         let expected = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -372,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn corrupt_cache_is_replaced_by_fresh_download() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("crucible/kernel");
+        let cache = tmp.path().join("bunsen/kernel");
         std::fs::create_dir_all(&cache).unwrap();
         // Pre-populate cache with wrong contents.
         let dest = cache.join("vmlinux-9.9.9");
@@ -403,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn http_500_returns_error_naming_the_url() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("crucible/kernel");
+        let cache = tmp.path().join("bunsen/kernel");
         let (addr, _hits, h) = spawn_mock("500 Internal Server Error", b"".to_vec()).await;
 
         let url = format!("http://{addr}/vmlinux");
@@ -428,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn connect_failure_returns_error_naming_the_url() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("crucible/kernel");
+        let cache = tmp.path().join("bunsen/kernel");
         // Bind + drop a listener to get a port that's almost certainly free
         // immediately after.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -459,8 +459,8 @@ mod tests {
         let p = cache_dir();
         let s = p.to_string_lossy();
         assert!(
-            s.ends_with("crucible/kernel"),
-            "cache_dir should end in crucible/kernel, got {s}"
+            s.ends_with("bunsen/kernel"),
+            "cache_dir should end in bunsen/kernel, got {s}"
         );
     }
 

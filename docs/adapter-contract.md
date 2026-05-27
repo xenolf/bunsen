@@ -1,6 +1,6 @@
 # Adapter Contract
 
-An Adapter lets crucible launch a Coding Agent and turn its output into a structured event stream. This document specifies what an Adapter author must implement.
+An Adapter lets bunsen launch a Coding Agent and turn its output into a structured event stream. This document specifies what an Adapter author must implement.
 
 See ADR-0004 (adapter contract with black-box fallback) and ADR-0007 (adapter runs host-side) and ADR-0008 (per-adapter OCI rootfs).
 
@@ -22,8 +22,8 @@ The Adapter is invoked as a subprocess. `cmd` in the RunSpec is the full argv. F
 
 The subprocess runs with:
 - `cwd` set to the materialised Workspace path
-- stdout/stderr piped to crucible-core for parsing
-- stdin closed (control commands arrive on crucible-core's own stdin)
+- stdout/stderr piped to bunsen-core for parsing
+- stdin closed (control commands arrive on bunsen-core's own stdin)
 
 ## Output parsing
 
@@ -52,7 +52,7 @@ When `adapter` is `"black-box"` or unknown, all stdout/stderr lines become `outp
 
 ## Native history preservation
 
-After the agent process exits, crucible copies the agent's native history directory from inside the Workspace to `${run_dir}/agent-history/`.
+After the agent process exits, bunsen copies the agent's native history directory from inside the Workspace to `${run_dir}/agent-history/`.
 
 | Adapter | Native history path (inside Workspace) |
 |---|---|
@@ -72,7 +72,7 @@ The effective Egress Policy is the case-insensitive union of the adapter's decla
 | `claude-code` | `api.anthropic.com` |
 | `aider` | derived from the `--model X` / `--model=X` value in `cmd`: `claude-*` / `anthropic/*` → `api.anthropic.com`; `gpt-*` / `o1*` / `o3*` / `openai/*` → `api.openai.com`; `gemini-*` → `generativelanguage.googleapis.com`; otherwise nothing declared (user script must supply the allowlist) |
 
-Composition is implemented by `RunSpec::effective_egress_policy()` (see `crucible-core/src/egress.rs`).
+Composition is implemented by `RunSpec::effective_egress_policy()` (see `bunsen-core/src/egress.rs`).
 
 When a Run attempts a destination outside the policy, the enforcer emits an `egress_denied` event:
 
@@ -94,32 +94,32 @@ Per ADR-0003 these events do *not* terminate the Run; the agent receives a norma
 
 ## OCI image
 
-Each Adapter is paired with a digest-pinned OCI image that provides the agent runtime environment. The image is pulled lazily on first use (`oci_cache::resolve_rootfs`), flattened to an ext4 file, and cached at `${XDG_CACHE_HOME:-~/.cache}/crucible/rootfs/<digest>.ext4`. One shared `vmlinux` (fetched by `kernel/fetch-vmlinux.sh`) boots every image — Adapters do not ship kernels.
+Each Adapter is paired with a digest-pinned OCI image that provides the agent runtime environment. The image is pulled lazily on first use (`oci_cache::resolve_rootfs`), flattened to an ext4 file, and cached at `${XDG_CACHE_HOME:-~/.cache}/bunsen/rootfs/<digest>.ext4`. One shared `vmlinux` (fetched by `kernel/fetch-vmlinux.sh`) boots every image — Adapters do not ship kernels.
 
 ### What the image must contain
 
 - The agent binary and all of its runtime dependencies (interpreter, libraries, default config).
-- `/sbin/crucible-init` — the in-guest PID 1 built from `crucible-init/`. The host wires it in as the kernel's `init=`. It mounts `/proc`, `/sys`, `/run`, `/tmp`, brings up `eth0` from the spec's `network` block, installs `/etc/resolv.conf` over a bind mount, then `execve`s the agent.
-- `/etc/resolv.conf` must exist as a regular file (even empty). Crucible bind-mounts a per-Run file over it; the rootfs is otherwise read-only, so the target inode must be pre-created. Alpine bases ship without it — see `adapters/_smoke-test/Dockerfile` for the placeholder pattern.
+- `/sbin/bunsen-init` — the in-guest PID 1 built from `bunsen-init/`. The host wires it in as the kernel's `init=`. It mounts `/proc`, `/sys`, `/run`, `/tmp`, brings up `eth0` from the spec's `network` block, installs `/etc/resolv.conf` over a bind mount, then `execve`s the agent.
+- `/etc/resolv.conf` must exist as a regular file (even empty). Bunsen bind-mounts a per-Run file over it; the rootfs is otherwise read-only, so the target inode must be pre-created. Alpine bases ship without it — see `adapters/_smoke-test/Dockerfile` for the placeholder pattern.
 - A standard `$PATH` containing `sh`, `wget` or `curl`, and whatever the agent shells out to. (BusyBox is fine.)
 
 ### Build and publish
 
-Adapter images are built from a small Dockerfile in `adapters/<name>/`. The `adapters/_smoke-test/` and `adapters/_alpine-test/` directories are working references — Alpine base, the musl-built `crucible-init` copied into `/sbin/`, `apk add` for the agent's runtime, the `resolv.conf` placeholder.
+Adapter images are built from a small Dockerfile in `adapters/<name>/`. The `adapters/_smoke-test/` and `adapters/_alpine-test/` directories are working references — Alpine base, the musl-built `bunsen-init` copied into `/sbin/`, `apk add` for the agent's runtime, the `resolv.conf` placeholder.
 
 Reference invocation:
 
 ```sh
-cargo build --release -p crucible-init --target x86_64-unknown-linux-musl
-docker buildx build --platform linux/amd64 --tag ghcr.io/<org>/crucible-adapter-<name>:dev adapters/<name>
-docker push ghcr.io/<org>/crucible-adapter-<name>:dev
+cargo build --release -p bunsen-init --target x86_64-unknown-linux-musl
+docker buildx build --platform linux/amd64 --tag ghcr.io/<org>/bunsen-adapter-<name>:dev adapters/<name>
+docker push ghcr.io/<org>/bunsen-adapter-<name>:dev
 # Take the digest reported by `docker push` and use it as the pinned ref.
 ```
 
 The Adapter declaration **must** reference the image by digest, never by tag:
 
 ```text
-ghcr.io/<org>/crucible-adapter-<name>@sha256:<64 hex chars>
+ghcr.io/<org>/bunsen-adapter-<name>@sha256:<64 hex chars>
 ```
 
 `oci_cache::OciImageRef::parse` enforces this — tags are rejected. Rebuild and re-pin the digest whenever the agent version or its dependencies change.
@@ -131,11 +131,11 @@ Both `--rootfs /path/to/custom.ext4` (host CLI) and a `oci-image` field on the R
 ## Implementing a custom Adapter
 
 1. Choose an adapter name (lowercase, hyphen-separated).
-2. Implement a line parser in `crucible-core/src/<name>_adapter.rs` following the `ClaudeCodeParser` or `AiderParser` pattern. Aider's is the closer template if your agent emits plain text rather than a structured stream.
+2. Implement a line parser in `bunsen-core/src/<name>_adapter.rs` following the `ClaudeCodeParser` or `AiderParser` pattern. Aider's is the closer template if your agent emits plain text rather than a structured stream.
 3. Add an `AdapterParser` variant in `supervisor.rs` and dispatch on the `spec.adapter` string at the top of `supervisor::run`.
 4. Wire native-history preservation into `supervisor::copy_agent_history` — an explicit allowlist of paths is preferred over a glob.
 5. Declare a `pub const EGRESS_ENDPOINTS: &[&str]`. If endpoints are model-derived, expose an `egress_endpoints_for_model(&str) -> &[&str]` helper and add the dispatch branch in `RunSpec::effective_egress_policy` (`run_spec.rs`).
 6. Build and publish an OCI image as above; record the digest-pinned reference.
-7. Capture an output fixture under `crucible-core/src/testdata/<name>_fixture.txt` and assert the expected event sequence in unit tests.
+7. Capture an output fixture under `bunsen-core/src/testdata/<name>_fixture.txt` and assert the expected event sequence in unit tests.
 
-See `crucible-core/src/claude_code_adapter.rs` and `crucible-core/src/aider_adapter.rs` for complete reference implementations.
+See `bunsen-core/src/claude_code_adapter.rs` and `bunsen-core/src/aider_adapter.rs` for complete reference implementations.
