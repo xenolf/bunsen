@@ -157,10 +157,12 @@ async fn main() {
     // that an aborted probe leaves zero side effects on the host. Only runs
     // on Linux when we'll enter sandbox mode (kernel resolved); macOS and
     // host-subprocess paths don't share a kernel with the L7 proxy and have
-    // nothing to probe.
+    // nothing to probe. Shared with `Session::run_with_backend` via
+    // `firewall::enforce_host_firewall_policy` so both surfaces emit the
+    // identical message at the identical timing (slice 13).
     #[cfg(target_os = "linux")]
     if resolved_kernel.is_some() {
-        if let Err(msg) = check_host_firewall(cli.manage_firewall).await {
+        if let Err(msg) = firewall::enforce_host_firewall_policy(cli.manage_firewall).await {
             eprintln!("{msg}");
             std::process::exit(1);
         }
@@ -311,52 +313,6 @@ async fn run_with_backend(
     let _ = (kernel, rootfs, firecracker_bin, manage_firewall);
 
     supervisor::run(spec, run_id, enc, workspace_path, agent_history_path).await
-}
-
-/// Probe the host iptables INPUT chain and decide whether to proceed.
-///
-/// On Linux + sandbox mode, called BEFORE any side-effecting host work
-/// (run_dir creation, workspace materialization, encoder open). The
-/// acceptance criterion is "produces no run_started events on Blocked":
-/// running the probe at the top of main() makes that automatic.
-///
-/// Returns:
-/// - `Ok(())` — proceed. Either iptables is absent, the INPUT chain is
-///   ACCEPT-by-default, a covering rule already exists, or the user passed
-///   `--manage-firewall` and authorized us to install one ourselves later.
-/// - `Err(msg)` — the caller should print `msg` to stderr and exit non-zero.
-#[cfg(target_os = "linux")]
-async fn check_host_firewall(manage_firewall: bool) -> Result<(), String> {
-    use firewall_check::{parse_iptables_save, Decision};
-
-    let probe = match firewall::probe_iptables().await {
-        Ok(Some(stdout)) => parse_iptables_save(&stdout),
-        Ok(None) => Decision::Permissive,
-        Err(e) => {
-            // Probe failed but iptables exists. Most likely cause is running
-            // unprivileged. We can't see the rules and we couldn't add one
-            // either, so warn and treat as permissive — the L3 nft path
-            // is the actual security boundary, and if the host firewall is
-            // dropping us the user will see the timeout symptom and re-run
-            // with --manage-firewall.
-            eprintln!(
-                "[firewall] WARNING: failed to probe iptables: {e:#} \
-                 — proceeding without firewall management"
-            );
-            Decision::Permissive
-        }
-    };
-
-    if matches!(probe, Decision::Blocked) && !manage_firewall {
-        return Err(
-            "[bunsen-core] ERROR: host iptables INPUT policy is DROP and no allow rule covers \
-             169.254.0.0/16, so the sandbox's L7 proxy will be unreachable from the guest. \
-             Re-run with --manage-firewall (Python: manage_firewall=True) to let bunsen add \
-             a per-TAP allow rule for the lifetime of this Run, or open the link-local range \
-             manually: sudo ufw allow from 169.254.0.0/16".to_string()
-        );
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]

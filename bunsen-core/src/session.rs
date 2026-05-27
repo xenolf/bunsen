@@ -133,6 +133,18 @@ pub enum SessionError {
     /// supported set is Linux + KVM (see ADR-0001). The host-subprocess
     /// backend (default `RunBackend`) is still reachable on every platform.
     SandboxUnsupportedOnPlatform,
+    /// The host's iptables INPUT chain is DROP-by-default and no covering
+    /// allow rule for `169.254.0.0/16` exists, and the caller did not opt
+    /// in via `RunBackend.manage_firewall`. The Run would otherwise boot
+    /// fine, then time out 30 s into the agent step when the L7 proxy
+    /// couldn't be reached from the guest. Returned upfront — before any
+    /// run-dir / transcript / Pool side-effects — so the failure mode
+    /// matches the legacy CLI (slice 13).
+    ///
+    /// `message` is the human-readable explanation (the byte-for-byte
+    /// [`crate::firewall_check::BLOCKED_MESSAGE`]); Python callers can
+    /// route on the variant and surface `message` to the user.
+    HostFirewallBlocked { message: String },
 }
 
 impl std::fmt::Display for SessionError {
@@ -157,6 +169,7 @@ impl std::fmt::Display for SessionError {
                 "sandbox backend (Firecracker) requires Linux + KVM; use the default \
                  RunBackend to keep the host-subprocess path"
             ),
+            Self::HostFirewallBlocked { message } => write!(f, "{message}"),
         }
     }
 }
@@ -611,6 +624,24 @@ impl Session {
         } else {
             None
         };
+
+        // Host firewall probe (slice 13): the legacy CLI refuses upfront
+        // on a DROP-by-default INPUT chain without `--manage-firewall`,
+        // and the Session path must do the same so callers don't see a
+        // 30-second timeout deep into the agent step. Runs only when the
+        // sandbox is intended (host-subprocess path doesn't share a
+        // kernel with the L7 proxy and has nothing to probe), AFTER
+        // input resolution (so a missing kernel/rootfs — the more common
+        // mistake — surfaces first), and BEFORE `accept_new_run` so the
+        // Session state machine is untouched on Blocked.
+        #[cfg(target_os = "linux")]
+        if sandbox_intended {
+            if let Err(message) =
+                crate::firewall::enforce_host_firewall_policy(backend.manage_firewall).await
+            {
+                return Err(SessionError::HostFirewallBlocked { message });
+            }
+        }
 
         // State check: open | failed_to_close accept new Runs; everything else
         // refuses. The state does not change as a result of the Run itself.
@@ -2783,6 +2814,139 @@ mod tests {
             matches!(err, SessionError::SandboxUnsupportedOnPlatform),
             "expected SandboxUnsupportedOnPlatform from spec.oci_image alone, got {err:?}"
         );
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Slice 13: a DROP-by-default INPUT chain with no covering rule and
+    /// `manage_firewall=false` must fail upfront with the typed
+    /// `HostFirewallBlocked` error, BEFORE the run dir / transcript / Pool
+    /// side-effects land. The legacy CLI already does this in main.rs; this
+    /// test pins the parity for `Session::run_with_backend`.
+    ///
+    /// Linux-only because the iptables probe is Linux-only and the env-var
+    /// test hook lives in `crate::firewall`. The hook + the
+    /// `TEST_IPTABLES_SAVE_LOCK` mutex serialize concurrent tests touching
+    /// the global env var.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_with_backend_returns_host_firewall_blocked_on_drop_policy() {
+        const UBUNTU_UFW_DROP: &str = "\
+-P INPUT DROP
+-P FORWARD DROP
+-P OUTPUT ACCEPT
+-A INPUT -i lo -j ACCEPT
+";
+
+        let host = make_host_repo("sr-fw-blocked");
+        let root = make_temp_dir("sr-fw-blocked-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+        let session_dir = s.path().to_path_buf();
+
+        // Real-looking kernel/rootfs paths so `resolve_sandbox_inputs`
+        // succeeds (it only checks for `Some`, not whether the files boot).
+        // The probe is what we expect to gate the Run.
+        let kernel = root.join("fake-vmlinux");
+        let rootfs = root.join("fake-rootfs.ext4");
+        std::fs::write(&kernel, b"not-a-kernel").unwrap();
+        std::fs::write(&rootfs, b"not-a-rootfs").unwrap();
+        let backend = RunBackend {
+            kernel: Some(kernel),
+            rootfs: Some(rootfs),
+            firecracker_bin: None,
+            manage_firewall: false,
+        };
+        let spec = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", None);
+
+        // Serialise around the global env var.
+        let _guard = crate::firewall::TEST_IPTABLES_SAVE_LOCK.lock().unwrap();
+        std::env::set_var(crate::firewall::TEST_IPTABLES_SAVE_ENV, UBUNTU_UFW_DROP);
+        let err = s.run_with_backend(spec, backend).await.unwrap_err();
+        std::env::remove_var(crate::firewall::TEST_IPTABLES_SAVE_ENV);
+        drop(_guard);
+
+        let message = match &err {
+            SessionError::HostFirewallBlocked { message } => message.clone(),
+            other => panic!("expected HostFirewallBlocked, got {other:?}"),
+        };
+        assert_eq!(message, crate::firewall_check::BLOCKED_MESSAGE);
+
+        // Probe failure must leave the Session bit-identical on disk: no run
+        // dir, no transient workspace. The state machine was never advanced.
+        let runs_dir = session_dir.join("runs");
+        if runs_dir.exists() {
+            let leftover: Vec<_> = std::fs::read_dir(&runs_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(leftover.is_empty(), "no run dir leftover on HostFirewallBlocked");
+        }
+        let transient = root.join(".workspace");
+        if transient.exists() {
+            let leftover: Vec<_> = std::fs::read_dir(&transient)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(leftover.is_empty(), "no transient workspace leftover");
+        }
+
+        std::fs::remove_dir_all(&host).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Slice 13: opting into `manage_firewall=true` makes the same Blocked
+    /// dump pass the probe — the per-TAP allow rule is installed later by
+    /// `sandbox_run::run`. The Run then fails for a *different* reason
+    /// (the fake kernel/rootfs can't boot Firecracker), proving the probe
+    /// no longer short-circuits.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_with_backend_manage_firewall_true_passes_probe_on_drop_policy() {
+        const UBUNTU_UFW_DROP: &str = "\
+-P INPUT DROP
+-P FORWARD DROP
+-P OUTPUT ACCEPT
+-A INPUT -i lo -j ACCEPT
+";
+
+        let host = make_host_repo("sr-fw-mgmt");
+        let root = make_temp_dir("sr-fw-mgmt-root");
+        let mut s = Session::open_in(&root, &host, vec!["main".into()], None)
+            .await
+            .unwrap();
+
+        let kernel = root.join("fake-vmlinux");
+        let rootfs = root.join("fake-rootfs.ext4");
+        std::fs::write(&kernel, b"not-a-kernel").unwrap();
+        std::fs::write(&rootfs, b"not-a-rootfs").unwrap();
+        let backend = RunBackend {
+            kernel: Some(kernel),
+            rootfs: Some(rootfs),
+            firecracker_bin: None,
+            manage_firewall: true,
+        };
+        let spec = run_spec_with_cmd(AGENT_COMMIT_CMD, "host/main", None);
+
+        let _guard = crate::firewall::TEST_IPTABLES_SAVE_LOCK.lock().unwrap();
+        std::env::set_var(crate::firewall::TEST_IPTABLES_SAVE_ENV, UBUNTU_UFW_DROP);
+        let result = s.run_with_backend(spec, backend).await;
+        std::env::remove_var(crate::firewall::TEST_IPTABLES_SAVE_ENV);
+        drop(_guard);
+
+        // Probe must NOT short-circuit when manage_firewall is true. The Run
+        // can still fail downstream — fake kernel can't boot Firecracker —
+        // but the *kind* of error must be anything other than
+        // HostFirewallBlocked.
+        match result {
+            Ok(_) => {} // unlikely with a bogus kernel, but acceptable
+            Err(SessionError::HostFirewallBlocked { .. }) => {
+                panic!("manage_firewall=true must bypass the host-firewall probe")
+            }
+            Err(_) => {} // any other failure (sandbox boot, etc.) is fine
+        }
 
         std::fs::remove_dir_all(&host).ok();
         std::fs::remove_dir_all(&root).ok();

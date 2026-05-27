@@ -17,6 +17,60 @@
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 
+/// Probe `iptables -S` and turn the result, together with the User Script's
+/// `manage_firewall` opt-in, into a single Yes/No-with-message answer that
+/// both the legacy CLI (`bunsen-core/src/main.rs`) and the Session path
+/// ([`crate::session::Session::run_with_backend`]) can share.
+///
+/// Composes [`probe_iptables`] with [`crate::firewall_check::enforce_decision`]:
+///
+/// - `iptables` absent → Permissive → `Ok(())`.
+/// - `iptables` present, probe failed (e.g. unprivileged) → WARN on stderr,
+///   treat as Permissive. Matches the pre-Session CLI fallback so dev boxes
+///   running tests as non-root don't get forced onto `--manage-firewall`.
+/// - INPUT policy ACCEPT, or covering rule for 169.254.0.0/16 present →
+///   Permissive → `Ok(())`.
+/// - INPUT policy DROP, no covering rule, `manage_firewall == false` → `Err`
+///   with the byte-for-byte [`crate::firewall_check::BLOCKED_MESSAGE`].
+/// - INPUT policy DROP, no covering rule, `manage_firewall == true` → `Ok(())`.
+///   The per-TAP allow rule is installed later inside `sandbox_run::run`.
+pub async fn enforce_host_firewall_policy(manage_firewall: bool) -> Result<(), String> {
+    use crate::firewall_check::{enforce_decision, parse_iptables_save, Decision};
+
+    // Test-only injection point: when `BUNSEN_TEST_IPTABLES_SAVE` is set,
+    // skip the real iptables shell-out and feed the synthetic dump straight
+    // through the parser. Lets the Session-level test exercise the wiring
+    // from `run_with_backend` → `enforce_host_firewall_policy` →
+    // `SessionError::HostFirewallBlocked` without needing a Linux box with a
+    // DROP policy on the INPUT chain. Compiled out of release builds.
+    #[cfg(test)]
+    if let Ok(s) = std::env::var(TEST_IPTABLES_SAVE_ENV) {
+        return enforce_decision(parse_iptables_save(&s), manage_firewall);
+    }
+
+    let decision = match probe_iptables().await {
+        Ok(Some(stdout)) => parse_iptables_save(&stdout),
+        Ok(None) => Decision::Permissive,
+        Err(e) => {
+            eprintln!(
+                "[firewall] WARNING: failed to probe iptables: {e:#} \
+                 — proceeding without firewall management"
+            );
+            Decision::Permissive
+        }
+    };
+    enforce_decision(decision, manage_firewall)
+}
+
+#[cfg(test)]
+pub(crate) const TEST_IPTABLES_SAVE_ENV: &str = "BUNSEN_TEST_IPTABLES_SAVE";
+
+/// Serialise tests that mutate `TEST_IPTABLES_SAVE_ENV` — env vars are
+/// process-global and `cargo test` runs tests in parallel. Any test that
+/// sets the var must hold this lock for the full set/run/unset window.
+#[cfg(test)]
+pub(crate) static TEST_IPTABLES_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Run `iptables -S` and capture stdout.
 ///
 /// Returns:

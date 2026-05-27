@@ -20,6 +20,19 @@
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+/// Stderr/error message printed verbatim by the legacy CLI and the
+/// Session path when the host iptables INPUT chain is DROP-by-default
+/// and the user has not opted in via `--manage-firewall` /
+/// `manage_firewall=True`. Kept as a single constant so both surfaces
+/// emit the byte-for-byte identical text — Python callers, integration
+/// tests, and users wiring up `grep` on the CLI all see one string.
+pub const BLOCKED_MESSAGE: &str =
+    "[bunsen-core] ERROR: host iptables INPUT policy is DROP and no allow rule covers \
+     169.254.0.0/16, so the sandbox's L7 proxy will be unreachable from the guest. \
+     Re-run with --manage-firewall (Python: manage_firewall=True) to let bunsen add \
+     a per-TAP allow rule for the lifetime of this Run, or open the link-local range \
+     manually: sudo ufw allow from 169.254.0.0/16";
+
 /// Whether the host's iptables INPUT chain would drop a packet arriving from
 /// the per-Run /30 in `169.254.0.0/16`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +145,26 @@ fn subnet_covers_link_local(subnet: &str) -> bool {
     const LINK_LOCAL: u32 = 0xa9fe_0000;
     let mask = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
     (ip & mask) == (LINK_LOCAL & mask)
+}
+
+/// Combine a parsed [`Decision`] with the user's `manage_firewall` opt-in into
+/// a single Yes/No-with-message answer. Pure (no I/O) so the policy logic can
+/// be unit-tested on every platform — the iptables shell-out in
+/// [`crate::firewall::enforce_host_firewall_policy`] composes this with a real
+/// `iptables -S` probe.
+///
+/// Returns:
+/// - `Ok(())` on [`Decision::Permissive`] (regardless of `manage_firewall`).
+/// - `Ok(())` on [`Decision::Blocked`] when `manage_firewall == true` — the
+///   per-TAP allow rule is installed later by `sandbox_run::run`.
+/// - `Err(`[`BLOCKED_MESSAGE`]`)` on [`Decision::Blocked`] + `manage_firewall ==
+///   false` — the caller is expected to print this verbatim and refuse the Run
+///   before any disk side-effects (run dir, transcript, Pool refs).
+pub fn enforce_decision(decision: Decision, manage_firewall: bool) -> Result<(), String> {
+    if matches!(decision, Decision::Blocked) && !manage_firewall {
+        return Err(BLOCKED_MESSAGE.to_string());
+    }
+    Ok(())
 }
 
 fn parse_ipv4(s: &str) -> Option<u32> {
@@ -298,6 +331,40 @@ mod tests {
         assert_eq!(parse_ipv4("169.254.0.0.0"), None);
         assert_eq!(parse_ipv4("169.254.0.256"), None);
         assert_eq!(parse_ipv4(""), None);
+    }
+
+    #[test]
+    fn enforce_decision_permissive_is_always_ok() {
+        assert!(enforce_decision(Decision::Permissive, false).is_ok());
+        assert!(enforce_decision(Decision::Permissive, true).is_ok());
+    }
+
+    #[test]
+    fn enforce_decision_blocked_with_manage_firewall_is_ok() {
+        // The per-TAP allow rule will be installed later by sandbox_run::run.
+        assert!(enforce_decision(Decision::Blocked, true).is_ok());
+    }
+
+    #[test]
+    fn enforce_decision_blocked_without_manage_firewall_returns_blocked_message() {
+        let err = enforce_decision(Decision::Blocked, false).unwrap_err();
+        assert_eq!(err, BLOCKED_MESSAGE);
+        // Sanity-check the wording the caller will print: it must name the
+        // link-local range and the opt-in flags so the user can self-serve.
+        assert!(err.contains("169.254.0.0/16"));
+        assert!(err.contains("--manage-firewall"));
+        assert!(err.contains("manage_firewall=True"));
+    }
+
+    #[test]
+    fn enforce_decision_routes_ufw_drop_dump_to_blocked() {
+        // End-to-end of the pure path: real iptables-save text → parser →
+        // policy decision. The Session and CLI surfaces compose these two
+        // calls, so pinning them together here guards the routing.
+        let decision = parse_iptables_save(UBUNTU_UFW_DROP);
+        assert_eq!(decision, Decision::Blocked);
+        assert!(enforce_decision(decision, false).is_err());
+        assert!(enforce_decision(decision, true).is_ok());
     }
 
     #[test]
