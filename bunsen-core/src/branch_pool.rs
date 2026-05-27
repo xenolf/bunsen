@@ -122,15 +122,16 @@ impl BranchPool {
         Ok(())
     }
 
-    /// Write `runs/<run_id>` (always) and `<output_branch>` (if supplied)
-    /// into the Pool, both pointing at `source_repo`'s HEAD. Refuses to
-    /// overwrite an existing ref. Rejects `output_branch` in reserved
-    /// `host/*` or `runs/*` namespaces.
-    pub async fn accept_run_output(
+    /// Validate that `runs/<run_id>` does not already exist in the Pool and
+    /// that the optional `output_branch` is a legal user-named ref (not in
+    /// `host/*` or `runs/*`) and not already taken. No I/O on `source_repo`.
+    ///
+    /// Shared between [`Self::accept_run_output`] and the sandbox-fetch
+    /// module so the rules live in one place.
+    pub async fn validate_run_output_targets(
         &self,
         run_id: &str,
         output_branch: Option<&str>,
-        source_repo: &Path,
     ) -> Result<(), BranchPoolError> {
         if let Some(name) = output_branch {
             validate_user_ref_name(name)?;
@@ -142,6 +143,26 @@ impl BranchPool {
         if branch_exists(&self.path, &audit).await? {
             return Err(BranchPoolError::RefAlreadyExists { name: audit });
         }
+        Ok(())
+    }
+
+    /// Write `runs/<run_id>` (always) and `<output_branch>` (if supplied)
+    /// into the Pool, both pointing at `source_repo`'s HEAD. Refuses to
+    /// overwrite an existing ref. Rejects `output_branch` in reserved
+    /// `host/*` or `runs/*` namespaces.
+    ///
+    /// Note: this verb does **not** apply the ADR-0011 hardening flag set.
+    /// For fetches from an adversarial Sandbox, use
+    /// [`crate::sandbox_fetch::sandbox_fetch_from_ext4`] (or its directory
+    /// equivalent), which wraps this validator plus the hardened fetch.
+    pub async fn accept_run_output(
+        &self,
+        run_id: &str,
+        output_branch: Option<&str>,
+        source_repo: &Path,
+    ) -> Result<(), BranchPoolError> {
+        self.validate_run_output_targets(run_id, output_branch).await?;
+        let audit = format!("runs/{run_id}");
         let mut args: Vec<String> = vec![
             "fetch".into(),
             "--no-tags".into(),

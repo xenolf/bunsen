@@ -14,6 +14,7 @@ mod redactor;
 mod run_dir;
 mod run_spec;
 mod sandbox;
+mod sandbox_fetch;
 mod sandbox_net;
 mod sandbox_nft;
 mod session;
