@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, Union
+from typing import Mapping, Optional, Sequence, Union
 
 from ._core_path import find_core_bin
 from ._run import _SessionRunContext
@@ -51,17 +51,68 @@ def _strategy_to_json(s: BranchingStrategy) -> dict:
     raise TypeError(f"unknown BranchingStrategy variant: {type(s).__name__}")
 
 
-# ── RunSpec helper ────────────────────────────────────────────────────────
+# ── RunSpec ───────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    """Typed description of a Run, mirroring bunsen-core's `RunSpec`.
+
+    `adapter` and `cmd` are required; every other field carries the same
+    default as the Rust struct. Pass an instance to `Session.run` /
+    `Session.run_sync`, or a plain dict in the kebab-case wire shape as an
+    escape hatch. See [ADR-0010] and the Rust `RunSpec` for field semantics.
+
+    `branching_strategy` takes a typed `NoneStrategy` / `PoolClone`.
+    `output_branch` is validated server-side against legal git branch names
+    and the reserved `host/*` and `runs/*` namespaces.
+    """
+    adapter: str
+    cmd: Sequence[str]
+    env: Mapping[str, str] = field(default_factory=dict)
+    secrets: Mapping[str, str] = field(default_factory=dict)
+    branching_strategy: BranchingStrategy = field(default_factory=NoneStrategy)
+    output_branch: Optional[str] = None
+    stop_grace_seconds: int = 10
+    wall_clock_seconds: int = 1800
+    memory_mb: int = 4096
+    vcpus: int = 2
+    workspace_disk_mb: int = 10240
+    oci_image: Optional[str] = None
+    egress_endpoints: Sequence[str] = ()
+
+    def _to_wire(self) -> dict:
+        """Serialise to the kebab-case JSON shape `RunSpec::from_json` accepts."""
+        return {
+            "adapter": self.adapter,
+            "cmd": list(self.cmd),
+            "env": dict(self.env),
+            "secrets": dict(self.secrets),
+            "branching-strategy": _strategy_to_json(self.branching_strategy),
+            "output-branch": self.output_branch,
+            "stop-grace-seconds": self.stop_grace_seconds,
+            "wall-clock-seconds": self.wall_clock_seconds,
+            "memory-mb": self.memory_mb,
+            "vcpus": self.vcpus,
+            "workspace-disk-mb": self.workspace_disk_mb,
+            "oci-image": self.oci_image,
+            "egress-endpoints": list(self.egress_endpoints),
+        }
 
 
 def _spec_to_json(
-    spec: dict,
+    spec: Union["RunSpec", dict],
 ) -> str:
-    """Lightweight passthrough — the dict is already in the shape
-    bunsen-core's `RunSpec::from_json` accepts. We only translate the
-    `branching_strategy` field when it's been supplied as a typed
-    Python variant, since dicts are accepted as-is.
+    """Serialise a `RunSpec` or a raw spec dict to the JSON shape
+    bunsen-core's `RunSpec::from_json` accepts.
+
+    A `RunSpec` is serialised field-by-field to the kebab-case wire form. A
+    dict is treated as already being in that shape and passed through as-is;
+    the one exception is `branching_strategy`/`branching-strategy`, which is
+    normalised when supplied as a typed `NoneStrategy` / `PoolClone`.
     """
+    if isinstance(spec, RunSpec):
+        return json.dumps(spec._to_wire())
     out = dict(spec)
     bs = out.get("branching_strategy") or out.get("branching-strategy")
     if isinstance(bs, (NoneStrategy, PoolClone)):
@@ -169,7 +220,7 @@ def _run_core(
 
 def _run_argv_suffix(
     session_id: str,
-    spec: dict,
+    spec: Union["RunSpec", dict],
     *,
     kernel: Optional[str],
     rootfs: Optional[str],
@@ -308,7 +359,7 @@ class Session:
 
     def run(
         self,
-        spec: dict,
+        spec: Union["RunSpec", dict],
         *,
         kernel: Optional[str] = None,
         rootfs: Optional[str] = None,
@@ -339,7 +390,7 @@ class Session:
 
     def run_sync(
         self,
-        spec: dict,
+        spec: Union["RunSpec", dict],
         *,
         kernel: Optional[str] = None,
         rootfs: Optional[str] = None,
@@ -348,10 +399,10 @@ class Session:
     ) -> Run:
         """Drive a Run inside this Session, blocking until it completes.
 
-        `spec` is a dict matching `RunSpec` (no `host_repo_path`; the
-        Session provides it). `branching_strategy` may be either a dict
-        (the JSON shape) or a typed `NoneStrategy` / `PoolClone` instance.
-        `output_branch` is optional.
+        `spec` is a typed `RunSpec` or a dict matching it (no `host_repo_path`;
+        the Session provides it). In dict form, `branching_strategy` may be
+        either a dict (the JSON shape) or a typed `NoneStrategy` / `PoolClone`
+        instance. `output_branch` is optional.
 
         Pass `kernel` (and optionally `rootfs`, `firecracker`,
         `manage_firewall`) to route the Run through the Firecracker sandbox
@@ -448,6 +499,7 @@ __all__ = [
     "BranchingStrategy",
     "NoneStrategy",
     "PoolClone",
+    "RunSpec",
     "ManifestPair",
     "Run",
     "Session",

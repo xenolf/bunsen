@@ -335,6 +335,27 @@ def test_documented_worktree_inspection_command_works(
         )
 
 
+def test_run_sync_accepts_typed_run_spec(
+    host_repo: Path, core_bin: str, xdg: Path
+) -> None:
+    """A typed `bunsen.RunSpec` round-trips through the real bunsen-core
+    deserialiser, guarding against drift between the dataclass wire form
+    and the Rust `RunSpec` struct's kebab-case field names / defaults.
+    """
+    import bunsen
+
+    s = bunsen.open_session(str(host_repo), _core_bin=core_bin)
+    spec = bunsen.RunSpec(
+        adapter="black-box",
+        cmd=["sh", "-c", _AGENT_COMMIT_SH.format(tag="typed", file="typed.txt")],
+        branching_strategy=bunsen.PoolClone(base="host/main"),
+        output_branch="feature/typed",
+    )
+    r = s.run_sync(spec)
+    assert r.pool_sha is not None
+    assert r.output_branch_pushed == "feature/typed"
+
+
 def test_session_run_with_kernel_routes_through_sandbox_dispatch(
     host_repo: Path, core_bin: str, xdg: Path, tmp_path: Path
 ) -> None:

@@ -9,6 +9,7 @@ from ._session import (
     BranchingStrategy,
     NoneStrategy,
     PoolClone,
+    RunSpec,
     ManifestPair,
     Run,
     Session,
@@ -23,7 +24,7 @@ __all__ = [
     "RunStarted", "RunEnded", "Output", "EgressDenied", "UnknownEvent",
     "SchemaVersionError", "SCHEMA_VERSION",
     # Slice 11: Session/Pool/Run surface
-    "BranchingStrategy", "NoneStrategy", "PoolClone",
+    "BranchingStrategy", "NoneStrategy", "PoolClone", "RunSpec",
     "ManifestPair", "Run", "Session", "SessionError",
     "open_session", "attach_session", "list_sessions",
 ]
