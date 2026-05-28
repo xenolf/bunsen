@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Sequence, Union
 
 from ._core_path import find_core_bin
+from ._run import _SessionRunContext
 
 
 # ── BranchingStrategy variants ────────────────────────────────────────────
@@ -166,6 +167,30 @@ def _run_core(
     return json.loads(last)
 
 
+def _run_argv_suffix(
+    session_id: str,
+    spec: dict,
+    *,
+    kernel: Optional[str],
+    rootfs: Optional[str],
+    firecracker: Optional[str],
+    manage_firewall: bool,
+) -> list[str]:
+    """Build the `--session <id> --spec <json> [flags]` argv tail shared by
+    `Session.run` (async streaming) and `Session.run_sync` (blocking).
+    """
+    argv: list[str] = ["--session", session_id, "--spec", _spec_to_json(spec)]
+    if kernel is not None:
+        argv.extend(["--kernel", kernel])
+    if rootfs is not None:
+        argv.extend(["--rootfs", rootfs])
+    if firecracker is not None:
+        argv.extend(["--firecracker", firecracker])
+    if manage_firewall:
+        argv.append("--manage-firewall")
+    return argv
+
+
 # ── Session class ─────────────────────────────────────────────────────────
 
 
@@ -289,8 +314,39 @@ class Session:
         rootfs: Optional[str] = None,
         firecracker: Optional[str] = None,
         manage_firewall: bool = False,
+    ) -> _SessionRunContext:
+        """Drive a streaming Run inside this Session.
+
+        Async context manager yielding a live event stream plus run control:
+
+            async with s.run(spec) as r:
+                async for event in r.events:
+                    ...
+                # After the loop the Pool summary is on the handle:
+                print(r.pool_sha, r.output_branch_pushed, r.uncommitted_paths)
+
+        `spec`, `kernel`, `rootfs`, `firecracker`, and `manage_firewall` carry
+        the same meaning as `run_sync`. Use `run_sync` when you only need the
+        final outcome and not the live event stream.
+        """
+        suffix = _run_argv_suffix(
+            self.id, spec,
+            kernel=kernel, rootfs=rootfs,
+            firecracker=firecracker, manage_firewall=manage_firewall,
+        )
+        argv = _core_argv(self._core_bin) + suffix
+        return _SessionRunContext(argv)
+
+    def run_sync(
+        self,
+        spec: dict,
+        *,
+        kernel: Optional[str] = None,
+        rootfs: Optional[str] = None,
+        firecracker: Optional[str] = None,
+        manage_firewall: bool = False,
     ) -> Run:
-        """Drive a Run inside this Session.
+        """Drive a Run inside this Session, blocking until it completes.
 
         `spec` is a dict matching `RunSpec` (no `host_repo_path`; the
         Session provides it). `branching_strategy` may be either a dict
@@ -305,16 +361,11 @@ class Session:
         hosts, supplying `kernel` raises `SessionError`
         ("sandbox backend requires Linux + KVM").
         """
-        spec_json = _spec_to_json(spec)
-        argv: list[str] = ["--session", self.id, "--spec", spec_json]
-        if kernel is not None:
-            argv.extend(["--kernel", kernel])
-        if rootfs is not None:
-            argv.extend(["--rootfs", rootfs])
-        if firecracker is not None:
-            argv.extend(["--firecracker", firecracker])
-        if manage_firewall:
-            argv.append("--manage-firewall")
+        argv = _run_argv_suffix(
+            self.id, spec,
+            kernel=kernel, rootfs=rootfs,
+            firecracker=firecracker, manage_firewall=manage_firewall,
+        )
         result = _run_core(argv, _core_bin=self._core_bin)
         return Run(
             run_id=result["run_id"],

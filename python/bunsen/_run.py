@@ -1,20 +1,36 @@
-"""Run handle — async context manager wrapping bunsen-core subprocess."""
+"""Streaming Run handle — async context manager wrapping a bunsen-core Run."""
 from __future__ import annotations
 import asyncio
 import json
-import threading
-from typing import AsyncIterator, Iterator, Optional
+from typing import AsyncIterator, Optional, Sequence
 
-from ._events import RunStarted, RunEnded, decode_event, _Base, SchemaVersionError
+from ._events import RunStarted, decode_event, _Base, SchemaVersionError
 
 
-class Run:
+class RunHandle:
+    """Live handle to a streaming Run, yielded by `async with Session.run(spec)`.
+
+    `.events` async-iterates the typed NDJSON event stream until the run ends.
+    `.stop()` / `.kill()` / `.pause()` / `.resume()` send control commands. Once
+    the iterator is exhausted the Pool summary (`.pool_sha`,
+    `.output_branch_pushed`, `.uncommitted_paths`, `.run_id`) is populated — the
+    drain captures the trailing summary line before signalling end-of-stream, so
+    these are guaranteed readable the moment the `async for` loop finishes.
+    """
+
     def __init__(self) -> None:
         self._queue: asyncio.Queue[_Base | Exception | None] = asyncio.Queue(maxsize=1024)
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._id: Optional[str] = None
         self._workspace_path: Optional[str] = None
         self._transcript_path: Optional[str] = None
+        # Pool summary — set by _drain from the trailing summary line (the one
+        # stdout line with neither "type" nor "seq"). None until a run produces
+        # commits / a summary (e.g. a killed run may emit none).
+        self._pool_sha: Optional[str] = None
+        self._output_branch_pushed: Optional[str] = None
+        self._uncommitted_paths: tuple[str, ...] = ()
+        self._summary_run_id: Optional[str] = None
 
     @property
     def id(self) -> Optional[str]:
@@ -28,6 +44,22 @@ class Run:
     def transcript_path(self) -> Optional[str]:
         return self._transcript_path
 
+    @property
+    def run_id(self) -> Optional[str]:
+        return self._summary_run_id or self._id
+
+    @property
+    def pool_sha(self) -> Optional[str]:
+        return self._pool_sha
+
+    @property
+    def output_branch_pushed(self) -> Optional[str]:
+        return self._output_branch_pushed
+
+    @property
+    def uncommitted_paths(self) -> Sequence[str]:
+        return self._uncommitted_paths
+
     async def _drain(self, proc: asyncio.subprocess.Process) -> None:
         assert proc.stdout is not None
         try:
@@ -37,6 +69,22 @@ class Run:
                     continue
                 try:
                     obj = json.loads(raw_line)
+                except Exception:
+                    continue
+
+                # The trailing summary line carries neither "type" nor "seq"
+                # (every event has both). Capture it onto the handle and keep
+                # reading to EOF; it is never yielded as an event. Setting the
+                # fields here — before the `finally` enqueues the EOF sentinel —
+                # is what lets callers read `.pool_sha` right after the loop.
+                if "type" not in obj and "seq" not in obj:
+                    self._summary_run_id = obj.get("run_id")
+                    self._pool_sha = obj.get("pool_sha")
+                    self._output_branch_pushed = obj.get("output_branch_pushed")
+                    self._uncommitted_paths = tuple(obj.get("uncommitted_paths", ()))
+                    continue
+
+                try:
                     event = decode_event(obj)
                 except SchemaVersionError as e:
                     await self._queue.put(e)
@@ -44,15 +92,13 @@ class Run:
                 except Exception:
                     continue
 
-                if self._id is None and hasattr(event, "run_id"):
+                if self._id is None and getattr(event, "run_id", ""):
                     self._id = event.run_id
                 if isinstance(event, RunStarted):
                     self._workspace_path = event.workspace_path
                     self._transcript_path = event.transcript_path
 
                 await self._queue.put(event)
-                if isinstance(event, RunEnded):
-                    return
         finally:
             await self._queue.put(None)
 
@@ -68,8 +114,6 @@ class Run:
             if isinstance(item, Exception):
                 raise item
             yield item
-            if isinstance(item, RunEnded):
-                return
 
     async def _send_cmd(self, op: str) -> None:
         if self._proc and self._proc.stdin and self._proc.returncode is None:
@@ -100,18 +144,20 @@ class Run:
                 pass
 
 
-class _AsyncRunContext:
-    def __init__(self, spec: dict, core_argv: list[str]) -> None:
-        self._spec = spec
-        self._core_argv = core_argv
-        self._run = Run()
+class _SessionRunContext:
+    """Async context manager spawning `bunsen-core --session ...`. Built with the
+    complete argv (core binary + `--session <id> --spec <json>` + any flags) and
+    yields a `RunHandle` bound to the live subprocess.
+    """
+
+    def __init__(self, argv: list[str]) -> None:
+        self._argv = argv
+        self._run = RunHandle()
         self._drain_task: Optional[asyncio.Task] = None
 
-    async def __aenter__(self) -> Run:
-        import json as _json
-        argv = self._core_argv + ["--spec", _json.dumps(self._spec)]
+    async def __aenter__(self) -> RunHandle:
         proc = await asyncio.create_subprocess_exec(
-            *argv,
+            *self._argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             stdin=asyncio.subprocess.PIPE,
@@ -128,67 +174,3 @@ class _AsyncRunContext:
                 await self._drain_task
             except asyncio.CancelledError:
                 pass
-
-
-# ---- sync facade ----
-
-class _SyncRun:
-    def __init__(self, run: Run, loop: asyncio.AbstractEventLoop) -> None:
-        self._run = run
-        self._loop = loop
-
-    @property
-    def id(self) -> Optional[str]:
-        return self._run.id
-
-    @property
-    def workspace_path(self) -> Optional[str]:
-        return self._run.workspace_path
-
-    @property
-    def transcript_path(self) -> Optional[str]:
-        return self._run.transcript_path
-
-    @property
-    def events(self) -> Iterator[_Base]:
-        aiter = self._run.events
-        while True:
-            try:
-                item = self._loop.run_until_complete(aiter.__anext__())
-                yield item
-            except StopAsyncIteration:
-                return
-
-    def stop(self) -> None:
-        self._loop.run_until_complete(self._run.stop())
-
-    def kill(self) -> None:
-        self._loop.run_until_complete(self._run.kill())
-
-    def pause(self) -> None:
-        self._loop.run_until_complete(self._run.pause())
-
-    def resume(self) -> None:
-        self._loop.run_until_complete(self._run.resume())
-
-
-class _SyncRunContext:
-    def __init__(self, spec: dict, core_argv: list[str]) -> None:
-        self._spec = spec
-        self._core_argv = core_argv
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
-        self._async_ctx: Optional[_AsyncRunContext] = None
-        self._run: Optional[_SyncRun] = None
-
-    def __enter__(self) -> _SyncRun:
-        self._loop = asyncio.new_event_loop()
-        self._async_ctx = _AsyncRunContext(self._spec, self._core_argv)
-        async_run = self._loop.run_until_complete(self._async_ctx.__aenter__())
-        self._run = _SyncRun(async_run, self._loop)
-        return self._run
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        assert self._async_ctx is not None and self._loop is not None
-        self._loop.run_until_complete(self._async_ctx.__aexit__(exc_type, exc_val, exc_tb))
-        self._loop.close()

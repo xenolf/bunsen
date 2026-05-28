@@ -226,7 +226,7 @@ def test_end_to_end_parallel_reconcile_downstream_close(
             base="host/main",
             output_branch=f"parallel/{i}",
         )
-        r = s.run(spec)
+        r = s.run_sync(spec)
         assert r.pool_sha is not None, f"parallel run {i} produced no commits"
         assert r.output_branch_pushed == f"parallel/{i}"
         parallel.append(r)
@@ -247,7 +247,7 @@ git commit -m reconcile --quiet
         import_refs=("parallel/1", "parallel/2", "parallel/3"),
         output_branch="reconciled",
     )
-    reconciled = s.run(reconcile_spec)
+    reconciled = s.run_sync(reconcile_spec)
     assert reconciled.pool_sha is not None
     assert reconciled.output_branch_pushed == "reconciled"
 
@@ -259,7 +259,7 @@ git commit -m reconcile --quiet
             base="reconciled",
             output_branch=f"downstream/{i}",
         )
-        r = s.run(spec)
+        r = s.run_sync(spec)
         assert r.pool_sha is not None, f"downstream run {i} produced no commits"
         downstream.append(r)
 
@@ -312,7 +312,7 @@ def test_documented_worktree_inspection_command_works(
         base="host/main",
         output_branch="feature/inspect",
     )
-    r = s.run(spec)
+    r = s.run_sync(spec)
     assert r.pool_sha is not None
 
     pool = Path(s.path) / "pool"
@@ -338,7 +338,7 @@ def test_documented_worktree_inspection_command_works(
 def test_session_run_with_kernel_routes_through_sandbox_dispatch(
     host_repo: Path, core_bin: str, xdg: Path, tmp_path: Path
 ) -> None:
-    """Slice 12: `Session.run(kernel=..., rootfs=...)` routes through the
+    """Slice 12: `Session.run_sync(kernel=..., rootfs=...)` routes through the
     Firecracker dispatch, not the host-subprocess supervisor.
 
     The host-subprocess path would happily run `cmd: ["true"]` and return Ok;
@@ -355,7 +355,7 @@ def test_session_run_with_kernel_routes_through_sandbox_dispatch(
     spec = _run_spec("true", base="host/main")
 
     with pytest.raises(bunsen.SessionError):
-        s.run(spec, kernel=str(fake_kernel), rootfs=str(fake_rootfs))
+        s.run_sync(spec, kernel=str(fake_kernel), rootfs=str(fake_rootfs))
 
 
 def test_run_session_flag_runs_inside_named_session(
@@ -376,8 +376,8 @@ def test_run_session_flag_runs_inside_named_session(
         base="host/main",
         output_branch="feature/via-flag",
     )
-    # Drive the Run through Session.run (which uses --session under the hood).
-    r = a.run(spec)
+    # Drive the Run through Session.run_sync (which uses --session under the hood).
+    r = a.run_sync(spec)
     assert r.pool_sha is not None
 
     a_pool = Path(a.path) / "pool"

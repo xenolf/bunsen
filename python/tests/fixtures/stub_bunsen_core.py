@@ -8,9 +8,10 @@ RUN_ID = "01HWTEST00000000000000000A"
 WORKSPACE = f"/tmp/bunsen-test-runs/{RUN_ID}/workspace"
 TRANSCRIPT = f"/tmp/bunsen-test-runs/{RUN_ID}/transcript.ndjson"
 
-# Parse --mode and --spec from args
+# Parse --mode, --spec, and --session from args
 mode = "normal"
 spec_dict: dict = {}
+has_session = False
 i = 1
 while i < len(sys.argv):
     arg = sys.argv[i]
@@ -31,6 +32,12 @@ while i < len(sys.argv):
             spec_dict = json.loads(arg.split("=", 1)[1])
         except Exception:
             pass
+        i += 1
+    elif arg == "--session" and i + 1 < len(sys.argv):
+        has_session = True
+        i += 2
+    elif arg.startswith("--session="):
+        has_session = True
         i += 1
     else:
         i += 1
@@ -147,3 +154,10 @@ emit({**base, "seq": 2, "ts": "2026-01-01T00:00:02.000Z",
       "type": "output", "stream": "stdout", "text": "world\n"})
 emit({**base, "seq": 3, "ts": "2026-01-01T00:00:03.000Z",
       "type": "run_ended", "reason": "agent_exit", "exit_code": 0})
+
+# Session path: bunsen-core prints a trailing summary line (no "type"/"seq")
+# after run_ended. Mirror that so the streaming handle can capture the Pool
+# outcome.
+if has_session:
+    emit({"run_id": RUN_ID, "pool_sha": "deadbeefcafe",
+          "output_branch_pushed": "feature/x", "uncommitted_paths": []})
