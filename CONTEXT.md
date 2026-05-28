@@ -14,6 +14,12 @@ A Run terminates when the agent exits, the Sandbox is signalled to stop, or the 
 
 The Python (or shell) program that orchestrates Runs. Selects agent, model, and prompt; configures Sandbox restrictions; launches Runs; consumes their event streams; decides what to do next. The User Script is the consumer of bunsen — bunsen's library/CLI is what it calls into.
 
+### User Script user
+
+The OS account — a concrete uid, gid, and home directory — that owns and runs the [[user-script]] and that `bunsen-core` drops to after its privileged setup. Distinct from the [[user-script]] itself: the User Script is the orchestrating *program*; the User Script user is the *account* it runs under. Code and docs that say "the user" when they mean this account should say **User Script user**.
+
+When bunsen is launched under `sudo` (or via a setuid/file-caps install), `bunsen-core` starts privileged, does the genuinely-privileged setup, then makes a one-way drop to the User Script user for the rest of its lifecycle. Everything bunsen persists — Sessions, the [[branch-pool]], Run transcripts, agent history, and the kernel/rootfs caches — is owned by this account, not root, regardless of `sudo`. The account is resolved from the invocation context (an explicit `--as-user`, the `SUDO_*` environment, or the real uid behind a setuid install), never from the `sudo`-mangled inherited `HOME`/`XDG_*`. See [ADR-0013](docs/adr/0013-privilege-drop-to-user-script-user.md) for the full privilege model.
+
 ### Sandbox
 
 The isolated environment a Run executes inside. Provides filesystem isolation, restricted network egress, and bounded resource usage. The host kernel and User Script are outside the Sandbox.

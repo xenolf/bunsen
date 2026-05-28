@@ -1,5 +1,7 @@
 # Hardened git fetch from the Sandbox's .git
 
+> **Superseded in part by [ADR-0013](0013-privilege-drop-to-user-script-user.md).** The *extraction mechanism* described here — exposing the Workspace ext4's `.git` by mounting the image read-only via `losetup` + `mount` under privilege — is replaced by a userspace `debugfs` read that needs no `CAP_SYS_ADMIN`. The **hardened-`git-fetch` posture** below (the flag set, the deprivileged fetch as the User Script user, the explicit refspec, and the narrow symlink-safe history copy) is unchanged and remains the contract; ADR-0013 runs exactly this fetch against the extracted `.git`.
+
 The host-side `git fetch` that reads commits out of a Run's Sandbox runs with explicit hardening flags, with the ext4 image mounted read-only (`nosuid,nodev,noexec`), and as the User Script's user — not root. The minimum privileged surface is the mount itself; everything after it is deprivileged.
 
 ## Why
