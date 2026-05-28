@@ -14,7 +14,16 @@ use crate::session::{ListFilter, Session, SessionError};
 /// Entry point. `argv` is `&args[2..]` — i.e. everything after the
 /// `session` literal. Returns the process exit code.
 pub async fn run(argv: &[String]) -> i32 {
-    let Some((sub, rest)) = argv.split_first() else {
+    // Extract --as-user before the verb so every Session verb gets the
+    // resolved user and privilege drop.
+    let (as_user, verb_argv) = extract_as_user(argv);
+
+    if let Err(msg) = crate::target_user::resolve_and_drop(as_user) {
+        eprintln!("{msg}");
+        return 1;
+    }
+
+    let Some((sub, rest)) = verb_argv.split_first() else {
         eprintln!("{}", usage());
         return 2;
     };
@@ -38,8 +47,27 @@ pub async fn run(argv: &[String]) -> i32 {
     }
 }
 
+fn extract_as_user(argv: &[String]) -> (Option<String>, Vec<String>) {
+    let mut as_user = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--as-user" && i + 1 < argv.len() {
+            as_user = Some(argv[i + 1].clone());
+            i += 2;
+        } else if let Some(v) = argv[i].strip_prefix("--as-user=") {
+            as_user = Some(v.to_string());
+            i += 1;
+        } else {
+            rest.push(argv[i].clone());
+            i += 1;
+        }
+    }
+    (as_user, rest)
+}
+
 fn usage() -> &'static str {
-    "usage: bunsen-core session <subcommand> [...]\n\
+    "usage: bunsen-core session [--as-user <name|uid>] <subcommand> [...]\n\
      \n\
      subcommands:\n\
        open <host-repo> [--mirror <ref>]... [--label <label>]\n\
@@ -418,5 +446,39 @@ mod tests {
         assert_eq!(state_str(Closed), "closed");
         assert_eq!(state_str(FailedToClose), "failed_to_close");
         assert_eq!(state_str(Discarded), "discarded");
+    }
+
+    // ── --as-user extraction ─────────────────────────────────────────────
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn extract_as_user_space_form() {
+        let (user, rest) = extract_as_user(&strs(&["--as-user", "alice", "open", "/repo"]));
+        assert_eq!(user.as_deref(), Some("alice"));
+        assert_eq!(rest, strs(&["open", "/repo"]));
+    }
+
+    #[test]
+    fn extract_as_user_equals_form() {
+        let (user, rest) = extract_as_user(&strs(&["--as-user=1000", "list"]));
+        assert_eq!(user.as_deref(), Some("1000"));
+        assert_eq!(rest, strs(&["list"]));
+    }
+
+    #[test]
+    fn extract_as_user_absent() {
+        let (user, rest) = extract_as_user(&strs(&["open", "/repo", "--label", "test"]));
+        assert!(user.is_none());
+        assert_eq!(rest, strs(&["open", "/repo", "--label", "test"]));
+    }
+
+    #[test]
+    fn extract_as_user_after_verb() {
+        let (user, rest) = extract_as_user(&strs(&["open", "--as-user", "bob", "/repo"]));
+        assert_eq!(user.as_deref(), Some("bob"));
+        assert_eq!(rest, strs(&["open", "/repo"]));
     }
 }

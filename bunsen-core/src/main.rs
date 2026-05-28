@@ -1,6 +1,7 @@
 mod adapter;
 mod aider_adapter;
 mod branch_pool;
+mod bunsen_paths;
 mod claude_code_adapter;
 mod dns;
 mod egress;
@@ -20,6 +21,7 @@ mod sandbox_nft;
 mod session;
 mod session_cli;
 mod supervisor;
+mod target_user;
 mod ulid;
 mod workspace_materializer;
 
@@ -359,22 +361,7 @@ struct CliArgs {
 /// slice 11 wires `bunsen run --session <id>`. Carries no `meta.json`,
 /// so `Session::list` ignores it.
 fn cli_session_dir() -> std::path::PathBuf {
-    xdg_data_home()
-        .join("bunsen")
-        .join("sessions")
-        .join("__cli__")
-}
-
-fn xdg_data_home() -> std::path::PathBuf {
-    if let Ok(v) = std::env::var("XDG_DATA_HOME") {
-        std::path::PathBuf::from(v)
-    } else {
-        std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-            .join(".local")
-            .join("share")
-    }
+    bunsen_paths::sessions_root().join("__cli__")
 }
 
 fn parse_cli_args(args: &[String]) -> CliArgs {

@@ -48,13 +48,7 @@ pub const KERNEL_SHA256: &str = "";
 // ── Cache location ────────────────────────────────────────────────────────────
 
 pub fn cache_dir() -> PathBuf {
-    let base = std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".cache")
-        });
-    base.join("bunsen").join("kernel")
+    crate::bunsen_paths::kernel_cache()
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────

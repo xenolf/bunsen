@@ -1084,19 +1084,7 @@ impl Session {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 pub(crate) fn sessions_root() -> PathBuf {
-    xdg_data_home().join("bunsen").join("sessions")
-}
-
-fn xdg_data_home() -> PathBuf {
-    if let Ok(v) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(v)
-    } else {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join(".local")
-            .join("share")
-    }
+    crate::bunsen_paths::sessions_root()
 }
 
 fn now_iso8601() -> String {
