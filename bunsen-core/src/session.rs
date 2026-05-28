@@ -829,6 +829,7 @@ impl Session {
     /// lazy resolution; on Linux it passes `resolved` to ask for the
     /// sandbox path, or `None` for the host-subprocess fallback.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     async fn run_dispatch(
         &self,
         backend: RunBackend,

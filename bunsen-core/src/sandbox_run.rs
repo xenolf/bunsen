@@ -93,6 +93,11 @@ pub async fn run(
         .create_tap(&tap_name, net.host, net.prefix_len, owner_user)
         .await
         .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+    // Tie the TAP's lifetime to this Run: the guard deletes it on every exit
+    // path (success, error, or panic). This replaces the deletion that used to
+    // live in FirecrackerHandle::drop, so teardown stays centralised in the
+    // privileged-net module.
+    let _tap_guard = crate::privileged_net::TapGuard::new(tap_name.clone());
 
     // ── Slice 10k: host iptables co-existence ─────────────────────────────
     // The pre-flight probe in main() already decided whether we can proceed.
@@ -235,15 +240,18 @@ pub async fn run(
                         Ok(async_stdout) => {
                             let table = nft_table.clone();
                             let sender = drop_log_tx;
+                            // Own the child via a reaper so it is killed whether
+                            // the pump exits on its own or the task is aborted on
+                            // Run teardown — dropping a std::process::Child alone
+                            // does not kill it.
+                            let reaper = crate::privileged_net::ChildReaper(child);
                             eprintln!("[egress] drop-log emitter watching table {nft_table}");
                             Some(tokio::spawn(async move {
+                                let _reaper = reaper;
                                 let reader = tokio::io::BufReader::new(async_stdout);
                                 if let Err(e) = pump_drop_log_lines(reader, &table, sender).await {
                                     eprintln!("[egress] drop-log pump exited with error: {e:#}");
                                 }
-                                // Best-effort: reap the child when the pump exits.
-                                let _ = child.kill();
-                                let _ = child.wait();
                             }))
                         }
                         Err(e) => {

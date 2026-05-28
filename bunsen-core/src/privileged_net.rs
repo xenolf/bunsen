@@ -314,6 +314,11 @@ fn exec_delete_nft(table: &str) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn exec_bind_dns(addr: SocketAddr) -> Result<std::os::unix::io::RawFd> {
     let sock = UdpSocket::bind(addr).with_context(|| format!("bind UDP {addr}"))?;
+    // tokio's `UdpSocket::from_std` requires a non-blocking fd — it
+    // `debug_assert!`s on a blocking one (panicking in debug builds) and
+    // blocks the runtime worker in release builds. `std::net::UdpSocket` is
+    // blocking by default, so flip it before handing the fd to the caller.
+    sock.set_nonblocking(true).context("set DNS socket non-blocking")?;
     Ok(sock.into_raw_fd())
 }
 
@@ -355,6 +360,54 @@ impl Drop for TapAllowGuard {
             return;
         }
         let _ = exec_remove_tap_allow(&self.tap);
+    }
+}
+
+// ── TapGuard ──────────────────────────────────────────────────────────────────
+
+/// RAII handle that deletes the per-Run TAP device on drop.
+///
+/// Like [`TapAllowGuard`], `Drop` runs the synchronous `exec_delete_tap` helper
+/// directly rather than routing through the actor: teardown must run on every
+/// exit path — including panic and tokio runtime shutdown — where scheduling
+/// fresh async work is not safe. `ip link del` is idempotent, so a redundant
+/// delete (e.g. the next Run's pre-cleanup) is harmless.
+#[cfg(target_os = "linux")]
+pub struct TapGuard {
+    name: String,
+}
+
+#[cfg(target_os = "linux")]
+impl TapGuard {
+    pub fn new(name: String) -> Self {
+        Self { name }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TapGuard {
+    fn drop(&mut self) {
+        let _ = exec_delete_tap(&self.name);
+    }
+}
+
+// ── ChildReaper ─────────────────────────────────────────────────────────────
+
+/// Kills and reaps a spawned child process on drop.
+///
+/// [`PrivilegedNetHandle::spawn_journalctl`] returns a `std::process::Child`,
+/// which — unlike tokio's `Command::kill_on_drop` — is *not* terminated when
+/// dropped. The drop-log pump task is torn down by aborting its `JoinHandle`,
+/// so without this guard the `journalctl -k -f` tail would be orphaned on every
+/// Run teardown.
+#[cfg(target_os = "linux")]
+pub struct ChildReaper(pub Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 

@@ -284,6 +284,7 @@ async fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn run_with_backend(
     kernel: Option<std::path::PathBuf>,
     rootfs: Option<std::path::PathBuf>,
@@ -310,7 +311,9 @@ async fn run_with_backend(
             }
         };
         // Resolve the owner user for TAP creation (current user for the CLI path).
-        let owner_user = target_user::resolve_current_user()
+        let owner_user = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .ok()
+            .flatten()
             .map(|u| u.name)
             .unwrap_or_else(|| "root".to_string());
         return sandbox_run::run(

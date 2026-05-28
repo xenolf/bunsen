@@ -175,8 +175,8 @@ pub async fn run(
         h.abort();
     }
     if let Some(h) = drop_log_handle {
-        // Drops the task, which drops the journalctl `Child`; kill_on_drop
-        // takes the kernel-log tail down for us.
+        // Aborting drops the task, which drops its ChildReaper, which kills and
+        // reaps the journalctl tail.
         h.abort();
     }
     if let Some(h) = dns_handle {

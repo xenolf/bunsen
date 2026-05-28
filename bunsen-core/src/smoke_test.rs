@@ -55,6 +55,9 @@ pub async fn run(raw_args: &[String]) -> Result<()> {
     create_tap(&tap_name, net.host, net.prefix_len)
         .await
         .context("create smoke TAP")?;
+    // FirecrackerHandle no longer deletes the TAP on drop; own its teardown
+    // here so the smoke TAP is removed on every exit path.
+    let _tap_guard = crate::privileged_net::TapGuard::new(tap_name.clone());
 
     let config = SandboxConfig {
         kernel_path: args.kernel,
