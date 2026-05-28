@@ -625,6 +625,14 @@ impl Session {
             None
         };
 
+        // Spawn the PrivilegedNet actor for the sandbox path. On Linux the
+        // actor is always created (even for non-sandbox runs) so the Session
+        // doesn't need to know which path it will take at this point; the
+        // actor thread is cheap to start and stays alive for the lifetime of
+        // this Session invocation.
+        #[cfg(target_os = "linux")]
+        let actor = crate::privileged_net::start_actor();
+
         // Host firewall probe (slice 13): the legacy CLI refuses upfront
         // on a DROP-by-default INPUT chain without `--manage-firewall`,
         // and the Session path must do the same so callers don't see a
@@ -637,7 +645,8 @@ impl Session {
         #[cfg(target_os = "linux")]
         if sandbox_intended {
             if let Err(message) =
-                crate::firewall::enforce_host_firewall_policy(backend.manage_firewall).await
+                crate::firewall::enforce_host_firewall_policy(backend.manage_firewall, &actor)
+                    .await
             {
                 return Err(SessionError::HostFirewallBlocked { message });
             }
@@ -729,6 +738,7 @@ impl Session {
                 &mut enc,
                 &workspace_path,
                 &agent_history_path,
+                &actor,
             )
             .await;
         #[cfg(not(target_os = "linux"))]
@@ -828,9 +838,14 @@ impl Session {
         enc: &mut Encoder,
         workspace_path: &Path,
         agent_history_dst: &Path,
+        actor: &crate::privileged_net::PrivilegedNetHandle,
     ) -> DispatchOutcome {
         if let Some(r) = resolved {
             let user_script_uid = current_uid();
+            // Resolve the owner user for TAP creation. Use the current user's
+            // name, which (after Module B's privilege drop) will be the User
+            // Script user rather than root.
+            let owner_user = resolve_current_username();
             let sandbox_result = crate::sandbox_run::run(
                 r.kernel,
                 r.rootfs,
@@ -846,6 +861,8 @@ impl Session {
                     agent_history_dst: Some(agent_history_dst),
                     user_script_uid,
                 }),
+                actor,
+                &owner_user,
             )
             .await;
             return DispatchOutcome::Sandbox { sandbox_result };
@@ -1216,6 +1233,19 @@ fn current_uid() -> u32 {
     {
         0
     }
+}
+
+/// Return the username for the process's current uid, falling back to "root".
+/// Used to set TAP ownership so Firecracker (running as the same user after
+/// Module B's privilege drop) can open the device without CAP_NET_ADMIN.
+#[cfg(target_os = "linux")]
+fn resolve_current_username() -> String {
+    let uid = nix::unistd::getuid();
+    nix::unistd::User::from_uid(uid)
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+        .unwrap_or_else(|| "root".to_string())
 }
 
 async fn default_branch(host_repo: &Path) -> Result<String, SessionError> {

@@ -482,6 +482,24 @@ where
     R: DnsResolver + 'static,
 {
     let sock = UdpSocket::bind(addr).await?;
+    spawn_dns_listener_from_socket(sock, policy, resolver, denied_tx).await
+}
+
+/// Start the DNS listener loop on an already-bound socket.
+///
+/// Used by the PrivilegedNet actor path: the actor binds the privileged `:53`
+/// socket synchronously (so the bind inherits any ambient capability on the
+/// actor thread), converts the raw fd back to a tokio socket, then calls this
+/// function to adopt it into the async listener loop.
+pub async fn spawn_dns_listener_from_socket<R>(
+    sock: UdpSocket,
+    policy: EgressPolicy,
+    resolver: R,
+    denied_tx: mpsc::UnboundedSender<DenialEvent>,
+) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)>
+where
+    R: DnsResolver + 'static,
+{
     let bound = sock.local_addr()?;
     let sock = Arc::new(sock);
     let resolver = Arc::new(resolver);

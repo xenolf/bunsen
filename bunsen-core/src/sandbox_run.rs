@@ -18,21 +18,19 @@
 #![cfg(target_os = "linux")]
 
 use std::net::SocketAddr;
+use std::os::unix::io::FromRawFd as _;
 use std::path::{Path, PathBuf};
 
 use crate::branch_pool::BranchPool;
 use crate::dns;
 use crate::egress_proxy;
 use crate::encoder::Encoder;
-use crate::firecracker::{
-    apply_nftables_ruleset, create_tap, delete_nftables_table, delete_tap,
-    extract_workspace_from_ext4, spawn_drop_log_emitter, start_firecracker,
-};
-use crate::firewall;
+use crate::firecracker::{extract_workspace_from_ext4, start_firecracker};
+use crate::privileged_net::PrivilegedNetHandle;
 use crate::run_spec::RunSpec;
 use crate::sandbox::{self, SandboxConfig};
 use crate::sandbox_net::{derive_run_network, derive_tap_name};
-use crate::sandbox_nft::{build_ruleset, derive_table_name};
+use crate::sandbox_nft::{build_ruleset, derive_table_name, pump_drop_log_lines};
 use crate::sandbox_supervisor::{self, EgressContext};
 
 /// Per-Run request to fetch the agent's commits out of the workspace ext4
@@ -71,6 +69,8 @@ pub async fn run(
     enc: &mut Encoder,
     workspace_path: &Path,
     extraction: Option<PoolExtraction<'_>>,
+    actor: &PrivilegedNetHandle,
+    owner_user: &str,
 ) -> std::io::Result<()> {
     let fc_bin = firecracker_bin.unwrap_or_else(|| PathBuf::from("firecracker"));
 
@@ -82,14 +82,15 @@ pub async fn run(
     // mirrors the pre-cleanup behavior start_firecracker used to do.
     let net = derive_run_network(run_id);
     let tap_name = derive_tap_name(run_id);
-    let _ = delete_tap(&tap_name).await;
+    let _ = actor.delete_tap(&tap_name).await;
     eprintln!(
         "[fc] creating TAP device {tap_name} (host {host}/{prefix}, guest {guest})",
         host = net.host,
         prefix = net.prefix_len,
         guest = net.guest,
     );
-    create_tap(&tap_name, net.host, net.prefix_len)
+    actor
+        .create_tap(&tap_name, net.host, net.prefix_len, owner_user)
         .await
         .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
 
@@ -103,12 +104,13 @@ pub async fn run(
     // shutdown. Holding the guard in this local scope ties its lifetime to
     // the Run.
     let _firewall_guard = if manage_firewall {
-        let _ = firewall::remove_tap_allow(&tap_name).await;
-        firewall::add_tap_allow(&tap_name)
+        let _ = actor.remove_tap_allow(&tap_name).await;
+        actor
+            .add_tap_allow(&tap_name)
             .await
             .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
         eprintln!("[firewall] installed per-TAP allow rule for {tap_name}");
-        Some(firewall::TapAllowGuard::new(tap_name.clone()))
+        Some(crate::privileged_net::TapAllowGuard::new(tap_name.clone()))
     } else {
         None
     };
@@ -141,8 +143,9 @@ pub async fn run(
     };
 
     // ── DNS listener (slice 10m) ───────────────────────────────────────────
-    // Resolution order (slice 10p): explicit env var → host /etc/resolv.conf
-    // first `nameserver` line → 8.8.8.8:53 literal.
+    // The actor binds the privileged :53 socket synchronously on its thread
+    // (inheriting CAP_NET_BIND_SERVICE once Module B lands). We adopt the raw
+    // fd into a tokio UdpSocket and hand it to the async listener loop.
     use std::env;
     let upstream: SocketAddr = match env::var("BUNSEN_DNS_UPSTREAM") {
         Ok(s) => s.parse().unwrap_or_else(|_| {
@@ -156,17 +159,41 @@ pub async fn run(
         Err(_) => dns::default_dns_upstream(),
     };
     let dns_bind: SocketAddr = SocketAddr::from((net.host, 53));
-    let (dns_port, dns_handle) = match dns::spawn_dns_listener(
-        dns_bind,
-        policy,
-        dns::TokioUdpResolver::new(upstream),
-        dns_tx,
-    )
-    .await
-    {
-        Ok((addr, h)) => {
-            eprintln!("[egress] DNS listener bound on {addr} (upstream {upstream})");
-            (Some(addr.port()), Some(h))
+    let (dns_port, dns_handle) = match actor.bind_dns(dns_bind).await {
+        Ok(raw_fd) => {
+            // SAFETY: the actor just created this fd; we take exclusive ownership.
+            let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) };
+            match tokio::net::UdpSocket::from_std(std_sock) {
+                Ok(tok_sock) => {
+                    match dns::spawn_dns_listener_from_socket(
+                        tok_sock,
+                        policy,
+                        dns::TokioUdpResolver::new(upstream),
+                        dns_tx,
+                    )
+                    .await
+                    {
+                        Ok((addr, h)) => {
+                            eprintln!("[egress] DNS listener bound on {addr} (upstream {upstream})");
+                            (Some(addr.port()), Some(h))
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[egress] failed to start DNS listener loop: {e} \
+                                 — DNS-only egress attempts will surface as raw_tcp drops"
+                            );
+                            (None, None)
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[egress] failed to convert DNS fd to tokio socket: {e} \
+                         — DNS-only egress attempts will surface as raw_tcp drops"
+                    );
+                    (None, None)
+                }
+            }
         }
         Err(e) => {
             eprintln!(
@@ -179,12 +206,12 @@ pub async fn run(
 
     // ── L3 egress enforcement (nftables) ───────────────────────────────────
     let nft_table = derive_table_name(run_id);
-    let _ = delete_nftables_table(&nft_table).await;
+    let _ = actor.delete_nft(&nft_table).await;
     let mut nft_loaded = false;
     if let Some(addr) = proxy_addr {
         let rules = build_ruleset(&nft_table, &tap_name, net.host, addr.port(), dns_port);
         eprintln!("[egress] loading nftables table {nft_table}");
-        match apply_nftables_ruleset(&rules).await {
+        match actor.apply_nft(rules).await {
             Ok(()) => nft_loaded = true,
             Err(e) => {
                 eprintln!("[egress] WARNING: failed to load L3 nftables rules: {e:#}");
@@ -197,17 +224,53 @@ pub async fn run(
     }
 
     // ── L3 drop-log side-channel ──────────────────────────────────────────
+    // The actor spawns journalctl synchronously so it inherits CAP_SYSLOG
+    // (once Module B lands). We take the child's stdout and drive the line
+    // pump inside a tokio task.
     let drop_log_handle = if nft_loaded {
-        match spawn_drop_log_emitter(nft_table.clone(), drop_log_tx) {
-            Ok(h) => {
-                eprintln!("[egress] drop-log emitter watching table {nft_table}");
-                Some(h)
-            }
+        match actor.spawn_journalctl().await {
+            Ok(mut child) => match child.stdout.take() {
+                Some(stdout) => {
+                    match tokio::process::ChildStdout::from_std(stdout) {
+                        Ok(async_stdout) => {
+                            let table = nft_table.clone();
+                            let sender = drop_log_tx;
+                            eprintln!("[egress] drop-log emitter watching table {nft_table}");
+                            Some(tokio::spawn(async move {
+                                let reader = tokio::io::BufReader::new(async_stdout);
+                                if let Err(e) = pump_drop_log_lines(reader, &table, sender).await {
+                                    eprintln!("[egress] drop-log pump exited with error: {e:#}");
+                                }
+                                // Best-effort: reap the child when the pump exits.
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }))
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[egress] WARNING: failed to adapt journalctl stdout: {e:#} \
+                                 — L3 drops will not produce egress_denied events"
+                            );
+                            drop(drop_log_tx);
+                            None
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "[egress] WARNING: journalctl child has no stdout pipe \
+                         — L3 drops will not produce egress_denied events"
+                    );
+                    drop(drop_log_tx);
+                    None
+                }
+            },
             Err(e) => {
                 eprintln!(
-                    "[egress] WARNING: failed to start drop-log emitter: {e:#} \
+                    "[egress] WARNING: failed to spawn journalctl: {e:#} \
                      — L3 drops will not produce egress_denied events"
                 );
+                drop(drop_log_tx);
                 None
             }
         }
@@ -265,7 +328,7 @@ pub async fn run(
 
     // Remove the per-Run nftables table. Idempotent; safe even if loading
     // earlier failed.
-    let _ = delete_nftables_table(&nft_table).await;
+    let _ = actor.delete_nft(&nft_table).await;
 
     // The supervisor's failure wins if both fail: it carries the agent-side
     // error, which is the more useful signal for the user.

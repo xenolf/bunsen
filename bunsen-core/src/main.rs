@@ -29,6 +29,7 @@ mod workspace_materializer;
 mod firecracker;
 #[cfg(target_os = "linux")]
 mod firewall;
+mod privileged_net;
 #[cfg(target_os = "linux")]
 mod sandbox_run;
 #[cfg(target_os = "linux")]
@@ -154,6 +155,10 @@ async fn main() {
     #[cfg(not(target_os = "linux"))]
     let resolved_kernel: Option<std::path::PathBuf> = cli.kernel.clone();
 
+    // ── PrivilegedNet actor ───────────────────────────────────────────────
+    #[cfg(target_os = "linux")]
+    let actor = privileged_net::start_actor();
+
     // ── Slice 10k: host firewall probe ────────────────────────────────────
     // Probe BEFORE we touch the run_dir, transcript, or emit run_started so
     // that an aborted probe leaves zero side effects on the host. Only runs
@@ -164,7 +169,7 @@ async fn main() {
     // identical message at the identical timing (slice 13).
     #[cfg(target_os = "linux")]
     if resolved_kernel.is_some() {
-        if let Err(msg) = firewall::enforce_host_firewall_policy(cli.manage_firewall).await {
+        if let Err(msg) = firewall::enforce_host_firewall_policy(cli.manage_firewall, &actor).await {
             eprintln!("{msg}");
             std::process::exit(1);
         }
@@ -252,6 +257,9 @@ async fn main() {
 
     // ── Dispatch: sandbox (Linux + --kernel/--rootfs) or host subprocess ───
     let agent_history_path = run_dir.agent_history_path();
+    #[cfg(target_os = "linux")]
+    let result = run_with_backend(resolved_kernel, cli.rootfs, cli.firecracker, cli.manage_firewall, &spec, &run_id, &mut enc, &workspace_path, Some(&agent_history_path), &actor).await;
+    #[cfg(not(target_os = "linux"))]
     let result = run_with_backend(resolved_kernel, cli.rootfs, cli.firecracker, cli.manage_firewall, &spec, &run_id, &mut enc, &workspace_path, Some(&agent_history_path)).await;
 
     let ended_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
@@ -275,6 +283,7 @@ async fn main() {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn run_with_backend(
     kernel: Option<std::path::PathBuf>,
     rootfs: Option<std::path::PathBuf>,
@@ -285,10 +294,8 @@ async fn run_with_backend(
     enc: &mut encoder::Encoder,
     workspace_path: &std::path::Path,
     agent_history_path: Option<&std::path::Path>,
+    actor: &privileged_net::PrivilegedNetHandle,
 ) -> std::io::Result<()> {
-    // On Linux: use Firecracker when --kernel is provided.
-    // Rootfs comes from --rootfs, or is pulled from spec.oci_image on first use.
-    #[cfg(target_os = "linux")]
     if let Some(kernel) = kernel {
         let rootfs = match rootfs {
             Some(p) => p,
@@ -302,46 +309,44 @@ async fn run_with_backend(
                     .map_err(|e| std::io::Error::other(format!("{e:#}")))?
             }
         };
-        return run_sandbox(kernel, rootfs, firecracker_bin, manage_firewall, spec, run_id, enc, workspace_path).await;
+        // Resolve the owner user for TAP creation (current user for the CLI path).
+        let owner_user = target_user::resolve_current_user()
+            .map(|u| u.name)
+            .unwrap_or_else(|| "root".to_string());
+        return sandbox_run::run(
+            kernel,
+            rootfs,
+            firecracker_bin,
+            manage_firewall,
+            spec,
+            run_id,
+            enc,
+            workspace_path,
+            None,
+            actor,
+            &owner_user,
+        )
+        .await;
     }
-    // On Linux after the if-let: kernel was moved; suppress unused warnings.
-    #[cfg(target_os = "linux")]
     let _ = (rootfs, firecracker_bin, manage_firewall);
-
-    // On macOS: all three were never consumed.
-    #[cfg(not(target_os = "linux"))]
-    let _ = (kernel, rootfs, firecracker_bin, manage_firewall);
-
     supervisor::run(spec, run_id, enc, workspace_path, agent_history_path).await
 }
 
-#[cfg(target_os = "linux")]
-async fn run_sandbox(
-    kernel: std::path::PathBuf,
-    rootfs: std::path::PathBuf,
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+async fn run_with_backend(
+    kernel: Option<std::path::PathBuf>,
+    rootfs: Option<std::path::PathBuf>,
     firecracker_bin: Option<std::path::PathBuf>,
     manage_firewall: bool,
     spec: &run_spec::RunSpec,
     run_id: &str,
     enc: &mut encoder::Encoder,
     workspace_path: &std::path::Path,
+    agent_history_path: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
-    // The full Firecracker lifecycle lives in `sandbox_run` so that the CLI
-    // (this caller) and `Session::run_with_backend` share one implementation.
-    // The CLI's legacy path does not extract into a Pool — workspace state
-    // dies at VM exit, matching ADR-0010 — so `extraction` is `None`.
-    sandbox_run::run(
-        kernel,
-        rootfs,
-        firecracker_bin,
-        manage_firewall,
-        spec,
-        run_id,
-        enc,
-        workspace_path,
-        None,
-    )
-    .await
+    let _ = (kernel, rootfs, firecracker_bin, manage_firewall);
+    supervisor::run(spec, run_id, enc, workspace_path, agent_history_path).await
 }
 
 struct CliArgs {
