@@ -518,70 +518,44 @@ pub async fn extract_workspace_from_ext4(
     agent_history_dst: Option<&Path>,
 ) -> Result<()> {
     use crate::sandbox_fetch::{
-        build_mount_argv, copy_agent_history_narrow, fetch_pool_from_git_dir,
+        agent_history_subpaths, copy_agent_history_narrow, debugfs_rdump, fetch_pool_from_git_dir,
+        scrub_symlinks,
     };
 
-    // losetup attach.
-    let losetup = Command::new("losetup")
-        .args(["-f", "--show", &ext4_path.to_string_lossy()])
-        .output()
+    let tmp = tempfile::TempDir::new()?;
+    let tmp_path = tmp.path();
+
+    // Extract .git using debugfs — no mount, no CAP_SYS_ADMIN.
+    let found = debugfs_rdump(ext4_path, "/.git", tmp_path)
         .await
-        .context("losetup -f --show")?;
-    if !losetup.status.success() {
-        bail!("losetup failed: {}", String::from_utf8_lossy(&losetup.stderr));
+        .map_err(|e| anyhow!("debugfs rdump .git: {e}"))?;
+    if !found {
+        bail!("workspace ext4 has no .git directory");
     }
-    let loop_dev = String::from_utf8_lossy(&losetup.stdout).trim().to_string();
+    scrub_symlinks(&tmp_path.join(".git"))?;
 
-    // Mount the loop device to a temp dir with the hardening quad.
-    let mnt = std::env::temp_dir().join(format!(
-        "bunsen-mnt-{}-{}",
-        std::process::id(),
-        run_id,
-    ));
-    std::fs::create_dir_all(&mnt)?;
-
-    let mount_argv = build_mount_argv(&loop_dev, &mnt);
-    let argv_refs: Vec<&str> = mount_argv.iter().map(String::as_str).collect();
-    let mount_status = Command::new("mount")
-        .args(&argv_refs)
-        .status()
-        .await
-        .context("mount ext4 ro,nosuid,nodev,noexec")?;
-    if !mount_status.success() {
-        // Clean up loop device before returning error.
-        Command::new("losetup").args(["-d", &loop_dev]).status().await.ok();
-        std::fs::remove_dir_all(&mnt).ok();
-        bail!("mount failed for {loop_dev}");
-    }
-
-    // Try fetch + narrow copy. Both happen against the same mount, so a
-    // single inner block lets us bail out cleanly while still running the
-    // tear-down below.
-    let inner = async {
-        let source_git_dir = mnt.join(".git");
-        fetch_pool_from_git_dir(pool, &source_git_dir, run_id, output_branch, user_script_uid)
-            .await
-            .map_err(|e| anyhow!("sandbox fetch into pool failed: {e}"))?;
-
-        if let Some(hist_dst) = agent_history_dst {
-            copy_agent_history_narrow(adapter, &mnt, hist_dst)
-                .map_err(|e| anyhow!("agent-history narrow copy failed: {e}"))?;
+    // Extract agent-history subpaths when a destination is requested.
+    if agent_history_dst.is_some() {
+        for sub in agent_history_subpaths(adapter) {
+            let src = format!("/{sub}");
+            debugfs_rdump(ext4_path, &src, tmp_path)
+                .await
+                .map_err(|e| anyhow!("debugfs rdump {sub}: {e}"))?;
         }
-        Ok::<(), anyhow::Error>(())
-    };
+        // Scrub the whole extraction dir — covers both .git and history subpaths.
+        scrub_symlinks(tmp_path)?;
+    }
 
-    let result = inner.await;
-
-    // Always unmount + detach, regardless of inner result.
-    Command::new("umount")
-        .arg(&mnt.to_string_lossy().to_string())
-        .status()
+    fetch_pool_from_git_dir(pool, &tmp_path.join(".git"), run_id, output_branch, user_script_uid)
         .await
-        .ok();
-    Command::new("losetup").args(["-d", &loop_dev]).status().await.ok();
-    std::fs::remove_dir_all(&mnt).ok();
+        .map_err(|e| anyhow!("sandbox fetch into pool failed: {e}"))?;
 
-    result
+    if let Some(hist_dst) = agent_history_dst {
+        copy_agent_history_narrow(adapter, tmp_path, hist_dst)
+            .map_err(|e| anyhow!("agent-history narrow copy failed: {e}"))?;
+    }
+
+    Ok(())
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -600,4 +574,176 @@ async fn wait_for_api_socket(path: &Path) -> Result<()> {
     bail!("Firecracker API socket {} did not appear after {}ms",
           path.display(),
           FIRECRACKER_READY_RETRIES as u64 * FIRECRACKER_READY_DELAY_MS);
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as StdCommand;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn make_temp_dir(suffix: &str) -> PathBuf {
+        use std::time::SystemTime;
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "bunsen-fc-test-{suffix}-{pid}-{nanos}-{n}"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn run_git_in(cwd: &Path, args: &[&str]) {
+        let s = StdCommand::new("git").current_dir(cwd).args(args).status().unwrap();
+        assert!(s.success(), "git {args:?} in {cwd:?} failed");
+    }
+
+    fn make_workspace_dir(suffix: &str) -> (PathBuf, String) {
+        let dir = make_temp_dir(suffix);
+        run_git_in(&dir, &["init", "-b", "main", "--quiet"]);
+        run_git_in(&dir, &["config", "user.email", "agent@test"]);
+        run_git_in(&dir, &["config", "user.name", "Agent"]);
+        std::fs::write(dir.join("hello.txt"), "hello\n").unwrap();
+        run_git_in(&dir, &["add", "hello.txt"]);
+        run_git_in(&dir, &["commit", "-m", "agent commit", "--quiet"]);
+        let out = StdCommand::new("git")
+            .current_dir(&dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (dir, sha)
+    }
+
+    fn ref_sha(repo: &Path, full_ref: &str) -> String {
+        let out = StdCommand::new("git")
+            .current_dir(repo)
+            .args(["rev-parse", full_ref])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn has_debugfs() -> bool {
+        StdCommand::new("debugfs").arg("-V").output().is_ok()
+    }
+
+    fn make_workspace_ext4(src: &Path, size: &str) -> PathBuf {
+        let ext4 = src.with_extension("ext4");
+        let s = StdCommand::new("mkfs.ext4")
+            .args([
+                "-F", "-q",
+                "-d", &src.to_string_lossy(),
+                &ext4.to_string_lossy(),
+                size,
+            ])
+            .status()
+            .expect("mkfs.ext4 must be available");
+        assert!(s.success(), "mkfs.ext4 failed for {src:?}");
+        ext4
+    }
+
+    fn current_uid() -> u32 {
+        #[cfg(unix)]
+        { nix::unistd::getuid().as_raw() }
+        #[cfg(not(unix))]
+        { 0 }
+    }
+
+    /// Full lifecycle: debugfs extraction → pool ref + agent-history copy.
+    #[tokio::test]
+    async fn extract_workspace_writes_pool_ref_and_agent_history() {
+        if !has_debugfs() {
+            return;
+        }
+        let (work, sha) = make_workspace_dir("fc-full");
+        // Add .claude/ files representing agent history.
+        std::fs::create_dir_all(work.join(".claude")).unwrap();
+        std::fs::write(work.join(".claude").join("session.json"), b"session").unwrap();
+        std::fs::write(work.join(".claude").join("settings.json"), b"{}").unwrap();
+
+        let ext4 = make_workspace_ext4(&work, "16M");
+        let pool_dir = make_temp_dir("fc-pool");
+        let pool = crate::branch_pool::BranchPool::init(pool_dir.clone()).await.unwrap();
+        let hist_dst = make_temp_dir("fc-hist");
+
+        extract_workspace_from_ext4(
+            &ext4, &pool, "01HFCRUN1", None, current_uid(), "claude-code", Some(&hist_dst),
+        )
+        .await
+        .unwrap();
+
+        // Pool ref must point at the agent's commit.
+        assert_eq!(ref_sha(&pool_dir, "refs/heads/runs/01HFCRUN1"), sha);
+
+        // Agent-history files must be copied to the host.
+        assert_eq!(
+            std::fs::read(hist_dst.join(".claude").join("session.json")).unwrap(),
+            b"session"
+        );
+        assert_eq!(
+            std::fs::read(hist_dst.join(".claude").join("settings.json")).unwrap(),
+            b"{}"
+        );
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_file(&ext4).ok();
+        std::fs::remove_dir_all(&pool_dir).ok();
+        std::fs::remove_dir_all(&hist_dst).ok();
+    }
+
+    /// A symlink planted in .claude/ must not be followed during extraction.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn extract_workspace_symlink_escape_refused() {
+        if !has_debugfs() {
+            return;
+        }
+        use std::os::unix::fs::symlink;
+        let (work, _sha) = make_workspace_dir("fc-sym");
+        std::fs::create_dir_all(work.join(".claude")).unwrap();
+        std::fs::write(work.join(".claude").join("real.json"), b"real").unwrap();
+        // Adversarial symlink pointing to a host file.
+        symlink("/etc/passwd", work.join(".claude").join("escape")).unwrap();
+
+        let ext4 = make_workspace_ext4(&work, "16M");
+        let pool_dir = make_temp_dir("fc-sym-pool");
+        let pool = crate::branch_pool::BranchPool::init(pool_dir.clone()).await.unwrap();
+        let hist_dst = make_temp_dir("fc-sym-hist");
+
+        extract_workspace_from_ext4(
+            &ext4, &pool, "01HFCRUN2", None, current_uid(), "claude-code", Some(&hist_dst),
+        )
+        .await
+        .unwrap();
+
+        // The legitimate file must be present.
+        assert_eq!(
+            std::fs::read(hist_dst.join(".claude").join("real.json")).unwrap(),
+            b"real"
+        );
+
+        // The symlink must not have been followed and /etc/passwd content must not leak.
+        let escaped = hist_dst.join(".claude").join("escape");
+        if escaped.exists() {
+            let bytes = std::fs::read(&escaped).unwrap();
+            assert!(
+                !bytes.starts_with(b"root:"),
+                "symlink escape must not leak /etc/passwd content"
+            );
+        }
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_file(&ext4).ok();
+        std::fs::remove_dir_all(&pool_dir).ok();
+        std::fs::remove_dir_all(&hist_dst).ok();
+    }
 }

@@ -10,25 +10,23 @@
 //! Public surface:
 //!
 //! - [`sandbox_fetch_from_ext4`] (Linux only): the full lifecycle —
-//!   `losetup` + `mount -o ro,nosuid,nodev,noexec` + hardened `git fetch` +
-//!   `umount` + `losetup -d`. This is what slice 09 will swap in for the old
-//!   `cp -a` extraction in `firecracker.rs`.
+//!   `debugfs rdump` (no `losetup`/`mount`/`CAP_SYS_ADMIN`) + symlink scrub
+//!   + hardened `git fetch`. Replaces the old mount-based extraction.
 //! - [`fetch_pool_from_git_dir`]: the hardened-fetch step on its own, taking a
-//!   pre-mounted (or fixture) `.git` directory. Cross-platform and used
-//!   directly by tests that cannot exercise the privileged mount step.
+//!   pre-extracted (or fixture) `.git` directory. Cross-platform and used
+//!   directly by tests that cannot exercise the ext4 path.
+//! - [`debugfs_rdump`] (Linux only): extract a single path from an ext4 image
+//!   into a host directory using `debugfs`, without mounting.
+//! - [`scrub_symlinks`]: remove all symlinks from an extracted tree before
+//!   passing it to `git fetch` or the narrow agent-history copy.
 //!
-//! Both paths share the same hardening: the `-c` flags + `GIT_CONFIG_*` env
+//! All paths share the same hardening: the `-c` flags + `GIT_CONFIG_*` env
 //! + explicit `HEAD:refs/heads/runs/<run-id>` (plus optional
 //!   `HEAD:refs/heads/<output_branch>`) refspec — never a wildcard. Namespace
 //!   validation is delegated to [`BranchPool::validate_run_output_targets`]
 //!   so the reserved-namespace and already-exists rules live in one place.
 
-// Scaffolding for slice 09 — the firecracker extraction path swaps `cp -a`
-// for `sandbox_fetch_from_ext4`. Until then, only the tests in this module
-// and downstream slices invoke it.
-#![allow(dead_code)]
-
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tokio::process::Command;
 
@@ -50,10 +48,6 @@ pub const HARDENING_ENV_VARS: &[(&str, &str)] = &[
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
 ];
-
-/// Mount option string passed to `mount -o ...`. Read-only with the standard
-/// hostile-filesystem hardening triad.
-pub const MOUNT_OPTIONS: &str = "ro,nosuid,nodev,noexec";
 
 /// Known agent-history subpaths to extract from a Workspace after a Run.
 ///
@@ -84,12 +78,11 @@ const AIDER_HISTORY_SUBPATHS: &[&str] = &[
 pub enum SandboxFetchError {
     Io(std::io::Error),
     Pool(BranchPoolError),
-    /// `losetup -f --show` or `losetup -d` failed.
-    Loop { context: String, stderr: String },
-    /// `mount` or `umount` failed.
-    Mount { context: String, stderr: String },
     /// The hardened `git fetch` returned a non-zero status.
     Git { stderr: String },
+    /// `debugfs rdump` returned a non-zero status or an unexpected error.
+    #[cfg(target_os = "linux")]
+    Debugfs { context: String, stderr: String },
 }
 
 impl std::fmt::Display for SandboxFetchError {
@@ -97,9 +90,11 @@ impl std::fmt::Display for SandboxFetchError {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Pool(e) => write!(f, "pool error: {e}"),
-            Self::Loop { context, stderr } => write!(f, "loop device error in {context}: {stderr}"),
-            Self::Mount { context, stderr } => write!(f, "mount error in {context}: {stderr}"),
             Self::Git { stderr } => write!(f, "hardened git fetch failed: {stderr}"),
+            #[cfg(target_os = "linux")]
+            Self::Debugfs { context, stderr } => {
+                write!(f, "debugfs error in {context}: {stderr}")
+            }
         }
     }
 }
@@ -160,17 +155,6 @@ pub fn compute_spawn_uid(current_euid: u32, user_script_uid: u32) -> Option<u32>
     } else {
         None
     }
-}
-
-/// Build the argv passed to `mount` for the read-only Sandbox `.git` mount.
-/// The options string is the load-bearing `ro,nosuid,nodev,noexec`.
-pub fn build_mount_argv(loop_dev: &str, mountpoint: &Path) -> Vec<String> {
-    vec![
-        "-o".into(),
-        MOUNT_OPTIONS.into(),
-        loop_dev.into(),
-        mountpoint.to_string_lossy().to_string(),
-    ]
 }
 
 // ── Narrow agent-history copy ─────────────────────────────────────────────
@@ -259,6 +243,26 @@ fn copy_narrow_entry(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+/// Remove every symlink found recursively under `dir`.
+///
+/// Called after `debugfs rdump` to ensure no adversarial symlinks planted by
+/// the agent inside the Workspace ext4 survive into the host-side extraction
+/// directory. Regular files and directories are left intact.
+pub fn scrub_symlinks(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        // DirEntry::metadata uses lstat — does not follow symlinks.
+        let meta = entry.metadata()?;
+        if meta.file_type().is_symlink() {
+            std::fs::remove_file(entry.path())?;
+        } else if meta.file_type().is_dir() {
+            scrub_symlinks(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 // ── Fetch step (cross-platform, used by both fixtures and the ext4 lifecycle) ─
 
 /// Perform the hardened `git fetch` from `source_git_dir` (a bare or non-bare
@@ -314,16 +318,52 @@ fn apply_spawn_uid(_cmd: &mut Command, _user_script_uid: u32) {
 
 // ── Full ext4 lifecycle (Linux only) ───────────────────────────────────────
 
-/// The single host-side path that reads commits out of an adversarial
-/// Sandbox's ext4. Performs `losetup` + `mount -o ro,nosuid,nodev,noexec` +
-/// hardened `git fetch` + `umount` + `losetup -d`. The mount and loop-device
-/// cleanup always runs, even if the fetch fails.
+/// Extract `src_path` (a path inside `ext4_path`) into `dst_dir` using
+/// `debugfs rdump`, without mounting the filesystem.
 ///
-/// `ext4_path` is the Sandbox's workspace image; the mounted root must
-/// contain a `.git` directory (the Workspace's `.git`).
+/// `dst_dir` must already exist. A directory source is extracted as a
+/// subdirectory of `dst_dir` with the same base name; a file source is
+/// placed directly in `dst_dir`. No `CAP_SYS_ADMIN` is required.
 ///
-/// `user_script_uid` is the uid the bunsen host process should drop to for
-/// the actual `git fetch`. Used only if bunsen is running as root.
+/// Returns `Ok(true)` if the path was extracted, `Ok(false)` if the path
+/// does not exist inside the image (debugfs exits 0 but creates no output).
+#[cfg(target_os = "linux")]
+pub async fn debugfs_rdump(
+    ext4_path: &Path,
+    src_path: &str,
+    dst_dir: &Path,
+) -> Result<bool, SandboxFetchError> {
+    let base = Path::new(src_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| SandboxFetchError::Debugfs {
+            context: format!("rdump: invalid src_path {src_path}"),
+            stderr: String::new(),
+        })?;
+
+    let cmd_str = format!("rdump {} {}", src_path, dst_dir.display());
+    let out = Command::new("debugfs")
+        .args(["-R", &cmd_str, &ext4_path.to_string_lossy()])
+        .output()
+        .await?;
+
+    if !out.status.success() {
+        return Err(SandboxFetchError::Debugfs {
+            context: format!("rdump {src_path} from {}", ext4_path.display()),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        });
+    }
+
+    // If debugfs silently skipped a missing path, the expected output won't exist.
+    Ok(dst_dir.join(base).exists())
+}
+
+/// Read commits out of a Workspace ext4 into `pool` using `debugfs rdump`
+/// (no `losetup`/`mount`/`CAP_SYS_ADMIN`). Any symlinks present in the
+/// extracted `.git` are scrubbed before the hardened `git fetch` runs.
+///
+/// `ext4_path` must contain a `.git` directory at the root of the Workspace.
+/// `user_script_uid` is consulted only when the current process is root.
 #[cfg(target_os = "linux")]
 pub async fn sandbox_fetch_from_ext4(
     pool: &BranchPool,
@@ -332,75 +372,28 @@ pub async fn sandbox_fetch_from_ext4(
     output_branch: Option<&str>,
     user_script_uid: u32,
 ) -> Result<(), SandboxFetchError> {
-    // Validate first so we fail before touching the kernel loop subsystem.
     pool.validate_run_output_targets(run_id, output_branch).await?;
 
-    let loop_dev = losetup_attach(ext4_path).await?;
-    let mnt = make_mount_dir().await?;
+    let tmp = tempfile::TempDir::new()?;
+    let tmp_path = tmp.path();
 
-    let inner = async {
-        let mount_argv = build_mount_argv(&loop_dev, &mnt);
-        let argv_refs: Vec<&str> = mount_argv.iter().map(String::as_str).collect();
-        let mount_out = Command::new("mount").args(&argv_refs).output().await?;
-        if !mount_out.status.success() {
-            return Err(SandboxFetchError::Mount {
-                context: format!("mount {loop_dev} {}", mnt.display()),
-                stderr: String::from_utf8_lossy(&mount_out.stderr).to_string(),
-            });
-        }
-
-        let source_git_dir = mnt.join(".git");
-        fetch_pool_from_git_dir(pool, &source_git_dir, run_id, output_branch, user_script_uid).await
-    };
-
-    let fetch_result = inner.await;
-
-    // Always clean up: umount → losetup -d → rmdir.
-    let _ = Command::new("umount").arg(&mnt).status().await;
-    let _ = Command::new("losetup").args(["-d", &loop_dev]).status().await;
-    let _ = std::fs::remove_dir_all(&mnt);
-
-    fetch_result
-}
-
-#[cfg(target_os = "linux")]
-async fn losetup_attach(ext4_path: &Path) -> Result<String, SandboxFetchError> {
-    let out = Command::new("losetup")
-        .args(["-f", "--show", &ext4_path.to_string_lossy()])
-        .output()
-        .await?;
-    if !out.status.success() {
-        return Err(SandboxFetchError::Loop {
-            context: format!("losetup -f --show {}", ext4_path.display()),
-            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    let found = debugfs_rdump(ext4_path, "/.git", tmp_path).await?;
+    if !found {
+        return Err(SandboxFetchError::Debugfs {
+            context: format!("rdump /.git from {}", ext4_path.display()),
+            stderr: ".git not found in workspace ext4".into(),
         });
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
+    scrub_symlinks(&tmp_path.join(".git"))?;
 
-#[cfg(target_os = "linux")]
-async fn make_mount_dir() -> Result<PathBuf, SandboxFetchError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "bunsen-sbf-{}-{}",
-        std::process::id(),
-        n
-    ));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-// Keep make_mount_dir available to non-Linux for symmetry of the API surface
-// (currently unused there, but harmless).
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-async fn make_mount_dir() -> Result<PathBuf, SandboxFetchError> {
-    Err(SandboxFetchError::Mount {
-        context: "make_mount_dir".into(),
-        stderr: "ext4 mount only supported on linux".into(),
-    })
+    fetch_pool_from_git_dir(
+        pool,
+        &tmp_path.join(".git"),
+        run_id,
+        output_branch,
+        user_script_uid,
+    )
+    .await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -551,20 +544,6 @@ mod tests {
             HARDENING_ENV_VARS.iter().copied().collect();
         assert_eq!(env.get("GIT_CONFIG_NOSYSTEM"), Some(&"1"));
         assert_eq!(env.get("GIT_CONFIG_GLOBAL"), Some(&"/dev/null"));
-    }
-
-    #[test]
-    fn mount_options_string_is_the_load_bearing_quad() {
-        assert_eq!(MOUNT_OPTIONS, "ro,nosuid,nodev,noexec");
-    }
-
-    #[test]
-    fn build_mount_argv_uses_hardening_quad() {
-        let argv = build_mount_argv("/dev/loop7", Path::new("/tmp/mnt"));
-        assert_eq!(argv[0], "-o");
-        assert_eq!(argv[1], "ro,nosuid,nodev,noexec");
-        assert_eq!(argv[2], "/dev/loop7");
-        assert_eq!(argv[3], "/tmp/mnt");
     }
 
     // ── Deprivilege decision ──────────────────────────────────────────────
@@ -846,5 +825,179 @@ mod tests {
         assert!(!dst.join("README.md").exists());
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&dst).ok();
+    }
+
+    // ── scrub_symlinks ────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn scrub_symlinks_removes_symlinks_and_leaves_regular_files() {
+        use std::os::unix::fs::symlink;
+        let dir = make_temp_dir("scrub-sym");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("regular.txt"), b"keep").unwrap();
+        std::fs::write(dir.join("sub").join("nested.txt"), b"keep").unwrap();
+        // Absolute out-of-tree symlink — the adversarial case.
+        symlink("/etc/passwd", dir.join("bad_link")).unwrap();
+        // Relative in-tree symlink — also scrubbed.
+        symlink("../regular.txt", dir.join("sub").join("relative_link")).unwrap();
+
+        scrub_symlinks(&dir).unwrap();
+
+        assert!(dir.join("regular.txt").exists(), "regular file must survive");
+        assert!(dir.join("sub").join("nested.txt").exists(), "nested file must survive");
+        assert!(!dir.join("bad_link").exists(), "absolute symlink must be removed");
+        assert!(
+            !dir.join("sub").join("relative_link").exists(),
+            "relative symlink must be removed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── debugfs_rdump + sandbox_fetch_from_ext4 (Linux only, requires mkfs.ext4 + debugfs) ──
+
+    #[cfg(target_os = "linux")]
+    fn make_workspace_ext4(src: &Path, size: &str) -> PathBuf {
+        let ext4 = src.with_extension("ext4");
+        let status = StdCommand::new("mkfs.ext4")
+            .args([
+                "-F",
+                "-q",
+                "-d",
+                &src.to_string_lossy(),
+                &ext4.to_string_lossy(),
+                size,
+            ])
+            .status()
+            .expect("mkfs.ext4 must be available for ext4 fixture tests");
+        assert!(status.success(), "mkfs.ext4 failed for {src:?}");
+        ext4
+    }
+
+    #[cfg(target_os = "linux")]
+    fn has_debugfs() -> bool {
+        StdCommand::new("debugfs").arg("-V").output().is_ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn debugfs_rdump_extracts_directory_from_ext4() {
+        if !has_debugfs() {
+            return;
+        }
+        let src = make_temp_dir("dbgfs-src");
+        std::fs::create_dir_all(src.join("mydir")).unwrap();
+        std::fs::write(src.join("mydir").join("hello.txt"), b"hello\n").unwrap();
+        let ext4 = make_workspace_ext4(&src, "10M");
+
+        let dst = make_temp_dir("dbgfs-dst");
+        let found = debugfs_rdump(&ext4, "/mydir", &dst).await.unwrap();
+
+        assert!(found, "/mydir must be found in ext4");
+        assert_eq!(
+            std::fs::read(dst.join("mydir").join("hello.txt")).unwrap(),
+            b"hello\n"
+        );
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_file(&ext4).ok();
+        std::fs::remove_dir_all(&dst).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn debugfs_rdump_returns_false_for_missing_path() {
+        if !has_debugfs() {
+            return;
+        }
+        let src = make_temp_dir("dbgfs-miss-src");
+        let ext4 = make_workspace_ext4(&src, "10M");
+
+        let dst = make_temp_dir("dbgfs-miss-dst");
+        let found = debugfs_rdump(&ext4, "/nonexistent", &dst).await.unwrap();
+
+        assert!(!found, "nonexistent path must return Ok(false)");
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_file(&ext4).ok();
+        std::fs::remove_dir_all(&dst).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandbox_fetch_from_ext4_writes_pool_ref_via_debugfs() {
+        if !has_debugfs() {
+            return;
+        }
+        let (work, sha) = make_workspace_repo("ext4-pool");
+        let ext4 = make_workspace_ext4(&work, "16M");
+
+        let pool_dir = make_temp_dir("pool-ext4");
+        let pool = BranchPool::init(pool_dir.clone()).await.unwrap();
+
+        sandbox_fetch_from_ext4(&pool, &ext4, "01HEXT1", None, current_uid())
+            .await
+            .unwrap();
+
+        assert_eq!(ref_sha(&pool_dir, "refs/heads/runs/01HEXT1"), sha);
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_file(&ext4).ok();
+        std::fs::remove_dir_all(&pool_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandbox_fetch_from_ext4_also_writes_output_branch() {
+        if !has_debugfs() {
+            return;
+        }
+        let (work, sha) = make_workspace_repo("ext4-out");
+        let ext4 = make_workspace_ext4(&work, "16M");
+
+        let pool_dir = make_temp_dir("pool-ext4-out");
+        let pool = BranchPool::init(pool_dir.clone()).await.unwrap();
+
+        sandbox_fetch_from_ext4(&pool, &ext4, "01HEXT2", Some("feature/done"), current_uid())
+            .await
+            .unwrap();
+
+        assert_eq!(ref_sha(&pool_dir, "refs/heads/runs/01HEXT2"), sha);
+        assert_eq!(ref_sha(&pool_dir, "refs/heads/feature/done"), sha);
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_file(&ext4).ok();
+        std::fs::remove_dir_all(&pool_dir).ok();
+    }
+
+    #[cfg(all(target_os = "linux", unix))]
+    #[tokio::test]
+    async fn sandbox_fetch_from_ext4_symlink_in_git_is_scrubbed() {
+        // A symlink planted inside .git/ by an adversarial agent must not
+        // survive into the host extraction dir (it is scrubbed before git fetch).
+        if !has_debugfs() {
+            return;
+        }
+        use std::os::unix::fs::symlink;
+        let (work, sha) = make_workspace_repo("ext4-sym");
+        // Plant an adversarial symlink inside .git/hooks/
+        std::fs::create_dir_all(work.join(".git").join("hooks")).unwrap();
+        symlink("/etc/passwd", work.join(".git").join("hooks").join("escape")).unwrap();
+
+        let ext4 = make_workspace_ext4(&work, "16M");
+
+        let pool_dir = make_temp_dir("pool-ext4-sym");
+        let pool = BranchPool::init(pool_dir.clone()).await.unwrap();
+
+        // Extraction must succeed (symlink scrubbed, not followed).
+        sandbox_fetch_from_ext4(&pool, &ext4, "01HEXT3", None, current_uid())
+            .await
+            .unwrap();
+
+        assert_eq!(ref_sha(&pool_dir, "refs/heads/runs/01HEXT3"), sha);
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_file(&ext4).ok();
+        std::fs::remove_dir_all(&pool_dir).ok();
     }
 }
