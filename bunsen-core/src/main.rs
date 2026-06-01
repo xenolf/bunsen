@@ -37,58 +37,86 @@ mod sandbox_supervisor;
 #[cfg(target_os = "linux")]
 mod smoke_test;
 
+use clap::{Args, Parser, Subcommand};
 use events::{SCHEMA_VERSION, BUNSEN_VERSION};
 use run_dir::{RunDir, MetaJson, ResourceLimits};
 use serde_json::json;
 
+#[derive(Parser)]
+#[command(name = "bunsen-core")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Run(RunArgs),
+    Session(session_cli::SessionArgs),
+    SandboxSmokeTest(SandboxSmokeTestArgs),
+}
+
+#[derive(Args)]
+struct RunArgs {
+    #[arg(long)]
+    spec: String,
+    #[arg(long)]
+    kernel: Option<std::path::PathBuf>,
+    #[arg(long)]
+    rootfs: Option<std::path::PathBuf>,
+    #[arg(long)]
+    firecracker: Option<std::path::PathBuf>,
+    #[arg(long)]
+    session: Option<String>,
+    #[arg(long)]
+    manage_firewall: bool,
+}
+
+#[derive(Args)]
+struct SandboxSmokeTestArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse();
 
-    // Subcommand dispatch.
-    if args.get(1).map(|s| s.as_str()) == Some("sandbox-smoke-test") {
-        #[cfg(target_os = "linux")]
-        {
-            if let Err(e) = smoke_test::run(&args[2..]).await {
-                eprintln!("smoke-test failed: {e:#}");
+    match cli.command {
+        Command::SandboxSmokeTest(args) => {
+            #[cfg(target_os = "linux")]
+            {
+                if let Err(e) = smoke_test::run(&args.args).await {
+                    eprintln!("smoke-test failed: {e:#}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = args;
+                eprintln!("sandbox-smoke-test: Linux + KVM required");
                 std::process::exit(1);
             }
-            return;
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            eprintln!("sandbox-smoke-test: Linux + KVM required");
-            std::process::exit(1);
+
+        Command::Session(args) => {
+            std::process::exit(session_cli::run(args).await);
         }
+
+        Command::Run(cli) => run_main(cli).await,
     }
+}
 
-    // Slice 11: `session` subcommand surface — User-Script-facing verbs that
-    // wrap the Rust [`Session`] API. Each subcommand prints JSON on stdout
-    // for parseability from the Python wrappers.
-    if args.get(1).map(|s| s.as_str()) == Some("session") {
-        std::process::exit(session_cli::run(&args[2..]).await);
-    }
-
-    let cli = parse_cli_args(&args);
-
-    let spec_json = cli.spec.unwrap_or_else(|| {
-        eprintln!("usage: bunsen-core --spec <json>");
-        std::process::exit(1);
-    });
+async fn run_main(cli: RunArgs) {
+    let spec_json = cli.spec.clone();
 
     let spec = run_spec::RunSpec::from_json(&spec_json).unwrap_or_else(|e| {
         eprintln!("invalid spec: {e}");
         std::process::exit(1);
     });
 
-    // Slice 11: `bunsen-core --session <id> --spec <json>` ties a Run to an
-    // existing Session and drives it through [`Session::run`]/[`Session::run_with_backend`],
-    // which own workspace materialisation, supervisor dispatch, and (when a
-    // kernel was supplied) Firecracker sandbox dispatch with Pool extraction.
-    // Slice 12 adds the kernel/rootfs flags to the session path so the
-    // sandbox can be used per-Session, not just from the pre-Session legacy
-    // CLI.
-    if let Some(sid) = cli.session_id.clone() {
+    if let Some(sid) = cli.session.clone() {
         let mut sess = match session::Session::attach(&sid) {
             Ok(s) => s,
             Err(e) => {
@@ -96,11 +124,6 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        // Lazy kernel + OCI-rootfs resolution now lives inside
-        // `Session::run_with_backend` so any Session caller (CLI or Python)
-        // gets the same behaviour without duplicating the logic. The CLI
-        // just forwards its flags as RunBackend overrides; an absent
-        // `--kernel` + `spec.oci_image` set will lazy-fetch correctly.
         let backend = session::RunBackend {
             kernel: cli.kernel.clone(),
             rootfs: cli.rootfs.clone(),
@@ -128,16 +151,6 @@ async fn main() {
     }
 
     // ── Slice 02 (v1.1): lazy kernel resolve ──────────────────────────────
-    // On Linux, when sandbox mode is intended but the user didn't pass an
-    // explicit `--kernel /path`, fetch the pinned Firecracker-CI vmlinux
-    // (lazy on first call, cached afterwards). Side-effecting work — run_dir
-    // creation, transcript open, run_started emission — happens *after* this
-    // step so a download/SHA failure surfaces as a clean top-level error
-    // rather than partway through a Run.
-    //
-    // The trigger for "sandbox is intended" is `--rootfs` or `spec.oci_image`.
-    // Without either we have nothing to boot, so we fall through to the
-    // host-subprocess path and don't waste a kernel fetch.
     #[cfg(target_os = "linux")]
     let resolved_kernel: Option<std::path::PathBuf> = if let Some(k) = cli.kernel.clone() {
         Some(k)
@@ -160,13 +173,6 @@ async fn main() {
     let actor = privileged_net::start_actor();
 
     // ── Slice 10k: host firewall probe ────────────────────────────────────
-    // Probe BEFORE we touch the run_dir, transcript, or emit run_started so
-    // that an aborted probe leaves zero side effects on the host. Only runs
-    // on Linux when we'll enter sandbox mode (kernel resolved); macOS and
-    // host-subprocess paths don't share a kernel with the L7 proxy and have
-    // nothing to probe. Shared with `Session::run_with_backend` via
-    // `firewall::enforce_host_firewall_policy` so both surfaces emit the
-    // identical message at the identical timing (slice 13).
     #[cfg(target_os = "linux")]
     if resolved_kernel.is_some() {
         if let Err(msg) = firewall::enforce_host_firewall_policy(cli.manage_firewall, &actor).await {
@@ -178,12 +184,6 @@ async fn main() {
     let run_id = ulid::generate();
     eprintln!("{run_id}");
 
-    // Slice 08: Run dirs nest under their owning Session at
-    // sessions/<id>/runs/<run-id>/. The CLI doesn't yet have a Session
-    // (slice 11 wires `bunsen run --session <id>`), so until then we
-    // synthesize a `__cli__` session dir under the sessions root. The
-    // synthetic id has no meta.json, so Session::list silently ignores
-    // it — no risk of it surfacing as a real Session.
     let session_path = cli_session_dir();
     if let Err(e) = std::fs::create_dir_all(&session_path) {
         eprintln!("failed to create cli session dir: {e}");
@@ -196,12 +196,6 @@ async fn main() {
 
     run_dir.write_spec(&spec_json).ok();
 
-    // Workspace materialisation runs inside Session::run starting at slice 09.
-    // The CLI path (bunsen-core --spec ...) doesn't yet have a Session, so the
-    // workspace stays empty here — the adapter is responsible for whatever
-    // host-side state it needs until that wiring lands. We allocate it as a
-    // sibling of the Run dir (not a child) so that nothing downstream relies
-    // on the removed `RunDir::workspace_path()` accessor.
     let workspace_path = run_dir.path.join("workspace");
     if let Err(e) = std::fs::create_dir_all(&workspace_path) {
         eprintln!("failed to create workspace dir: {e}");
@@ -255,7 +249,6 @@ async fn main() {
         "transcript_path": transcript_path,
     })).unwrap();
 
-    // ── Dispatch: sandbox (Linux + --kernel/--rootfs) or host subprocess ───
     let agent_history_path = run_dir.agent_history_path();
     #[cfg(target_os = "linux")]
     let result = run_with_backend(resolved_kernel, cli.rootfs, cli.firecracker, cli.manage_firewall, &spec, &run_id, &mut enc, &workspace_path, Some(&agent_history_path), &actor).await;
@@ -310,7 +303,6 @@ async fn run_with_backend(
                     .map_err(|e| std::io::Error::other(format!("{e:#}")))?
             }
         };
-        // Resolve the owner user for TAP creation (current user for the CLI path).
         let owner_user = nix::unistd::User::from_uid(nix::unistd::getuid())
             .ok()
             .flatten()
@@ -352,148 +344,134 @@ async fn run_with_backend(
     supervisor::run(spec, run_id, enc, workspace_path, agent_history_path).await
 }
 
-struct CliArgs {
-    spec: Option<String>,
-    kernel: Option<std::path::PathBuf>,
-    rootfs: Option<std::path::PathBuf>,
-    firecracker: Option<std::path::PathBuf>,
-    manage_firewall: bool,
-    /// Slice 11: tie the Run to a Session by ULID. When set, Session::run
-    /// drives the Run end-to-end (materialise from Pool → run agent →
-    /// extract back into Pool). Without it, the legacy CLI path keeps the
-    /// pre-Session behaviour for backwards compatibility.
-    session_id: Option<String>,
-}
-
-/// Transitional sessions-root subdir for CLI invocations. Used until
-/// slice 11 wires `bunsen run --session <id>`. Carries no `meta.json`,
-/// so `Session::list` ignores it.
+/// Transitional sessions-root subdir for CLI invocations without a Session.
+/// Carries no `meta.json`, so `Session::list` ignores it.
 fn cli_session_dir() -> std::path::PathBuf {
     bunsen_paths::sessions_root().join("__cli__")
 }
-
-fn parse_cli_args(args: &[String]) -> CliArgs {
-    let mut spec = None;
-    let mut kernel = None;
-    let mut rootfs = None;
-    let mut firecracker = None;
-    let mut manage_firewall = false;
-    let mut session_id: Option<String> = None;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--spec" if i + 1 < args.len() => { spec = Some(args[i+1].clone()); i += 2; }
-            "--kernel" if i + 1 < args.len() => { kernel = Some(std::path::PathBuf::from(&args[i+1])); i += 2; }
-            "--rootfs" if i + 1 < args.len() => { rootfs = Some(std::path::PathBuf::from(&args[i+1])); i += 2; }
-            "--firecracker" if i + 1 < args.len() => { firecracker = Some(std::path::PathBuf::from(&args[i+1])); i += 2; }
-            "--session" if i + 1 < args.len() => { session_id = Some(args[i+1].clone()); i += 2; }
-            "--manage-firewall" => { manage_firewall = true; i += 1; }
-            other => {
-                if let Some(v) = other.strip_prefix("--spec=") { spec = Some(v.to_string()); }
-                else if let Some(v) = other.strip_prefix("--kernel=") { kernel = Some(std::path::PathBuf::from(v)); }
-                else if let Some(v) = other.strip_prefix("--rootfs=") { rootfs = Some(std::path::PathBuf::from(v)); }
-                else if let Some(v) = other.strip_prefix("--firecracker=") { firecracker = Some(std::path::PathBuf::from(v)); }
-                else if let Some(v) = other.strip_prefix("--session=") { session_id = Some(v.to_string()); }
-                i += 1;
-            }
-        }
-    }
-    CliArgs { spec, kernel, rootfs, firecracker, manage_firewall, session_id }
-}
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn strs(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    #[test]
+    fn parse_run_kernel_rootfs_spec() {
+        let cli = Cli::try_parse_from(&[
+            "bunsen-core", "run",
+            "--kernel", "/vmlinux",
+            "--rootfs", "/rootfs.ext4",
+            "--spec", r#"{"adapter":"black-box","cmd":["echo"]}"#,
+        ]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("expected Run") };
+        assert_eq!(args.kernel.unwrap().to_str().unwrap(), "/vmlinux");
+        assert_eq!(args.rootfs.unwrap().to_str().unwrap(), "/rootfs.ext4");
+        assert!(!args.spec.is_empty());
+        assert!(args.firecracker.is_none());
     }
 
     #[test]
-    fn parse_cli_kernel_rootfs_spec() {
-        let args = strs(&["bunsen-core", "--kernel", "/vmlinux", "--rootfs", "/rootfs.ext4", "--spec", r#"{"adapter":"black-box","cmd":["echo"]}"#]);
-        let cli = parse_cli_args(&args);
-        assert_eq!(cli.kernel.unwrap().to_str().unwrap(), "/vmlinux");
-        assert_eq!(cli.rootfs.unwrap().to_str().unwrap(), "/rootfs.ext4");
-        assert!(cli.spec.is_some());
-        assert!(cli.firecracker.is_none());
+    fn parse_run_firecracker_optional() {
+        let cli = Cli::try_parse_from(&[
+            "bunsen-core", "run",
+            "--kernel", "/k",
+            "--rootfs", "/r",
+            "--firecracker", "/fc",
+            "--spec", "{}",
+        ]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("expected Run") };
+        assert_eq!(args.firecracker.unwrap().to_str().unwrap(), "/fc");
     }
 
     #[test]
-    fn parse_cli_firecracker_optional() {
-        let args = strs(&["bunsen-core", "--kernel", "/k", "--rootfs", "/r", "--firecracker", "/fc", "--spec", "{}"]);
-        let cli = parse_cli_args(&args);
-        assert_eq!(cli.firecracker.unwrap().to_str().unwrap(), "/fc");
+    fn parse_run_no_sandbox_flags() {
+        let cli = Cli::try_parse_from(&[
+            "bunsen-core", "run",
+            "--spec", r#"{"adapter":"black-box","cmd":["echo"]}"#,
+        ]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("expected Run") };
+        assert!(args.kernel.is_none());
+        assert!(args.rootfs.is_none());
+        assert!(!args.spec.is_empty());
+        assert!(!args.manage_firewall);
     }
 
     #[test]
-    fn parse_cli_no_sandbox_flags() {
-        let args = strs(&["bunsen-core", "--spec", r#"{"adapter":"black-box","cmd":["echo"]}"#]);
-        let cli = parse_cli_args(&args);
-        assert!(cli.kernel.is_none());
-        assert!(cli.rootfs.is_none());
-        assert!(cli.spec.is_some());
-        assert!(!cli.manage_firewall);
+    fn parse_run_manage_firewall_flag() {
+        let cli = Cli::try_parse_from(&[
+            "bunsen-core", "run",
+            "--manage-firewall",
+            "--spec", "{}",
+        ]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("expected Run") };
+        assert!(args.manage_firewall);
     }
 
     #[test]
-    fn parse_cli_manage_firewall_flag() {
-        let args = strs(&["bunsen-core", "--manage-firewall", "--spec", "{}"]);
-        let cli = parse_cli_args(&args);
-        assert!(cli.manage_firewall);
-        assert!(cli.spec.is_some());
+    fn parse_run_manage_firewall_default_false() {
+        let cli = Cli::try_parse_from(&[
+            "bunsen-core", "run",
+            "--kernel", "/k",
+            "--rootfs", "/r",
+            "--spec", "{}",
+        ]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("expected Run") };
+        assert!(!args.manage_firewall);
     }
 
     #[test]
-    fn parse_cli_manage_firewall_default_false() {
-        let args = strs(&["bunsen-core", "--kernel", "/k", "--rootfs", "/r", "--spec", "{}"]);
-        let cli = parse_cli_args(&args);
-        assert!(!cli.manage_firewall);
+    fn parse_run_session_flag() {
+        let cli = Cli::try_parse_from(&[
+            "bunsen-core", "run",
+            "--session", "01HSESSION0000000000000000",
+            "--spec", "{}",
+        ]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("expected Run") };
+        assert_eq!(args.session.as_deref(), Some("01HSESSION0000000000000000"));
     }
 
     #[test]
-    fn parse_cli_session_flag_space_form() {
-        let args = strs(&["bunsen-core", "--session", "01HSESSION0000000000000000", "--spec", "{}"]);
-        let cli = parse_cli_args(&args);
-        assert_eq!(cli.session_id.as_deref(), Some("01HSESSION0000000000000000"));
+    fn parse_run_session_default_none() {
+        let cli = Cli::try_parse_from(&[
+            "bunsen-core", "run",
+            "--spec", "{}",
+        ]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("expected Run") };
+        assert!(args.session.is_none());
     }
 
     #[test]
-    fn parse_cli_session_flag_equals_form() {
-        let args = strs(&["bunsen-core", "--session=01HSESSION0000000000000000", "--spec", "{}"]);
-        let cli = parse_cli_args(&args);
-        assert_eq!(cli.session_id.as_deref(), Some("01HSESSION0000000000000000"));
+    fn parse_run_session_with_kernel_and_rootfs() {
+        let cli = Cli::try_parse_from(&[
+            "bunsen-core", "run",
+            "--session", "01HSESSION0000000000000000",
+            "--kernel", "/vmlinux",
+            "--rootfs", "/rootfs.ext4",
+            "--spec", "{}",
+        ]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("expected Run") };
+        assert_eq!(args.session.as_deref(), Some("01HSESSION0000000000000000"));
+        assert_eq!(args.kernel.unwrap().to_str().unwrap(), "/vmlinux");
+        assert_eq!(args.rootfs.unwrap().to_str().unwrap(), "/rootfs.ext4");
     }
 
     #[test]
-    fn parse_cli_session_default_none() {
-        let args = strs(&["bunsen-core", "--spec", "{}"]);
-        let cli = parse_cli_args(&args);
-        assert!(cli.session_id.is_none());
+    fn parse_session_as_user() {
+        let cli = Cli::try_parse_from(&[
+            "bunsen-core", "session",
+            "--as-user", "alice",
+            "list",
+        ]).unwrap();
+        let Command::Session(args) = cli.command else { panic!("expected Session") };
+        assert_eq!(args.as_user.as_deref(), Some("alice"));
     }
 
-    /// Slice 12 (Firecracker dispatch through Session::run): the
-    /// `--session <id> --kernel <p> --rootfs <p>` argument set parses as a
-    /// single CLI call so the binary can route the Run through
-    /// `Session::run_with_backend` with a sandbox-shaped RunBackend.
     #[test]
-    fn parse_cli_session_with_kernel_and_rootfs() {
-        let args = strs(&[
-            "bunsen-core",
-            "--session",
-            "01HSESSION0000000000000000",
-            "--kernel",
-            "/vmlinux",
-            "--rootfs",
-            "/rootfs.ext4",
-            "--spec",
-            "{}",
-        ]);
-        let cli = parse_cli_args(&args);
-        assert_eq!(cli.session_id.as_deref(), Some("01HSESSION0000000000000000"));
-        assert_eq!(cli.kernel.unwrap().to_str().unwrap(), "/vmlinux");
-        assert_eq!(cli.rootfs.unwrap().to_str().unwrap(), "/rootfs.ext4");
-        assert!(cli.spec.is_some());
+    fn parse_session_as_user_absent() {
+        let cli = Cli::try_parse_from(&[
+            "bunsen-core", "session",
+            "list",
+        ]).unwrap();
+        let Command::Session(args) = cli.command else { panic!("expected Session") };
+        assert!(args.as_user.is_none());
     }
 }

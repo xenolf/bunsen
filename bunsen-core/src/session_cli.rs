@@ -6,114 +6,106 @@
 
 use std::path::PathBuf;
 
+use clap::{Args, Subcommand};
 use serde_json::json;
 
 use crate::branch_pool::ManifestEntry;
 use crate::session::{ListFilter, Session, SessionError};
 
-/// Entry point. `argv` is `&args[2..]` — i.e. everything after the
-/// `session` literal. Returns the process exit code.
-pub async fn run(argv: &[String]) -> i32 {
-    // Extract --as-user before the verb so every Session verb gets the
-    // resolved user and privilege drop.
-    let (as_user, verb_argv) = extract_as_user(argv);
+#[derive(Args)]
+pub struct SessionArgs {
+    #[arg(long)]
+    pub as_user: Option<String>,
+    #[command(subcommand)]
+    pub command: SessionCommand,
+}
 
-    if let Err(msg) = crate::target_user::resolve_and_drop(as_user) {
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    Open(OpenArgs),
+    Attach(AttachArgs),
+    List(ListArgs),
+    Show(ShowArgs),
+    Close(CloseArgs),
+    Discard(DiscardArgs),
+    Label(LabelArgs),
+    Purge(PurgeArgs),
+}
+
+#[derive(Args)]
+pub struct OpenArgs {
+    pub host_repo: PathBuf,
+    #[arg(long)]
+    pub mirror: Vec<String>,
+    #[arg(long)]
+    pub label: Option<String>,
+}
+
+#[derive(Args)]
+pub struct AttachArgs {
+    pub id: String,
+}
+
+#[derive(Args)]
+pub struct ListArgs {
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
+    pub with_tombstones: bool,
+}
+
+#[derive(Args)]
+pub struct ShowArgs {
+    pub id: String,
+}
+
+fn parse_manifest_entry(s: &str) -> Result<ManifestEntry, String> {
+    parse_pair(s).map_err(|e| e.to_string())
+}
+
+#[derive(Args)]
+pub struct CloseArgs {
+    pub id: String,
+    #[arg(long, value_parser = parse_manifest_entry, required = true)]
+    pub pair: Vec<ManifestEntry>,
+}
+
+#[derive(Args)]
+pub struct DiscardArgs {
+    pub id: String,
+}
+
+#[derive(Args)]
+pub struct LabelArgs {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Args)]
+pub struct PurgeArgs {
+    pub id: String,
+}
+
+/// Entry point called from `main`. Returns the process exit code.
+pub async fn run(args: SessionArgs) -> i32 {
+    if let Err(msg) = crate::target_user::resolve_and_drop(args.as_user) {
         eprintln!("{msg}");
         return 1;
     }
-
-    let Some((sub, rest)) = verb_argv.split_first() else {
-        eprintln!("{}", usage());
-        return 2;
-    };
-    match sub.as_str() {
-        "open" => cmd_open(rest).await,
-        "attach" => cmd_attach(rest),
-        "list" => cmd_list(rest),
-        "show" => cmd_show(rest),
-        "close" => cmd_close(rest).await,
-        "discard" => cmd_discard(rest),
-        "label" => cmd_label(rest),
-        "purge" => cmd_purge(rest),
-        "-h" | "--help" | "help" => {
-            println!("{}", usage());
-            0
-        }
-        other => {
-            eprintln!("unknown session subcommand: {other:?}\n\n{}", usage());
-            2
-        }
+    match args.command {
+        SessionCommand::Open(a) => cmd_open(a).await,
+        SessionCommand::Attach(a) => cmd_attach(a),
+        SessionCommand::List(a) => cmd_list(a),
+        SessionCommand::Show(a) => cmd_show(a),
+        SessionCommand::Close(a) => cmd_close(a).await,
+        SessionCommand::Discard(a) => cmd_discard(a),
+        SessionCommand::Label(a) => cmd_label(a),
+        SessionCommand::Purge(a) => cmd_purge(a),
     }
 }
 
-fn extract_as_user(argv: &[String]) -> (Option<String>, Vec<String>) {
-    let mut as_user = None;
-    let mut rest = Vec::new();
-    let mut i = 0;
-    while i < argv.len() {
-        if argv[i] == "--as-user" && i + 1 < argv.len() {
-            as_user = Some(argv[i + 1].clone());
-            i += 2;
-        } else if let Some(v) = argv[i].strip_prefix("--as-user=") {
-            as_user = Some(v.to_string());
-            i += 1;
-        } else {
-            rest.push(argv[i].clone());
-            i += 1;
-        }
-    }
-    (as_user, rest)
-}
-
-fn usage() -> &'static str {
-    "usage: bunsen-core session [--as-user <name|uid>] <subcommand> [...]\n\
-     \n\
-     subcommands:\n\
-       open <host-repo> [--mirror <ref>]... [--label <label>]\n\
-       attach <id>\n\
-       list [--all] [--with-tombstones]\n\
-       show <id>\n\
-       close <id> --pair <pool>:<host>[:force] [--pair ...]\n\
-       discard <id>\n\
-       label <id> <label>\n\
-       purge <id>"
-}
-
-async fn cmd_open(argv: &[String]) -> i32 {
-    let mut host_repo: Option<PathBuf> = None;
-    let mut mirror: Vec<String> = Vec::new();
-    let mut label: Option<String> = None;
-    let mut i = 0;
-    while i < argv.len() {
-        match argv[i].as_str() {
-            "--mirror" if i + 1 < argv.len() => {
-                mirror.push(argv[i + 1].clone());
-                i += 2;
-            }
-            "--label" if i + 1 < argv.len() => {
-                label = Some(argv[i + 1].clone());
-                i += 2;
-            }
-            other if other.starts_with("--") => {
-                eprintln!("unknown flag for `session open`: {other}");
-                return 2;
-            }
-            other => {
-                if host_repo.is_some() {
-                    eprintln!("unexpected positional arg: {other}");
-                    return 2;
-                }
-                host_repo = Some(PathBuf::from(other));
-                i += 1;
-            }
-        }
-    }
-    let Some(host_repo) = host_repo else {
-        eprintln!("usage: bunsen-core session open <host-repo> [--mirror <ref>]... [--label <label>]");
-        return 2;
-    };
-    match Session::open(&host_repo, mirror, label).await {
+async fn cmd_open(args: OpenArgs) -> i32 {
+    match Session::open(&args.host_repo, args.mirror, args.label).await {
         Ok(s) => {
             println!("{}", json!({"id": s.id(), "path": s.path().display().to_string()}));
             0
@@ -125,12 +117,8 @@ async fn cmd_open(argv: &[String]) -> i32 {
     }
 }
 
-fn cmd_attach(argv: &[String]) -> i32 {
-    let Some(id) = argv.first() else {
-        eprintln!("usage: bunsen-core session attach <id>");
-        return 2;
-    };
-    match Session::attach(id) {
+fn cmd_attach(args: AttachArgs) -> i32 {
+    match Session::attach(&args.id) {
         Ok(s) => {
             println!("{}", summary_json(&s));
             0
@@ -146,18 +134,11 @@ fn cmd_attach(argv: &[String]) -> i32 {
     }
 }
 
-fn cmd_list(argv: &[String]) -> i32 {
-    let mut filter = ListFilter::default();
-    for a in argv {
-        match a.as_str() {
-            "--all" => filter.include_closed = true,
-            "--with-tombstones" => filter.include_tombstones = true,
-            other => {
-                eprintln!("unknown flag for `session list`: {other}");
-                return 2;
-            }
-        }
-    }
+fn cmd_list(args: ListArgs) -> i32 {
+    let filter = ListFilter {
+        include_closed: args.all,
+        include_tombstones: args.with_tombstones,
+    };
     match Session::list(filter) {
         Ok(items) => {
             let arr: Vec<serde_json::Value> = items
@@ -182,12 +163,8 @@ fn cmd_list(argv: &[String]) -> i32 {
     }
 }
 
-fn cmd_show(argv: &[String]) -> i32 {
-    let Some(id) = argv.first() else {
-        eprintln!("usage: bunsen-core session show <id>");
-        return 2;
-    };
-    match Session::attach(id) {
+fn cmd_show(args: ShowArgs) -> i32 {
+    match Session::attach(&args.id) {
         Ok(s) => {
             println!("{}", summary_json(&s));
             0
@@ -203,45 +180,8 @@ fn cmd_show(argv: &[String]) -> i32 {
     }
 }
 
-async fn cmd_close(argv: &[String]) -> i32 {
-    let mut id: Option<String> = None;
-    let mut pairs: Vec<ManifestEntry> = Vec::new();
-    let mut i = 0;
-    while i < argv.len() {
-        match argv[i].as_str() {
-            "--pair" if i + 1 < argv.len() => {
-                match parse_pair(&argv[i + 1]) {
-                    Ok(e) => pairs.push(e),
-                    Err(msg) => {
-                        eprintln!("invalid --pair value {:?}: {msg}", &argv[i + 1]);
-                        return 2;
-                    }
-                }
-                i += 2;
-            }
-            other if other.starts_with("--") => {
-                eprintln!("unknown flag for `session close`: {other}");
-                return 2;
-            }
-            other => {
-                if id.is_some() {
-                    eprintln!("unexpected positional arg: {other}");
-                    return 2;
-                }
-                id = Some(other.to_string());
-                i += 1;
-            }
-        }
-    }
-    let Some(id) = id else {
-        eprintln!("usage: bunsen-core session close <id> --pair <pool>:<host>[:force] [--pair ...]");
-        return 2;
-    };
-    if pairs.is_empty() {
-        eprintln!("session close requires at least one --pair");
-        return 2;
-    }
-    let mut s = match Session::attach(&id) {
+async fn cmd_close(args: CloseArgs) -> i32 {
+    let mut s = match Session::attach(&args.id) {
         Ok(s) => s,
         Err(SessionError::NotFound { id }) => {
             eprintln!("session not found: {id}");
@@ -252,7 +192,7 @@ async fn cmd_close(argv: &[String]) -> i32 {
             return 1;
         }
     };
-    match s.close(&pairs).await {
+    match s.close(&args.pair).await {
         Ok(()) => {
             println!("{}", json!({"id": s.id(), "state": "closed"}));
             0
@@ -264,12 +204,9 @@ async fn cmd_close(argv: &[String]) -> i32 {
     }
 }
 
-fn cmd_discard(argv: &[String]) -> i32 {
-    let Some(id) = argv.first() else {
-        eprintln!("usage: bunsen-core session discard <id>");
-        return 2;
-    };
-    let s = match Session::attach(id) {
+fn cmd_discard(args: DiscardArgs) -> i32 {
+    let id = args.id.clone();
+    let s = match Session::attach(&args.id) {
         Ok(s) => s,
         Err(SessionError::NotFound { id }) => {
             eprintln!("session not found: {id}");
@@ -280,10 +217,9 @@ fn cmd_discard(argv: &[String]) -> i32 {
             return 1;
         }
     };
-    let owned = id.clone();
     match s.discard() {
         Ok(()) => {
-            println!("{}", json!({"id": owned, "state": "discarded"}));
+            println!("{}", json!({"id": id, "state": "discarded"}));
             0
         }
         Err(e) => {
@@ -293,14 +229,8 @@ fn cmd_discard(argv: &[String]) -> i32 {
     }
 }
 
-fn cmd_label(argv: &[String]) -> i32 {
-    if argv.len() < 2 {
-        eprintln!("usage: bunsen-core session label <id> <label>");
-        return 2;
-    }
-    let id = &argv[0];
-    let label = &argv[1];
-    let mut s = match Session::attach(id) {
+fn cmd_label(args: LabelArgs) -> i32 {
+    let mut s = match Session::attach(&args.id) {
         Ok(s) => s,
         Err(SessionError::NotFound { id }) => {
             eprintln!("session not found: {id}");
@@ -311,7 +241,7 @@ fn cmd_label(argv: &[String]) -> i32 {
             return 1;
         }
     };
-    match s.label(label.clone()) {
+    match s.label(args.label) {
         Ok(()) => {
             println!("{}", json!({"id": s.id(), "labels": s.labels()}));
             0
@@ -323,12 +253,9 @@ fn cmd_label(argv: &[String]) -> i32 {
     }
 }
 
-fn cmd_purge(argv: &[String]) -> i32 {
-    let Some(id) = argv.first() else {
-        eprintln!("usage: bunsen-core session purge <id>");
-        return 2;
-    };
-    let s = match Session::attach(id) {
+fn cmd_purge(args: PurgeArgs) -> i32 {
+    let id = args.id.clone();
+    let s = match Session::attach(&args.id) {
         Ok(s) => s,
         Err(SessionError::NotFound { id }) => {
             eprintln!("session not found: {id}");
@@ -339,10 +266,9 @@ fn cmd_purge(argv: &[String]) -> i32 {
             return 1;
         }
     };
-    let owned = id.clone();
     match s.purge() {
         Ok(()) => {
-            println!("{}", json!({"id": owned, "state": "purged"}));
+            println!("{}", json!({"id": id, "state": "purged"}));
             0
         }
         Err(e) => {
@@ -446,39 +372,5 @@ mod tests {
         assert_eq!(state_str(Closed), "closed");
         assert_eq!(state_str(FailedToClose), "failed_to_close");
         assert_eq!(state_str(Discarded), "discarded");
-    }
-
-    // ── --as-user extraction ─────────────────────────────────────────────
-
-    fn strs(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn extract_as_user_space_form() {
-        let (user, rest) = extract_as_user(&strs(&["--as-user", "alice", "open", "/repo"]));
-        assert_eq!(user.as_deref(), Some("alice"));
-        assert_eq!(rest, strs(&["open", "/repo"]));
-    }
-
-    #[test]
-    fn extract_as_user_equals_form() {
-        let (user, rest) = extract_as_user(&strs(&["--as-user=1000", "list"]));
-        assert_eq!(user.as_deref(), Some("1000"));
-        assert_eq!(rest, strs(&["list"]));
-    }
-
-    #[test]
-    fn extract_as_user_absent() {
-        let (user, rest) = extract_as_user(&strs(&["open", "/repo", "--label", "test"]));
-        assert!(user.is_none());
-        assert_eq!(rest, strs(&["open", "/repo", "--label", "test"]));
-    }
-
-    #[test]
-    fn extract_as_user_after_verb() {
-        let (user, rest) = extract_as_user(&strs(&["open", "--as-user", "bob", "/repo"]));
-        assert_eq!(user.as_deref(), Some("bob"));
-        assert_eq!(rest, strs(&["open", "/repo"]));
     }
 }

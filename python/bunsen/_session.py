@@ -227,10 +227,10 @@ def _run_argv_suffix(
     firecracker: Optional[str],
     manage_firewall: bool,
 ) -> list[str]:
-    """Build the `--session <id> --spec <json> [flags]` argv tail shared by
+    """Build the `run --session <id> --spec <json> [flags]` argv tail shared by
     `Session.run` (async streaming) and `Session.run_sync` (blocking).
     """
-    argv: list[str] = ["--session", session_id, "--spec", _spec_to_json(spec)]
+    argv: list[str] = ["run", "--session", session_id, "--spec", _spec_to_json(spec)]
     if kernel is not None:
         argv.extend(["--kernel", kernel])
     if rootfs is not None:

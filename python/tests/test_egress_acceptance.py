@@ -125,6 +125,7 @@ async def _collect(spec: dict, timeout: float, rootfs_path: str) -> tuple:
     from bunsen._events import decode_event, RunEnded as _RunEnded
 
     cmd = _kvm_core_bin(rootfs_path).split()
+    cmd.insert(1, "run")
     if _MANAGE_FIREWALL:
         cmd += ["--manage-firewall"]
     cmd += ["--spec", _json.dumps(spec)]
