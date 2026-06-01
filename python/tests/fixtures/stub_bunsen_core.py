@@ -52,6 +52,13 @@ base = {
     "run_id": RUN_ID,
 }
 
+if mode == "fail":
+    # Core rejects the spec before emitting any event: error to stderr,
+    # non-zero exit, nothing on stdout. Mirrors a bad-spec / no-privilege
+    # early failure on the real binary.
+    print("invalid spec: cmd must be a non-empty list", file=sys.stderr, flush=True)
+    sys.exit(2)
+
 if mode == "schema_too_high":
     emit({**base, "schema_version": 999, "seq": 0, "ts": "2026-01-01T00:00:00.000Z",
           "type": "run_started", "adapter": "black-box", "workspace_path": WORKSPACE,

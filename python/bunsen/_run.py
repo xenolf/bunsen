@@ -4,7 +4,23 @@ import asyncio
 import json
 from typing import AsyncIterator, Optional, Sequence
 
-from ._events import RunStarted, decode_event, _Base, SchemaVersionError
+from ._events import RunStarted, RunEnded, decode_event, _Base, SchemaVersionError
+
+
+class RunError(RuntimeError):
+    """Raised through the event stream when `bunsen-core` exits non-zero
+    without emitting a terminal `run_ended` event or a Pool summary line.
+
+    `stderr` is the captured error text and `returncode` is the process exit
+    code, mirroring `SessionError` on the blocking `run_sync` path. Without
+    this, an early core failure (bad spec, missing privileges) would surface
+    as a silent empty event stream with an all-`None` summary.
+    """
+
+    def __init__(self, message: str, *, stderr: str = "", returncode: int = 1):
+        super().__init__(message)
+        self.stderr = stderr
+        self.returncode = returncode
 
 
 class RunHandle:
@@ -31,6 +47,9 @@ class RunHandle:
         self._output_branch_pushed: Optional[str] = None
         self._uncommitted_paths: tuple[str, ...] = ()
         self._summary_run_id: Optional[str] = None
+        # Accumulated stderr (bounded), surfaced via RunError if the run ends
+        # non-zero without a terminal signal.
+        self._stderr_buf = bytearray()
 
     @property
     def id(self) -> Optional[str]:
@@ -60,8 +79,24 @@ class RunHandle:
     def uncommitted_paths(self) -> Sequence[str]:
         return self._uncommitted_paths
 
+    async def _drain_stderr(self, proc: asyncio.subprocess.Process) -> None:
+        if proc.stderr is None:
+            return
+        try:
+            async for chunk in proc.stderr:
+                # Bound the buffer; a runaway stderr should not grow unbounded.
+                if len(self._stderr_buf) < 64 * 1024:
+                    self._stderr_buf.extend(chunk)
+        except Exception:
+            pass
+
     async def _drain(self, proc: asyncio.subprocess.Process) -> None:
         assert proc.stdout is not None
+        # A terminal signal is either a `run_ended` event or the trailing Pool
+        # summary line. If we reach EOF without one and the process exited
+        # non-zero, the run failed before producing any usable output — surface
+        # it as a RunError instead of a silent empty stream.
+        saw_terminal = False
         try:
             async for line in proc.stdout:
                 raw_line = line.decode("utf-8", errors="replace").rstrip("\n")
@@ -82,6 +117,7 @@ class RunHandle:
                     self._pool_sha = obj.get("pool_sha")
                     self._output_branch_pushed = obj.get("output_branch_pushed")
                     self._uncommitted_paths = tuple(obj.get("uncommitted_paths", ()))
+                    saw_terminal = True
                     continue
 
                 try:
@@ -97,8 +133,27 @@ class RunHandle:
                 if isinstance(event, RunStarted):
                     self._workspace_path = event.workspace_path
                     self._transcript_path = event.transcript_path
+                if isinstance(event, RunEnded):
+                    saw_terminal = True
 
                 await self._queue.put(event)
+        except asyncio.CancelledError:
+            raise
+        else:
+            # Reached natural EOF (no early return / no cancellation). If the
+            # run never produced a terminal signal and the process failed,
+            # raise through the stream so the caller sees the error.
+            if not saw_terminal:
+                try:
+                    rc = await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except Exception:
+                    rc = proc.returncode
+                if rc not in (0, None):
+                    err = bytes(self._stderr_buf).decode("utf-8", errors="replace").strip()
+                    msg = f"bunsen-core run exited {rc}"
+                    if err:
+                        msg += f": {err}"
+                    await self._queue.put(RunError(msg, stderr=err, returncode=rc))
         finally:
             await self._queue.put(None)
 
@@ -154,23 +209,26 @@ class _SessionRunContext:
         self._argv = argv
         self._run = RunHandle()
         self._drain_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
 
     async def __aenter__(self) -> RunHandle:
         proc = await asyncio.create_subprocess_exec(
             *self._argv,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE,
         )
         self._run._proc = proc
+        self._stderr_task = asyncio.ensure_future(self._run._drain_stderr(proc))
         self._drain_task = asyncio.ensure_future(self._run._drain(proc))
         return self._run
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         await self._run._terminate()
-        if self._drain_task:
-            self._drain_task.cancel()
-            try:
-                await self._drain_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._drain_task, self._stderr_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass

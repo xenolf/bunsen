@@ -1,6 +1,6 @@
 """bunsen — Python library for orchestrating coding agent Runs."""
 from __future__ import annotations
-from ._run import RunHandle
+from ._run import RunHandle, RunError
 from ._events import (
     RunStarted, RunEnded, Output, EgressDenied, UnknownEvent,
     SchemaVersionError, SCHEMA_VERSION,
@@ -20,7 +20,7 @@ from ._session import (
 )
 
 __all__ = [
-    "RunHandle",
+    "RunHandle", "RunError",
     "RunStarted", "RunEnded", "Output", "EgressDenied", "UnknownEvent",
     "SchemaVersionError", "SCHEMA_VERSION",
     # Slice 11: Session/Pool/Run surface

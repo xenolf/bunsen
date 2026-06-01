@@ -116,6 +116,23 @@ async def test_schema_version_too_high_raises():
 
 
 @pytest.mark.asyncio
+async def test_nonzero_exit_without_events_raises_run_error():
+    """A run that fails before emitting any event surfaces a RunError carrying
+    stderr and the exit code, instead of a silent empty stream."""
+    from bunsen import RunError
+
+    spec = {"adapter": "claude-code", "cmd": ["claude"]}
+    with pytest.raises(RunError) as ei:
+        async with make_session("fail").run(spec) as run:
+            async for _ in run.events:
+                pass
+
+    assert ei.value.returncode == 2
+    assert "invalid spec" in ei.value.stderr
+    assert "invalid spec" in str(ei.value)
+
+
+@pytest.mark.asyncio
 async def test_secret_values_not_in_run_repr():
     """Run handle must not expose secret values via repr or public attributes."""
     spec = {
