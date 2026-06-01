@@ -17,8 +17,9 @@
 //!   directly by tests that cannot exercise the ext4 path.
 //! - [`debugfs_rdump`] (Linux only): extract a single path from an ext4 image
 //!   into a host directory using `debugfs`, without mounting.
-//! - [`scrub_symlinks`]: remove all symlinks from an extracted tree before
-//!   passing it to `git fetch` or the narrow agent-history copy.
+//! - [`scrub_extracted_tree`]: strip symlinks, special files, and setuid/setgid
+//!   bits from an extracted tree — the userspace replacement for the old
+//!   `nosuid,nodev,noexec` mount — before `git fetch` or the agent-history copy.
 //!
 //! All paths share the same hardening: the `-c` flags + `GIT_CONFIG_*` env
 //! + explicit `HEAD:refs/heads/runs/<run-id>` (plus optional
@@ -243,22 +244,56 @@ fn copy_narrow_entry(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-/// Remove every symlink found recursively under `dir`.
+/// Harden an extracted tree in place before it is handed to `git fetch` or the
+/// narrow agent-history copy.
 ///
-/// Called after `debugfs rdump` to ensure no adversarial symlinks planted by
-/// the agent inside the Workspace ext4 survive into the host-side extraction
-/// directory. Regular files and directories are left intact.
-pub fn scrub_symlinks(dir: &Path) -> std::io::Result<()> {
+/// `debugfs rdump` faithfully reproduces whatever the adversarial Workspace
+/// ext4 contained — including inode types and mode bits that the old
+/// `mount -o nosuid,nodev,noexec` posture (ADR-0011) neutralised in the
+/// kernel. With the mount gone, this restores the same guarantees in
+/// userspace, walking the tree with `lstat` (never following links):
+///
+/// - **Symlinks** are removed — an absolute or relative link could redirect a
+///   later read out of the tree (the ADR-0011 escape).
+/// - **Device nodes, FIFOs, and sockets** are removed — the `nodev` half:
+///   nothing downstream should open a Workspace-controlled special file.
+/// - **setuid/setgid bits** are stripped from surviving files and directories
+///   — the `nosuid` half: a root-side extraction must not leave a binary that
+///   could later be executed with elevated privileges.
+///
+/// Regular files and directories are otherwise left intact.
+#[cfg(target_os = "linux")]
+pub fn scrub_extracted_tree(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         // DirEntry::metadata uses lstat — does not follow symlinks.
         let meta = entry.metadata()?;
-        if meta.file_type().is_symlink() {
+        let ft = meta.file_type();
+        if ft.is_symlink() {
             std::fs::remove_file(entry.path())?;
-        } else if meta.file_type().is_dir() {
-            scrub_symlinks(&entry.path())?;
+        } else if ft.is_dir() {
+            strip_setid(&entry.path(), &meta)?;
+            scrub_extracted_tree(&entry.path())?;
+        } else if ft.is_file() {
+            strip_setid(&entry.path(), &meta)?;
+        } else {
+            // Block/char device, FIFO, or socket — the `nodev` half of the
+            // old mount posture. Nothing downstream should open these.
+            std::fs::remove_file(entry.path())?;
         }
+    }
+    Ok(())
+}
+
+/// Clear the setuid/setgid bits on `path` if either is set (the `nosuid` half
+/// of the old mount posture). A no-op when neither bit is present, so the
+/// common case never issues a `chmod`.
+#[cfg(target_os = "linux")]
+fn strip_setid(path: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = meta.permissions().mode();
+    if mode & 0o6000 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o6000))?;
     }
     Ok(())
 }
@@ -341,6 +376,17 @@ pub async fn debugfs_rdump(
             stderr: String::new(),
         })?;
 
+    // `debugfs -R` takes a single space-delimited request line, so whitespace
+    // in `src_path` would split into extra arguments. Every caller passes a
+    // compile-time constant today; reject anything else rather than silently
+    // building a malformed request.
+    if src_path.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err(SandboxFetchError::Debugfs {
+            context: format!("rdump: src_path must not contain whitespace: {src_path}"),
+            stderr: String::new(),
+        });
+    }
+
     let cmd_str = format!("rdump {} {}", src_path, dst_dir.display());
     let out = Command::new("debugfs")
         .args(["-R", &cmd_str, &ext4_path.to_string_lossy()])
@@ -384,7 +430,7 @@ pub async fn sandbox_fetch_from_ext4(
             stderr: ".git not found in workspace ext4".into(),
         });
     }
-    scrub_symlinks(&tmp_path.join(".git"))?;
+    scrub_extracted_tree(&tmp_path.join(".git"))?;
 
     fetch_pool_from_git_dir(
         pool,
@@ -827,22 +873,30 @@ mod tests {
         std::fs::remove_dir_all(&dst).ok();
     }
 
-    // ── scrub_symlinks ────────────────────────────────────────────────────
+    // ── scrub_extracted_tree ──────────────────────────────────────────────
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn scrub_symlinks_removes_symlinks_and_leaves_regular_files() {
-        use std::os::unix::fs::symlink;
-        let dir = make_temp_dir("scrub-sym");
+    fn scrub_extracted_tree_removes_unsafe_entries_and_keeps_regular_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = make_temp_dir("scrub-tree");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("regular.txt"), b"keep").unwrap();
         std::fs::write(dir.join("sub").join("nested.txt"), b"keep").unwrap();
-        // Absolute out-of-tree symlink — the adversarial case.
+        // Absolute out-of-tree symlink — the ADR-0011 escape case.
         symlink("/etc/passwd", dir.join("bad_link")).unwrap();
         // Relative in-tree symlink — also scrubbed.
         symlink("../regular.txt", dir.join("sub").join("relative_link")).unwrap();
+        // A setuid regular file — the `nosuid` case.
+        let suid = dir.join("suid_binary");
+        std::fs::write(&suid, b"#!/bin/true\n").unwrap();
+        std::fs::set_permissions(&suid, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        // A FIFO — a `nodev` special file, created without privilege.
+        let fifo = dir.join("a_fifo");
+        let s = StdCommand::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(s.success(), "mkfifo must be available for this test");
 
-        scrub_symlinks(&dir).unwrap();
+        scrub_extracted_tree(&dir).unwrap();
 
         assert!(dir.join("regular.txt").exists(), "regular file must survive");
         assert!(dir.join("sub").join("nested.txt").exists(), "nested file must survive");
@@ -851,6 +905,14 @@ mod tests {
             !dir.join("sub").join("relative_link").exists(),
             "relative symlink must be removed"
         );
+        assert!(
+            std::fs::symlink_metadata(&fifo).is_err(),
+            "FIFO (special file) must be removed for the nodev posture"
+        );
+        // The setuid file's content survives, but the setuid bit is stripped.
+        assert!(suid.exists(), "regular suid file content must survive");
+        let mode = std::fs::metadata(&suid).unwrap().permissions().mode();
+        assert_eq!(mode & 0o6000, 0, "setuid/setgid bits must be stripped");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -972,32 +1034,44 @@ mod tests {
 
     #[cfg(all(target_os = "linux", unix))]
     #[tokio::test]
-    async fn sandbox_fetch_from_ext4_symlink_in_git_is_scrubbed() {
-        // A symlink planted inside .git/ by an adversarial agent must not
-        // survive into the host extraction dir (it is scrubbed before git fetch).
+    async fn debugfs_extraction_reproduces_symlink_and_scrub_removes_it() {
+        // The ADR-0011 escape: a symlink planted inside .git/ by an adversarial
+        // agent. This asserts both halves of the defence — that debugfs faithfully
+        // reproduces the link (so the threat is real and the test is meaningful),
+        // and that scrub_extracted_tree removes the link inode before git ever
+        // sees it. (Asserting only a successful pool ref would pass even if the
+        // scrub were a no-op, since git fetch never traverses .git/hooks/.)
         if !has_debugfs() {
             return;
         }
         use std::os::unix::fs::symlink;
-        let (work, sha) = make_workspace_repo("ext4-sym");
-        // Plant an adversarial symlink inside .git/hooks/
+        let (work, _sha) = make_workspace_repo("ext4-sym");
         std::fs::create_dir_all(work.join(".git").join("hooks")).unwrap();
         symlink("/etc/passwd", work.join(".git").join("hooks").join("escape")).unwrap();
-
         let ext4 = make_workspace_ext4(&work, "16M");
 
-        let pool_dir = make_temp_dir("pool-ext4-sym");
-        let pool = BranchPool::init(pool_dir.clone()).await.unwrap();
+        let dst = make_temp_dir("ext4-sym-dst");
+        let found = debugfs_rdump(&ext4, "/.git", &dst).await.unwrap();
+        assert!(found, ".git must be extracted");
 
-        // Extraction must succeed (symlink scrubbed, not followed).
-        sandbox_fetch_from_ext4(&pool, &ext4, "01HEXT3", None, current_uid())
-            .await
-            .unwrap();
+        // Raw debugfs extraction reproduces the symlink verbatim.
+        let extracted_link = dst.join(".git").join("hooks").join("escape");
+        let pre = std::fs::symlink_metadata(&extracted_link)
+            .expect("debugfs must reproduce the planted entry");
+        assert!(
+            pre.file_type().is_symlink(),
+            "debugfs should reproduce the entry as a symlink before scrubbing"
+        );
 
-        assert_eq!(ref_sha(&pool_dir, "refs/heads/runs/01HEXT3"), sha);
+        // Scrubbing removes the symlink inode entirely (not just its target).
+        scrub_extracted_tree(&dst.join(".git")).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&extracted_link).is_err(),
+            "symlink inode must be gone after scrub"
+        );
 
         std::fs::remove_dir_all(&work).ok();
         std::fs::remove_file(&ext4).ok();
-        std::fs::remove_dir_all(&pool_dir).ok();
+        std::fs::remove_dir_all(&dst).ok();
     }
 }

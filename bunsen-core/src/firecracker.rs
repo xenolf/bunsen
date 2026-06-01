@@ -518,39 +518,28 @@ pub async fn extract_workspace_from_ext4(
     agent_history_dst: Option<&Path>,
 ) -> Result<()> {
     use crate::sandbox_fetch::{
-        agent_history_subpaths, copy_agent_history_narrow, debugfs_rdump, fetch_pool_from_git_dir,
-        scrub_symlinks,
+        agent_history_subpaths, copy_agent_history_narrow, debugfs_rdump, sandbox_fetch_from_ext4,
+        scrub_extracted_tree,
     };
 
-    let tmp = tempfile::TempDir::new()?;
-    let tmp_path = tmp.path();
-
-    // Extract .git using debugfs — no mount, no CAP_SYS_ADMIN.
-    let found = debugfs_rdump(ext4_path, "/.git", tmp_path)
-        .await
-        .map_err(|e| anyhow!("debugfs rdump .git: {e}"))?;
-    if !found {
-        bail!("workspace ext4 has no .git directory");
-    }
-    scrub_symlinks(&tmp_path.join(".git"))?;
-
-    // Extract agent-history subpaths when a destination is requested.
-    if agent_history_dst.is_some() {
-        for sub in agent_history_subpaths(adapter) {
-            let src = format!("/{sub}");
-            debugfs_rdump(ext4_path, &src, tmp_path)
-                .await
-                .map_err(|e| anyhow!("debugfs rdump {sub}: {e}"))?;
-        }
-        // Scrub the whole extraction dir — covers both .git and history subpaths.
-        scrub_symlinks(tmp_path)?;
-    }
-
-    fetch_pool_from_git_dir(pool, &tmp_path.join(".git"), run_id, output_branch, user_script_uid)
+    // Pool fetch goes through the single canonical extraction path so the
+    // `.git` debugfs read + scrub + hardened fetch lives in exactly one place
+    // (see the `sandbox_fetch` module docs).
+    sandbox_fetch_from_ext4(pool, ext4_path, run_id, output_branch, user_script_uid)
         .await
         .map_err(|e| anyhow!("sandbox fetch into pool failed: {e}"))?;
 
+    // Agent-history extraction is a separate concern: a narrow copy of known
+    // subpaths, into its own temp dir, scrubbed before it touches the host.
     if let Some(hist_dst) = agent_history_dst {
+        let tmp = tempfile::TempDir::new()?;
+        let tmp_path = tmp.path();
+        for sub in agent_history_subpaths(adapter) {
+            debugfs_rdump(ext4_path, &format!("/{sub}"), tmp_path)
+                .await
+                .map_err(|e| anyhow!("debugfs rdump {sub}: {e}"))?;
+        }
+        scrub_extracted_tree(tmp_path)?;
         copy_agent_history_narrow(adapter, tmp_path, hist_dst)
             .map_err(|e| anyhow!("agent-history narrow copy failed: {e}"))?;
     }
