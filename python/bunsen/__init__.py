@@ -2,8 +2,9 @@
 from __future__ import annotations
 from ._run import RunHandle, RunError
 from ._events import (
-    RunStarted, RunEnded, Output, EgressDenied, UnknownEvent,
-    SchemaVersionError, SCHEMA_VERSION,
+    RunStarted, RunEnded, Output, EgressDenied,
+    TurnStart, TurnEnd, ToolCall, ToolResult, ModelUsage,
+    UnknownEvent, SchemaVersionError, SCHEMA_VERSION,
 )
 from ._session import (
     BranchingStrategy,
@@ -21,8 +22,9 @@ from ._session import (
 
 __all__ = [
     "RunHandle", "RunError",
-    "RunStarted", "RunEnded", "Output", "EgressDenied", "UnknownEvent",
-    "SchemaVersionError", "SCHEMA_VERSION",
+    "RunStarted", "RunEnded", "Output", "EgressDenied",
+    "TurnStart", "TurnEnd", "ToolCall", "ToolResult", "ModelUsage",
+    "UnknownEvent", "SchemaVersionError", "SCHEMA_VERSION",
     # Slice 11: Session/Pool/Run surface
     "BranchingStrategy", "NoneStrategy", "PoolClone", "RunSpec",
     "ManifestPair", "Run", "Session", "SessionError",

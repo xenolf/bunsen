@@ -32,8 +32,10 @@ impl ClaudeCodeParser {
             "assistant" => self.parse_assistant(&v),
             "user" => self.parse_user(&v),
             "result" => self.parse_result(&v),
-            "system" => vec![],
-            _ => vec![("output".into(), json!({"stream": "stdout", "text": line}))],
+            // All other well-formed protocol JSON (system, rate_limit_event, …)
+            // is silently dropped. Only non-JSON lines become raw output events
+            // so banner text and progress lines still surface.
+            _ => vec![],
         }
     }
 
@@ -235,6 +237,14 @@ mod tests {
     fn system_init_line_is_ignored() {
         let mut parser = ClaudeCodeParser::new();
         let line = r#"{"type":"system","subtype":"init","session_id":"x","tools":[],"model":"claude-opus-4-5"}"#;
+        let events = parser.parse_line(line);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn unknown_json_type_is_silently_ignored() {
+        let mut parser = ClaudeCodeParser::new();
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"},"uuid":"abc","session_id":"s"}"#;
         let events = parser.parse_line(line);
         assert!(events.is_empty());
     }

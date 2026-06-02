@@ -30,7 +30,7 @@ The pluggable implementation of a Sandbox. Firecracker (microVM, strong isolatio
 
 ### Coding Agent
 
-A program that talks to a model and edits code — Claude Code, aider, codex, and so on. Bunsen interacts with a Coding Agent through an Adapter; it does not embed agent logic itself.
+A program that talks to a model and edits code — Claude Code, aider, codex, pi, and so on. Bunsen interacts with a Coding Agent through an Adapter; it does not embed agent logic itself.
 
 ### Adapter
 

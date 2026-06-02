@@ -48,6 +48,42 @@ class EgressDenied(_Base):
 
 
 @dataclass
+class TurnStart(_Base):
+    turn_id: int = 0
+
+
+@dataclass
+class TurnEnd(_Base):
+    turn_id: int = 0
+    model: Optional[str] = None
+    stop_reason: Optional[str] = None
+
+
+@dataclass
+class ToolCall(_Base):
+    tool_call_id: str = ""
+    name: str = ""
+    input: dict = field(default_factory=dict)
+
+
+@dataclass
+class ToolResult(_Base):
+    tool_call_id: str = ""
+    content: str = ""
+    is_error: bool = False
+
+
+@dataclass
+class ModelUsage(_Base):
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: Optional[str] = None
+    cache_read_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    cost_usd: Optional[float] = None
+
+
+@dataclass
 class UnknownEvent(_Base):
     type: str = ""
     raw: dict = field(default_factory=dict)
@@ -60,6 +96,11 @@ _KNOWN_FIELDS: dict[str, set[str]] = {
     "run_ended": {"reason", "exit_code", "signal", "error"},
     "output": {"stream", "text"},
     "egress_denied": {"destination", "protocol", "reason"},
+    "turn_start": {"turn_id"},
+    "turn_end": {"turn_id", "model", "stop_reason"},
+    "tool_call": {"tool_call_id", "name", "input"},
+    "tool_result": {"tool_call_id", "content", "is_error"},
+    "model_usage": {"input_tokens", "output_tokens", "model", "cache_read_tokens", "cache_write_tokens", "cost_usd"},
 }
 
 
@@ -87,6 +128,11 @@ def decode_event(raw: dict) -> _Base:
             "run_ended": RunEnded,
             "output": Output,
             "egress_denied": EgressDenied,
+            "turn_start": TurnStart,
+            "turn_end": TurnEnd,
+            "tool_call": ToolCall,
+            "tool_result": ToolResult,
+            "model_usage": ModelUsage,
         }[etype]
         return cls(**base_kwargs, extra=extra, **variant_kwargs)  # type: ignore[call-arg]
     else:
