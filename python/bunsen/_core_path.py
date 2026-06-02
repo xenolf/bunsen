@@ -30,7 +30,7 @@ def find_core_bin() -> list[str]:
     # Tier 3: sibling of sys.executable — maturin `bindings = "bin"` installs the
     # binary next to the Python interpreter in the venv's bin/ directory.  This path
     # is absolute so it survives sudo's PATH reset.
-    py_sibling = Path(sys.executable).resolve().parent / "bunsen-core"
+    py_sibling = Path(sys.executable).parent / "bunsen-core"
     if py_sibling.is_file() and os.access(py_sibling, os.X_OK):
         return [str(py_sibling)]
 
