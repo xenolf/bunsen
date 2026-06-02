@@ -105,7 +105,7 @@ async fn check_hello_world(handle: &mut FirecrackerHandle) -> Result<()> {
     let mut got = String::new();
 
     loop {
-        let n = timeout(Duration::from_secs(30), handle.stdout.read(&mut buf))
+        let n = timeout(Duration::from_secs(30), handle.stdout.as_mut().unwrap().read(&mut buf))
             .await
             .context("timeout waiting for stdout output")??;
         if n == 0 {

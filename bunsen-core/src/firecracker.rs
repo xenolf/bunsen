@@ -33,8 +33,10 @@ const FIRECRACKER_READY_RETRIES: u32 = 50;
 const FIRECRACKER_READY_DELAY_MS: u64 = 100;
 
 pub struct FirecrackerHandle {
-    pub stdout: UnixStream,
-    pub stderr: UnixStream,
+    /// Taken by the supervisor on first use; absent afterwards.
+    pub stdout: Option<UnixStream>,
+    /// Taken by the supervisor on first use; absent afterwards.
+    pub stderr: Option<UnixStream>,
     pub control: UnixStream,
     process: Child,
     run_dir: PathBuf,
@@ -168,8 +170,8 @@ pub async fn start_firecracker(
     eprintln!("[fc] control vsock connected");
 
     Ok(FirecrackerHandle {
-        stdout,
-        stderr,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
         control,
         process,
         run_dir,

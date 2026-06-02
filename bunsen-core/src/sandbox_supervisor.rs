@@ -6,11 +6,14 @@
 
 use anyhow::Result;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use crate::adapter::BlackBoxAdapter;
+use crate::aider_adapter::AiderParser;
+use crate::claude_code_adapter::ClaudeCodeParser;
 use crate::egress::DenialEvent;
 use crate::egress_proxy;
 use crate::encoder::Encoder;
@@ -35,6 +38,38 @@ pub struct EgressContext {
     /// nothing answers on, and DNS-only egress attempts surface as L3 drops
     /// via the nftables ruleset.
     pub dns_listener: Option<tokio::task::JoinHandle<()>>,
+}
+
+enum AdapterParser {
+    ClaudeCode(ClaudeCodeParser),
+    Aider(AiderParser),
+    BlackBox,
+}
+
+impl AdapterParser {
+    fn parse_stdout(&mut self, line: &str) -> Vec<(String, serde_json::Value)> {
+        match self {
+            AdapterParser::ClaudeCode(p) => p.parse_line(line),
+            AdapterParser::Aider(p) => p.parse_line(line),
+            AdapterParser::BlackBox => vec![(
+                "output".into(),
+                BlackBoxAdapter::output_event("stdout", line.as_bytes()),
+            )],
+        }
+    }
+
+    fn flush(&mut self) -> Vec<(String, serde_json::Value)> {
+        match self {
+            AdapterParser::Aider(p) => p.flush(),
+            _ => vec![],
+        }
+    }
+}
+
+#[derive(Debug)]
+enum OutputLine {
+    Line { stream: &'static str, text: String },
+    Done,
 }
 
 #[derive(Debug)]
@@ -63,10 +98,43 @@ pub async fn run(
     encoder: &mut Encoder,
     egress: EgressContext,
 ) -> Result<()> {
+    let mut parser = match spec.adapter.as_str() {
+        "claude-code" => AdapterParser::ClaudeCode(ClaudeCodeParser::new()),
+        "aider" => AdapterParser::Aider(AiderParser::new()),
+        _ => AdapterParser::BlackBox,
+    };
+
+    let stdout = handle.stdout.take().expect("stdout already consumed");
+    let stderr = handle.stderr.take().expect("stderr already consumed");
+
     let mut denied_rx = egress.denied_rx;
     let proxy_handle = egress.listener;
     let drop_log_handle = egress.drop_log;
     let dns_handle = egress.dns_listener;
+
+    // Channel: output lines → main task (same pattern as supervisor.rs)
+    let (out_tx, mut out_rx) = mpsc::channel::<OutputLine>(256);
+    let out_tx2 = out_tx.clone();
+
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if out_tx.send(OutputLine::Line { stream: "stdout", text: line + "\n" }).await.is_err() {
+                break;
+            }
+        }
+        let _ = out_tx.send(OutputLine::Done).await;
+    });
+
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if out_tx2.send(OutputLine::Line { stream: "stderr", text: line + "\n" }).await.is_err() {
+                break;
+            }
+        }
+        let _ = out_tx2.send(OutputLine::Done).await;
+    });
 
     // Control commands from bunsen-core's stdin.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCmd>(16);
@@ -92,35 +160,32 @@ pub async fn run(
     });
 
     let grace = spec.stop_grace_seconds;
-    let mut stdout_done = false;
-    let mut stderr_done = false;
+    let mut done_count = 0usize;
     let mut denial_rx_open = true;
     let mut initiated_reason: Option<&'static str> = None;
-    let mut stdout_buf = vec![0u8; 4096];
-    let mut stderr_buf = vec![0u8; 4096];
 
     loop {
-        if stdout_done && stderr_done {
-            break;
-        }
-
         tokio::select! {
-            result = handle.stdout.read(&mut stdout_buf), if !stdout_done => {
-                match result {
-                    Ok(0) | Err(_) => { stdout_done = true; }
-                    Ok(n) => {
-                        encoder.emit("output", BlackBoxAdapter::output_event("stdout", &stdout_buf[..n]))
-                            .map_err(|e| anyhow::anyhow!("encoder: {e}"))?;
+            msg = out_rx.recv() => {
+                match msg {
+                    Some(OutputLine::Line { stream, text }) => {
+                        if stream == "stdout" {
+                            for (event_type, payload) in parser.parse_stdout(&text) {
+                                encoder.emit(&event_type, payload)
+                                    .map_err(|e| anyhow::anyhow!("encoder: {e}"))?;
+                            }
+                        } else {
+                            encoder.emit("output", BlackBoxAdapter::output_event(stream, text.as_bytes()))
+                                .map_err(|e| anyhow::anyhow!("encoder: {e}"))?;
+                        }
                     }
-                }
-            }
-            result = handle.stderr.read(&mut stderr_buf), if !stderr_done => {
-                match result {
-                    Ok(0) | Err(_) => { stderr_done = true; }
-                    Ok(n) => {
-                        encoder.emit("output", BlackBoxAdapter::output_event("stderr", &stderr_buf[..n]))
-                            .map_err(|e| anyhow::anyhow!("encoder: {e}"))?;
+                    Some(OutputLine::Done) => {
+                        done_count += 1;
+                        if done_count >= 2 {
+                            break;
+                        }
                     }
+                    None => break,
                 }
             }
             denial = denied_rx.recv(), if denial_rx_open => {
@@ -134,11 +199,11 @@ pub async fn run(
                 match cmd {
                     Some(ControlCmd::Kill) => {
                         initiated_reason = Some("killed");
-                        write_control(handle, "kill").await.ok();
+                        write_control(&mut handle.control, "kill").await.ok();
                     }
                     Some(ControlCmd::Stop) => {
                         initiated_reason = Some("stopped");
-                        write_control(handle, "stop").await.ok();
+                        write_control(&mut handle.control, "stop").await.ok();
                         let cmd_tx2 = cmd_tx.clone();
                         tokio::spawn(async move {
                             sleep(Duration::from_secs(grace)).await;
@@ -147,13 +212,13 @@ pub async fn run(
                     }
                     Some(ControlCmd::Timeout) => {
                         initiated_reason = Some("timeout");
-                        write_control(handle, "kill").await.ok();
+                        write_control(&mut handle.control, "kill").await.ok();
                     }
                     Some(ControlCmd::Pause) => {
-                        write_control(handle, "pause").await.ok();
+                        write_control(&mut handle.control, "pause").await.ok();
                     }
                     Some(ControlCmd::Resume) => {
-                        write_control(handle, "resume").await.ok();
+                        write_control(&mut handle.control, "resume").await.ok();
                     }
                     None => {}
                 }
@@ -175,12 +240,17 @@ pub async fn run(
         h.abort();
     }
     if let Some(h) = drop_log_handle {
-        // Aborting drops the task, which drops its ChildReaper, which kills and
-        // reaps the journalctl tail.
         h.abort();
     }
     if let Some(h) = dns_handle {
         h.abort();
+    }
+
+    // Flush any per-line state the adapter parser was holding (e.g. aider's
+    // split Tokens:/Cost: pair) so the transcript surfaces it before run_ended.
+    for (event_type, payload) in parser.flush() {
+        encoder.emit(&event_type, payload)
+            .map_err(|e| anyhow::anyhow!("encoder: {e}"))?;
     }
 
     let reason = initiated_reason.unwrap_or("agent_exit");
@@ -190,10 +260,10 @@ pub async fn run(
     Ok(())
 }
 
-async fn write_control(handle: &mut FirecrackerHandle, op: &str) -> std::io::Result<()> {
+async fn write_control(control: &mut UnixStream, op: &str) -> std::io::Result<()> {
     let msg = format!("{{\"op\":\"{op}\"}}\n");
-    handle.control.write_all(msg.as_bytes()).await?;
-    handle.control.flush().await?;
+    control.write_all(msg.as_bytes()).await?;
+    control.flush().await?;
     Ok(())
 }
 
