@@ -47,6 +47,8 @@ class RunHandle:
         self._output_branch_pushed: Optional[str] = None
         self._uncommitted_paths: tuple[str, ...] = ()
         self._summary_run_id: Optional[str] = None
+        # Set by _SessionRunContext.__aenter__ so wait_for_summary can shield it.
+        self._drain_task: Optional[asyncio.Task] = None
         # Accumulated stderr (bounded), surfaced via RunError if the run ends
         # non-zero without a terminal signal.
         self._stderr_buf = bytearray()
@@ -135,6 +137,15 @@ class RunHandle:
                     self._transcript_path = event.transcript_path
                 if isinstance(event, RunEnded):
                     saw_terminal = True
+                    # Close stdin so the blocking tokio::io::stdin() reader in
+                    # bunsen-core gets EOF and the runtime can shut down after
+                    # post-run extraction. Without this, the blocking read()
+                    # syscall keeps the runtime alive indefinitely.
+                    if proc.stdin:
+                        try:
+                            proc.stdin.close()
+                        except Exception:
+                            pass
 
                 await self._queue.put(event)
         except asyncio.CancelledError:
@@ -169,6 +180,28 @@ class RunHandle:
             if isinstance(item, Exception):
                 raise item
             yield item
+
+    async def wait_for_summary(self, timeout: float = 120.0) -> None:
+        """Wait until the drain task has read the trailing Pool summary line.
+
+        Call this inside the `async with session.run(spec)` block after breaking
+        out of the event loop early (e.g. on `RunEnded`). It lets the drain task
+        finish capturing `pool_sha` / `output_branch_pushed` before `__aexit__`
+        cancels it.
+
+            async with session.run(spec) as run:
+                async for event in run.events:
+                    if isinstance(event, RunEnded):
+                        break
+                await run.wait_for_summary()
+            # run.pool_sha is populated here
+        """
+        if self._drain_task is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(self._drain_task), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
 
     async def _send_cmd(self, op: str) -> None:
         if self._proc and self._proc.stdin and self._proc.returncode is None:
@@ -221,6 +254,7 @@ class _SessionRunContext:
         self._run._proc = proc
         self._stderr_task = asyncio.ensure_future(self._run._drain_stderr(proc))
         self._drain_task = asyncio.ensure_future(self._run._drain(proc))
+        self._run._drain_task = self._drain_task
         return self._run
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
