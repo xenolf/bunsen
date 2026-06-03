@@ -61,18 +61,31 @@ impl ClaudeCodeParser {
 
         if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
             for block in content {
-                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                    if let (Some(id), Some(name)) = (
-                        block.get("id").and_then(|v| v.as_str()),
-                        block.get("name").and_then(|v| v.as_str()),
-                    ) {
-                        let input = block.get("input").cloned().unwrap_or(Value::Null);
-                        events.push(("tool_call".into(), json!({
-                            "tool_call_id": id,
-                            "name": name,
-                            "input": input,
-                        })));
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            if !text.is_empty() {
+                                events.push(("output".into(), json!({
+                                    "stream": "agent",
+                                    "text": text,
+                                })));
+                            }
+                        }
                     }
+                    Some("tool_use") => {
+                        if let (Some(id), Some(name)) = (
+                            block.get("id").and_then(|v| v.as_str()),
+                            block.get("name").and_then(|v| v.as_str()),
+                        ) {
+                            let input = block.get("input").cloned().unwrap_or(Value::Null);
+                            events.push(("tool_call".into(), json!({
+                                "tool_call_id": id,
+                                "name": name,
+                                "input": input,
+                            })));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -123,35 +136,40 @@ impl ClaudeCodeParser {
     }
 
     fn parse_result(&self, v: &Value) -> Vec<(String, Value)> {
-        let usage = match v.get("usage") {
-            Some(u) => u,
-            None => return vec![],
-        };
+        let mut events = vec![];
 
-        let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64());
-        let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64());
-        let cost_usd = v.get("total_cost_usd").and_then(|v| v.as_f64());
-
-        let mut payload = json!({
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-        });
-        if let Some(model) = &self.last_model {
-            payload["model"] = json!(model);
-        }
-        if let Some(cr) = cache_read {
-            payload["cache_read_tokens"] = json!(cr);
-        }
-        if let Some(cw) = cache_write {
-            payload["cache_write_tokens"] = json!(cw);
-        }
-        if let Some(cost) = cost_usd {
-            payload["cost_usd"] = json!(cost);
+        if v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false) {
+            let msg = v.get("result").and_then(|r| r.as_str()).unwrap_or("unknown error");
+            events.push(("output".into(), json!({"stream": "stderr", "text": msg})));
         }
 
-        vec![("model_usage".into(), payload)]
+        if let Some(usage) = v.get("usage") {
+            let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64());
+            let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64());
+            let cost_usd = v.get("total_cost_usd").and_then(|v| v.as_f64());
+
+            let mut payload = json!({
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            });
+            if let Some(model) = &self.last_model {
+                payload["model"] = json!(model);
+            }
+            if let Some(cr) = cache_read {
+                payload["cache_read_tokens"] = json!(cr);
+            }
+            if let Some(cw) = cache_write {
+                payload["cache_write_tokens"] = json!(cw);
+            }
+            if let Some(cost) = cost_usd {
+                payload["cost_usd"] = json!(cost);
+            }
+            events.push(("model_usage".into(), payload));
+        }
+
+        events
     }
 }
 
@@ -189,8 +207,25 @@ mod tests {
         let events = parse_fixture();
         assert_eq!(
             event_types(&events),
-            &["turn_start", "tool_call", "turn_end", "tool_result", "turn_start", "turn_end", "model_usage"]
+            &[
+                "turn_start", "output", "tool_call", "turn_end",
+                "tool_result",
+                "turn_start", "output", "turn_end",
+                "model_usage",
+            ]
         );
+    }
+
+    #[test]
+    fn agent_text_emitted_as_output_with_agent_stream() {
+        let events = parse_fixture();
+        let agent_outputs: Vec<_> = events
+            .iter()
+            .filter(|(t, v)| t == "output" && v["stream"] == "agent")
+            .collect();
+        assert_eq!(agent_outputs.len(), 2);
+        assert_eq!(agent_outputs[0].1["text"], "I'll list the files in the workspace.");
+        assert_eq!(agent_outputs[1].1["text"], "The workspace contains file1.txt and file2.py.");
     }
 
     #[test]
@@ -270,5 +305,28 @@ mod tests {
         let mut parser = ClaudeCodeParser::new();
         assert!(parser.parse_line("").is_empty());
         assert!(parser.parse_line("   ").is_empty());
+    }
+
+    #[test]
+    fn error_result_emits_stderr_output_and_no_model_usage() {
+        let mut parser = ClaudeCodeParser::new();
+        let line = r#"{"type":"result","subtype":"error","is_error":true,"result":"Max turns (5) reached","session_id":"s"}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "output");
+        assert_eq!(events[0].1["stream"], "stderr");
+        assert_eq!(events[0].1["text"], "Max turns (5) reached");
+    }
+
+    #[test]
+    fn error_result_with_usage_emits_both_events() {
+        let mut parser = ClaudeCodeParser::new();
+        let line = r#"{"type":"result","subtype":"error","is_error":true,"result":"API error","total_cost_usd":0.001,"session_id":"s","usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
+        let events = parser.parse_line(line);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "output");
+        assert_eq!(events[0].1["stream"], "stderr");
+        assert_eq!(events[1].0, "model_usage");
+        assert_eq!(events[1].1["input_tokens"], 50);
     }
 }

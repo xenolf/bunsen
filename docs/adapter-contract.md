@@ -38,9 +38,14 @@ An Adapter's parser reads the agent's stdout line by line and produces a sequenc
 | `turn_end` | End of each model response | `turn_id`, `model?`, `stop_reason?` |
 | `tool_result` | Each tool result returned to the model | `tool_call_id`, `content`, `is_error?` |
 | `model_usage` | End-of-run usage summary | `model?`, `input_tokens`, `output_tokens`, `cache_read_tokens?`, `cache_write_tokens?`, `cost_usd?` |
-| `output` | Unparseable or non-structured lines | `stream` (`"stdout"` or `"stderr"`), `text` |
+| `output` | Agent text response, error messages, and unparseable lines | `stream` (`"agent"`, `"stdout"`, or `"stderr"`), `text` |
 
-Stderr lines always produce `output` events regardless of adapter.
+The `stream` field distinguishes the source of an `output` event:
+- `"agent"` — text content from the model's response (parsed from the structured protocol)
+- `"stderr"` — error messages surfaced by the adapter (e.g. Claude Code's `result.is_error` message) or raw stderr lines from the agent process
+- `"stdout"` — unparseable stdout lines (e.g. banner text, progress output not recognised by the parser)
+
+Stderr lines from the agent process always produce `output` events with `stream: "stderr"` regardless of adapter.
 
 ### Tool-call pairing
 
