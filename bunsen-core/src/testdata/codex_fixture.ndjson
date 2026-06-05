@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"thread_abc123"}
+{"type":"turn.started","turn_id":"turn_001"}
+{"type":"item.started","item":{"id":"item_001","type":"command_execution","command":"ls /workspace"}}
+{"type":"item.completed","item":{"id":"item_001","type":"command_execution","command":"ls /workspace","output":"file1.txt\nfile2.py\n"}}
+{"type":"item.completed","item":{"id":"item_002","type":"agent_message","text":"The workspace contains file1.txt and file2.py."}}
+{"type":"turn.completed","usage":{"input_tokens":150,"output_tokens":25,"reasoning_output_tokens":10,"cached_input_tokens":50}}

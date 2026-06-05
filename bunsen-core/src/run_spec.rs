@@ -124,6 +124,7 @@ impl RunSpec {
                     None => &[],
                 }
             }
+            "codex" => crate::codex_adapter::EGRESS_ENDPOINTS,
             _ => &[],
         };
         EgressPolicy::compose(adapter_declared, &self.egress_endpoints)
@@ -325,6 +326,17 @@ mod tests {
         let policy = spec.effective_egress_policy();
         assert!(policy.allows("api.openai.com"));
         assert!(policy.allows("github.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_codex_includes_openai() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"codex","cmd":["codex","exec","--json","--ephemeral","do the thing"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.openai.com"));
+        assert!(!policy.allows("api.anthropic.com"));
     }
 
     #[test]

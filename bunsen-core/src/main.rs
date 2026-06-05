@@ -3,6 +3,7 @@ mod aider_adapter;
 mod branch_pool;
 mod bunsen_paths;
 mod claude_code_adapter;
+mod codex_adapter;
 mod dns;
 mod egress;
 mod egress_proxy;

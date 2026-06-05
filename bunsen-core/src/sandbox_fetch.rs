@@ -60,6 +60,8 @@ pub const HARDENING_ENV_VARS: &[(&str, &str)] = &[
 pub fn agent_history_subpaths(adapter: &str) -> &'static [&'static str] {
     match adapter {
         "aider" => AIDER_HISTORY_SUBPATHS,
+        // codex is invoked with --ephemeral; there is no native history to preserve.
+        "codex" => &[],
         // claude-code stores everything under `.claude/`; unknown adapters
         // fall back to the same convention so they keep working without a
         // per-adapter entry.
@@ -749,6 +751,11 @@ mod tests {
         assert!(subs.contains(&".aider.chat.history.md"));
         assert!(subs.contains(&".aider.input.history"));
         assert!(subs.contains(&".aider.llm.history"));
+    }
+
+    #[test]
+    fn agent_history_subpaths_codex_returns_empty() {
+        assert_eq!(agent_history_subpaths("codex"), &[] as &[&str]);
     }
 
     #[test]

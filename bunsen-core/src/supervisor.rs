@@ -11,6 +11,7 @@ use tokio::time::{sleep, Duration};
 use crate::adapter::BlackBoxAdapter;
 use crate::aider_adapter::AiderParser;
 use crate::claude_code_adapter::ClaudeCodeParser;
+use crate::codex_adapter::CodexParser;
 use crate::encoder::Encoder;
 use crate::run_spec::RunSpec;
 
@@ -20,6 +21,7 @@ use crate::run_spec::RunSpec;
 enum AdapterParser {
     ClaudeCode(ClaudeCodeParser),
     Aider(AiderParser),
+    Codex(CodexParser),
     BlackBox,
 }
 
@@ -28,6 +30,7 @@ impl AdapterParser {
         match self {
             AdapterParser::ClaudeCode(p) => p.parse_line(line),
             AdapterParser::Aider(p) => p.parse_line(line),
+            AdapterParser::Codex(p) => p.parse_line(line),
             AdapterParser::BlackBox => vec![(
                 "output".into(),
                 BlackBoxAdapter::output_event("stdout", line.as_bytes()),
@@ -90,6 +93,8 @@ fn signal_pgid(pgid: Pid, sig: Signal) {
 fn copy_agent_history(adapter: &str, workspace: &Path, dst: &Path) -> std::io::Result<()> {
     match adapter {
         "aider" => copy_aider_history(workspace, dst),
+        // codex is invoked with --ephemeral; the normalised transcript is the sole record.
+        "codex" => Ok(()),
         _ => {
             let dot_claude = workspace.join(".claude");
             if dot_claude.exists() {
@@ -140,6 +145,7 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
     let mut parser = match spec.adapter.as_str() {
         "claude-code" => AdapterParser::ClaudeCode(ClaudeCodeParser::new()),
         "aider" => AdapterParser::Aider(AiderParser::new()),
+        "codex" => AdapterParser::Codex(CodexParser::new()),
         _ => AdapterParser::BlackBox,
     };
 
@@ -422,6 +428,18 @@ mod tests {
 
         copy_agent_history("aider", workspace.path(), &dst_path).unwrap();
         assert!(!dst_path.exists(), "no aider history → no agent-history/");
+    }
+
+    #[test]
+    fn copy_agent_history_codex_creates_no_files() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dst_path = dst.path().join("agent-history");
+        // Even with a .claude/ present, codex must not copy it.
+        std::fs::create_dir_all(workspace.path().join(".claude")).unwrap();
+        std::fs::write(workspace.path().join(".claude/session.json"), "sess").unwrap();
+        copy_agent_history("codex", workspace.path(), &dst_path).unwrap();
+        assert!(!dst_path.exists(), "codex history copy must be a no-op");
     }
 
     #[test]
