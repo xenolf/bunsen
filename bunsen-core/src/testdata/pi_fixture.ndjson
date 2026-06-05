@@ -1,0 +1,10 @@
+{"type":"session","sessionId":"ses_abc123","agentId":"agent_def456"}
+{"type":"agent_start","agentId":"agent_def456","model":"claude-sonnet-4-6"}
+{"type":"turn_start"}
+{"type":"tool_execution_start","toolCallId":"call_001","toolName":"bash","args":{"command":"ls /workspace"}}
+{"type":"tool_execution_end","toolCallId":"call_001","result":"file1.txt\nfile2.py","isError":false}
+{"type":"turn_end","message":{"model":"claude-sonnet-4-6","stopReason":"tool_use","usage":{"input":100,"output":50,"cacheRead":20,"cacheWrite":10,"cost":{"total":0.0015}}}}
+{"type":"turn_start"}
+{"type":"turn_end","message":{"model":"claude-sonnet-4-6","stopReason":"end_turn","usage":{"input":150,"output":30,"cacheRead":10,"cacheWrite":5,"cost":{"total":0.001}}}}
+{"type":"compaction_start","reason":"context_length"}
+{"type":"agent_end"}
