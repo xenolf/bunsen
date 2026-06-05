@@ -6,7 +6,7 @@ See ADR-0004 (adapter contract with black-box fallback) and ADR-0007 (adapter ru
 
 ## Adapter identity
 
-Each Adapter has a string name (e.g. `"claude-code"`, `"aider"`, `"black-box"`). The User Script sets `adapter` in the RunSpec JSON to select one.
+Each Adapter has a string name (e.g. `"claude-code"`, `"aider"`, `"codex"`, `"pi"`, `"black-box"`). The User Script sets `adapter` in the RunSpec JSON to select one.
 
 ## Invocation
 
@@ -16,6 +16,26 @@ The Adapter is invoked as a subprocess. `cmd` in the RunSpec is the full argv. F
 {
   "adapter": "claude-code",
   "cmd": ["claude", "--output-format", "stream-json", "--prompt", "your task here"],
+  "env": { "ANTHROPIC_API_KEY": "..." }
+}
+```
+
+For codex:
+
+```json
+{
+  "adapter": "codex",
+  "cmd": ["codex", "exec", "--json", "--ephemeral", "your task here"],
+  "env": { "OPENAI_API_KEY": "..." }
+}
+```
+
+For pi (the adapter automatically injects `PI_CODING_AGENT_DIR=/workspace/.pi` into env):
+
+```json
+{
+  "adapter": "pi",
+  "cmd": ["pi", "--mode", "json", "--model", "anthropic/claude-sonnet-4-6", "-p", "your task here"],
   "env": { "ANTHROPIC_API_KEY": "..." }
 }
 ```
@@ -37,7 +57,7 @@ An Adapter's parser reads the agent's stdout line by line and produces a sequenc
 | `tool_call` | Each tool invocation in a model response | `tool_call_id`, `name`, `input` |
 | `turn_end` | End of each model response | `turn_id`, `model?`, `stop_reason?` |
 | `tool_result` | Each tool result returned to the model | `tool_call_id`, `content`, `is_error?` |
-| `model_usage` | End-of-run usage summary | `model?`, `input_tokens`, `output_tokens`, `cache_read_tokens?`, `cache_write_tokens?`, `cost_usd?` |
+| `model_usage` | Per-turn or end-of-run usage summary | `model?`, `input_tokens`, `output_tokens`, `cache_read_tokens?`, `cache_write_tokens?`, `cost_usd?` |
 | `output` | Agent text response, error messages, and unparseable lines | `stream` (`"agent"`, `"stdout"`, or `"stderr"`), `text` |
 
 The `stream` field distinguishes the source of an `output` event:
@@ -51,6 +71,19 @@ Stderr lines from the agent process always produce `output` events with `stream:
 
 Every `tool_call` is followed by exactly one `tool_result` with the same `tool_call_id`. Orphans (no matching result when the Run ends mid-call) are tolerated.
 
+For the `codex` adapter, all item types except `agent_message` and `reasoning` are surfaced as `tool_call`/`tool_result` pairs keyed by `item.id`. `agent_message` items become `output` events; `reasoning` items are dropped.
+
+### model_usage cadence
+
+Adapters may emit `model_usage` per-turn, once at end-of-run, or both — depending on what the agent's protocol exposes:
+
+| Adapter | Cadence |
+|---|---|
+| `claude-code` | Once at end-of-run (from the `result` event) |
+| `aider` | Per-turn (from the `Cost:` line that closes each turn) |
+| `codex` | Per-turn (from `turn.completed.usage`); `reasoning_output_tokens` is folded into `output_tokens` |
+| `pi` | Per-turn (from `turn_end.message.usage`) **and** once at end-of-run with accumulated session totals (from `agent_end`) |
+
 ### Black-box fallback
 
 When `adapter` is `"black-box"` or unknown, all stdout/stderr lines become `output` events.
@@ -63,6 +96,8 @@ After the agent process exits, bunsen copies the agent's native history director
 |---|---|
 | `claude-code` | `.claude/` (whole directory copied recursively) |
 | `aider` | `.aider.chat.history.md`, `.aider.input.history`, `.aider.llm.history` (top-level files copied individually; `.aider.tags.cache.*` and other cache state are skipped) |
+| `pi` | `.pi/agent/sessions/` (session tree only — `auth.json`/`settings.json` are deliberately excluded; the adapter injects `PI_CODING_AGENT_DIR=/workspace/.pi` so pi writes here instead of `~/.pi/agent/`) |
+| `codex` | none — codex is invoked with `--ephemeral`; the normalised transcript is the sole record |
 
 The copy is best-effort: if no source files exist, no error is raised and `agent-history/` is not created.
 
@@ -76,6 +111,8 @@ The effective Egress Policy is the case-insensitive union of the adapter's decla
 |---|---|
 | `claude-code` | `api.anthropic.com` |
 | `aider` | derived from the `--model X` / `--model=X` value in `cmd`: `claude-*` / `anthropic/*` → `api.anthropic.com`; `gpt-*` / `o1*` / `o3*` / `openai/*` → `api.openai.com`; `gemini-*` → `generativelanguage.googleapis.com`; otherwise nothing declared (user script must supply the allowlist) |
+| `codex` | `api.openai.com` (codex is OpenAI-only) |
+| `pi` | derived from `cmd`: `--model <provider>/<model>` (primary) or `--provider <name>` (fallback); `anthropic` → `api.anthropic.com`; `openai` / `openai-codex` / `azure-openai-responses` → `api.openai.com`; `google` / `google-vertex` → `generativelanguage.googleapis.com`; local providers (`ollama`, etc.) or unrecognised → nothing declared |
 
 Composition is implemented by `RunSpec::effective_egress_policy()` (see `bunsen-core/src/egress.rs`).
 
@@ -136,7 +173,7 @@ Both `--rootfs /path/to/custom.ext4` (host CLI) and a `oci-image` field on the R
 ## Implementing a custom Adapter
 
 1. Choose an adapter name (lowercase, hyphen-separated).
-2. Implement a line parser in `bunsen-core/src/<name>_adapter.rs` following the `ClaudeCodeParser` or `AiderParser` pattern. Aider's is the closer template if your agent emits plain text rather than a structured stream.
+2. Implement a line parser in `bunsen-core/src/<name>_adapter.rs` following the `ClaudeCodeParser` or `AiderParser` pattern. Aider's is the closer template if your agent emits plain text rather than a structured stream. For agents with a structured JSON stream (like codex or pi), follow the `ClaudeCodeParser` pattern — each line is parsed as JSON and matched on a `type` field.
 3. Add an `AdapterParser` variant in `supervisor.rs` and dispatch on the `spec.adapter` string at the top of `supervisor::run`.
 4. Wire native-history preservation into `supervisor::copy_agent_history` — an explicit allowlist of paths is preferred over a glob.
 5. Declare a `pub const EGRESS_ENDPOINTS: &[&str]`. If endpoints are model-derived, expose an `egress_endpoints_for_model(&str) -> &[&str]` helper and add the dispatch branch in `RunSpec::effective_egress_policy` (`run_spec.rs`).

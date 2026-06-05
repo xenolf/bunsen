@@ -70,6 +70,11 @@ struct RunArgs {
     session: Option<String>,
     #[arg(long)]
     manage_firewall: bool,
+    /// Account to resolve data/cache paths against (and, once the privilege
+    /// drop lands, to drop to). Mirrors `session --as-user`. When omitted under
+    /// `sudo`, the account is taken from `SUDO_USER`/`SUDO_UID`.
+    #[arg(long)]
+    as_user: Option<String>,
 }
 
 #[derive(Args)]
@@ -115,6 +120,27 @@ async fn run_main(cli: RunArgs) {
         eprintln!("invalid spec: {e}");
         std::process::exit(1);
     });
+
+    // ── User Script user resolution (sudo / privilege model) ───────────────
+    // `session open` resolves the target account from `--as-user`/`SUDO_*` and
+    // rewrites HOME/XDG before writing the Session to disk (see
+    // `target_user::resolve_and_drop`). The run path must perform the SAME path
+    // resolution, or attaching to that Session looks under root's home and
+    // fails with "session not found". We apply only the environment fix-up
+    // here, NOT the uid/gid drop: the per-Run network + Firecracker setup still
+    // needs root. The actual drop is the pending privilege arc (see the
+    // `owner_user` note in `session.rs::dispatch`).
+    match target_user::resolve(
+        &target_user::inputs_from_process(cli.as_user.clone()),
+        &target_user::RealSystemContext,
+    ) {
+        Ok(target_user::ResolutionOutcome::Drop(user)) => target_user::apply_env_fixup(&user),
+        Ok(target_user::ResolutionOutcome::NoDrop) => {}
+        Err(e) => {
+            eprintln!("[bunsen-core] target-user resolution failed: {e}");
+            std::process::exit(1);
+        }
+    }
 
     if let Some(sid) = cli.session.clone() {
         let mut sess = match session::Session::attach(&sid) {
