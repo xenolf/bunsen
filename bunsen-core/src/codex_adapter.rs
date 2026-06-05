@@ -3,6 +3,12 @@
 use std::collections::HashSet;
 use serde_json::{json, Value};
 
+/// OCI image that provides the codex runtime environment (Node.js + @openai/codex).
+/// Built from adapters/codex/Dockerfile on top of bunsen-base.
+// TODO(oci): pin digest once image is published
+pub const OCI_IMAGE: &str =
+    "ghcr.io/xenolf/bunsen/bunsen-adapter-codex@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
 /// Declared egress endpoints required by the codex adapter.
 pub const EGRESS_ENDPOINTS: &[&str] = &["api.openai.com"];
 
