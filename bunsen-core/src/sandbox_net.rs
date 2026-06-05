@@ -43,11 +43,19 @@ pub fn derive_run_network(run_id: &str) -> RunNetwork {
 /// Derive the host-side TAP device name for a Run.
 ///
 /// Kernel interface names are capped at 15 characters (`IFNAMSIZ - 1`). With
-/// a `tap-` prefix that leaves 11 chars from `run_id`; we truncate to 8 to
-/// keep some headroom and match the format Firecracker logs expect.
+/// a `tap-` prefix that leaves 11 chars for the Run id.
+///
+/// We take those 11 chars from the **end** of `run_id`, not the start. Run ids
+/// are ULIDs whose leading 10 characters encode the creation timestamp, so two
+/// Runs launched in the same millisecond share an identical prefix — and a
+/// prefix-derived name would collide. When that happens the first Firecracker
+/// claims the TAP and the second fails to open it (`EBUSY`, surfaced as
+/// "Could not create the network device: Open tap device"). The trailing
+/// characters come from the ULID's random component, so simultaneously-launched
+/// Runs get distinct TAP names regardless of timing.
 pub fn derive_tap_name(run_id: &str) -> String {
-    let suffix_len = run_id.len().min(8);
-    format!("tap-{}", &run_id[..suffix_len])
+    let start = run_id.len().saturating_sub(11);
+    format!("tap-{}", &run_id[start..])
 }
 
 /// Index into the 16,384 available /30 blocks in `169.254.0.0/16`.
@@ -168,11 +176,25 @@ mod tests {
     }
 
     #[test]
-    fn derive_tap_name_uses_first_eight_chars_of_run_id() {
+    fn derive_tap_name_uses_trailing_chars_of_run_id() {
+        // The 11 chars after `tap-` come from the END of the id, so the
+        // timestamp prefix never determines the name.
         assert_eq!(
             derive_tap_name("01HZXMSAMPLERUNID0000000000"),
-            "tap-01HZXMSA"
+            "tap-D0000000000"
         );
+    }
+
+    #[test]
+    fn derive_tap_name_distinct_for_same_millisecond_run_ids() {
+        // Regression: these two ULIDs were minted in the same millisecond in a
+        // real Run and shared the 10-char timestamp prefix `01KTBRS0AH`. The
+        // old prefix-based name produced `tap-01KTBRS0` for both, so the second
+        // Firecracker hit EBUSY opening the already-claimed TAP. The trailing
+        // random component must make the names distinct.
+        let a = derive_tap_name("01KTBRS0AHMEQKV287MN9TFRCX");
+        let b = derive_tap_name("01KTBRS0AHTATZGTTV15SWMZXX");
+        assert_ne!(a, b, "same-millisecond run ids must yield distinct tap names");
     }
 
     #[test]

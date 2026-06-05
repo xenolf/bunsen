@@ -101,8 +101,19 @@ pub async fn resolve_rootfs(image_ref: &str) -> Result<PathBuf> {
     let cache_path = cache_dir().join(format!("{}.ext4", r.digest_hex()));
 
     if cache_path.exists() {
-        eprintln!("[oci] cache hit: {}", cache_path.display());
-        return Ok(cache_path);
+        if is_valid_ext4(&cache_path) {
+            eprintln!("[oci] cache hit: {}", cache_path.display());
+            return Ok(cache_path);
+        }
+        // A previous build was interrupted (e.g. the process was killed
+        // mid-`mkfs.ext4`), leaving a full-size but superblock-less file that
+        // `exists()` honors yet the guest kernel can't mount ("VFS: Unable to
+        // mount root fs"). Discard it and rebuild rather than booting garbage.
+        eprintln!(
+            "[oci] cache entry {} is not a valid ext4 (interrupted build?) — rebuilding",
+            cache_path.display()
+        );
+        let _ = std::fs::remove_file(&cache_path);
     }
 
     eprintln!("[oci] pulling {image_ref}");
@@ -481,6 +492,16 @@ async fn create_ext4_from_dir(source_dir: &Path, output: &Path) -> Result<()> {
     let padded = (size_mb * 3 / 2).max(512) + 256;
     eprintln!("[oci] image content: {size_mb} MiB → ext4: {padded} MiB");
 
+    // Build into a per-process temp sibling, then atomically rename into place.
+    // `mkfs.ext4` pre-allocates the full-size output before writing the
+    // superblock, so a crash mid-build would otherwise leave a poisoned cache
+    // entry that `exists()` honors but the kernel can't mount. `rename(2)` is
+    // atomic within a filesystem (the temp sits in the same cache dir), so the
+    // final path only ever appears once fully written. The pid suffix keeps
+    // concurrent builds of the same image from clobbering each other's temp.
+    let tmp_output = output.with_extension(format!("ext4.tmp.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp_output);
+
     let status = Command::new("mkfs.ext4")
         .args([
             "-F",
@@ -488,7 +509,7 @@ async fn create_ext4_from_dir(source_dir: &Path, output: &Path) -> Result<()> {
             &source_dir.to_string_lossy(),
             "-b",
             "4096",
-            &output.to_string_lossy(),
+            &tmp_output.to_string_lossy(),
             &format!("{padded}M"),
         ])
         .status()
@@ -496,9 +517,36 @@ async fn create_ext4_from_dir(source_dir: &Path, output: &Path) -> Result<()> {
         .context("mkfs.ext4")?;
 
     if !status.success() {
+        let _ = std::fs::remove_file(&tmp_output);
         bail!("mkfs.ext4 failed for {}", output.display());
     }
+
+    std::fs::rename(&tmp_output, output).with_context(|| {
+        format!("rename {} -> {}", tmp_output.display(), output.display())
+    })?;
     Ok(())
+}
+
+/// Cheap structural check that `path` is a real ext4 image.
+///
+/// The ext4 superblock magic `0xEF53` lives at byte offset 1080 (superblock
+/// offset 1024 + `s_magic` offset 56), stored little-endian. An interrupted
+/// `mkfs.ext4` leaves a full-size but zero-filled file with no superblock; this
+/// catches that (and any truncation/corruption) so a poisoned cache entry is
+/// rebuilt instead of booted.
+fn is_valid_ext4(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    if f.seek(SeekFrom::Start(1080)).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 2];
+    if f.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    u16::from_le_bytes(buf) == 0xEF53
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -548,6 +596,34 @@ mod tests {
         assert!(path.to_string_lossy().contains(HEX64));
         assert!(path.to_string_lossy().ends_with(".ext4"));
         assert!(path.to_string_lossy().contains("bunsen/rootfs"));
+    }
+
+    // A poisoned (zero-filled / truncated) cache entry is rejected; only a file
+    // carrying the ext4 superblock magic is honored as a cache hit.
+    #[test]
+    fn is_valid_ext4_detects_magic_and_rejects_garbage() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Interrupted mkfs leaves a full-size but zero-filled file.
+        let zeros = dir.path().join("zeros.ext4");
+        std::fs::write(&zeros, vec![0u8; 2048]).unwrap();
+        assert!(!is_valid_ext4(&zeros), "zero-filled file must be rejected");
+
+        // ext4 magic 0xEF53 (little-endian) at byte offset 1080.
+        let good = dir.path().join("good.ext4");
+        let mut buf = vec![0u8; 2048];
+        buf[1080] = 0x53;
+        buf[1081] = 0xEF;
+        std::fs::write(&good, &buf).unwrap();
+        assert!(is_valid_ext4(&good), "valid superblock magic must be accepted");
+
+        // Too-short file must not panic and is rejected.
+        let short = dir.path().join("short.ext4");
+        std::fs::write(&short, b"hi").unwrap();
+        assert!(!is_valid_ext4(&short), "truncated file must be rejected");
+
+        // Missing file is rejected.
+        assert!(!is_valid_ext4(&dir.path().join("nope.ext4")));
     }
 
     // Cycle 8: parse Www-Authenticate Bearer header.
