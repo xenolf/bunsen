@@ -2,7 +2,6 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 use crate::run_spec::RunSpec;
@@ -15,6 +14,9 @@ pub const VSOCK_STDOUT_PORT: u32 = 5001;
 pub const VSOCK_STDERR_PORT: u32 = 5002;
 /// Host→guest: line-delimited JSON control commands.
 pub const VSOCK_CONTROL_PORT: u32 = 5003;
+/// Guest→host: the host writes the full spec JSON then half-closes; the guest
+/// reads to EOF. Replaces embedding the spec in the kernel cmdline.
+pub const VSOCK_SPEC_PORT: u32 = 5000;
 
 // ─── Firecracker API request bodies ───────────────────────────────────────
 // These structs are compiled on all platforms so serialization tests run on macOS.
@@ -86,14 +88,17 @@ pub struct SandboxConfig {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-/// Build the kernel boot args string, embedding the spec as base64.
+/// Build the kernel boot args string.
+///
+/// The spec is no longer embedded here — it is delivered to the guest over the
+/// vsock spec channel (port [`VSOCK_SPEC_PORT`]) because Firecracker caps the
+/// cmdline at ~4 KiB and large agent prompts overflowed it.
 ///
 /// When the host process has `BUNSEN_INIT_DEBUG=1` in its environment, append
 /// `bunsen_init_debug=1` so the guest init writes a per-run init.log to
 /// /workspace. Off by default — the diagnostics are noisy and meant for
 /// development.
-pub fn build_boot_args(spec_json: &str) -> String {
-    let encoded = STANDARD.encode(spec_json.as_bytes());
+pub fn build_boot_args() -> String {
     let debug = if std::env::var("BUNSEN_INIT_DEBUG").as_deref() == Ok("1") {
         " bunsen_init_debug=1"
     } else {
@@ -101,12 +106,12 @@ pub fn build_boot_args(spec_json: &str) -> String {
     };
     format!(
         "console=ttyS0 reboot=k panic=1 pci=off nomodule \
-         root=/dev/vda rw init=/sbin/bunsen-init \
-         bunsen_spec={encoded}{debug}"
+         root=/dev/vda rw init=/sbin/bunsen-init{debug}"
     )
 }
 
-/// Build the spec JSON to embed in the VM's kernel boot args.
+/// Build the spec JSON delivered to the guest over the vsock spec channel
+/// (port [`VSOCK_SPEC_PORT`]).
 ///
 /// The guest init understands `cmd`, `env`, `stop-grace-seconds`, and
 /// (optionally) `network`. Secrets are merged into `env` so the init exports
@@ -219,20 +224,15 @@ mod tests {
 
     #[test]
     fn boot_args_contain_init_path() {
-        let args = build_boot_args(r#"{"cmd":["echo"]}"#);
+        let args = build_boot_args();
         assert!(args.contains("init=/sbin/bunsen-init"));
     }
 
     #[test]
-    fn boot_args_contain_encoded_spec_roundtrips() {
-        let spec = r#"{"adapter":"black-box","cmd":["echo","hi"]}"#;
-        let args = build_boot_args(spec);
-        let token = args.split_whitespace()
-            .find(|t| t.starts_with("bunsen_spec="))
-            .expect("bunsen_spec token missing");
-        let encoded = token.strip_prefix("bunsen_spec=").unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
-        assert_eq!(String::from_utf8(decoded).unwrap(), spec);
+    fn boot_args_omit_embedded_spec() {
+        // The spec now travels over the vsock spec channel, not the cmdline.
+        let args = build_boot_args();
+        assert!(!args.contains("bunsen_spec="));
     }
 
     // ── Cycle 5: sandbox spec JSON ────────────────────────────────────────
@@ -423,6 +423,7 @@ mod tests {
 
     #[test]
     fn vsock_port_constants() {
+        assert_eq!(VSOCK_SPEC_PORT, 5000);
         assert_eq!(VSOCK_STDOUT_PORT, 5001);
         assert_eq!(VSOCK_STDERR_PORT, 5002);
         assert_eq!(VSOCK_CONTROL_PORT, 5003);

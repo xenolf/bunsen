@@ -4,12 +4,16 @@
 //!   1. Create per-run temp directory for API socket, vsock socket, workspace.ext4
 //!   2. Create TAP device
 //!   3. Create empty ext4 workspace image
-//!   4. Create vsock listener UDS for stdout (port 5001) and stderr (port 5002)
+//!   4. Create vsock listener UDS for spec (port 5000), stdout (port 5001) and
+//!      stderr (port 5002) BEFORE starting the VM — the guest connects to all
+//!      of them immediately after init runs
 //!   5. Spawn `firecracker --api-sock <path>`
 //!   6. Configure VM via Firecracker REST API (machine-config, boot-source, drives, net, vsock)
 //!   7. POST /actions InstanceStart
-//!   8. Wait for guest to connect stdout/stderr vsock sockets; accept both
-//!   9. Connect host→guest control vsock (send CONNECT 5003\n)
+//!   8. Accept the spec connection (port 5000), write the full spec JSON, then
+//!      half-close so the guest reads to EOF
+//!   9. Wait for guest to connect stdout/stderr vsock sockets; accept both
+//!  10. Connect host→guest control vsock (send CONNECT 5003\n)
 //!
 //! The handle exposes:
 //!   - `stdout_socket()` / `stderr_socket()` — accepted `UnixStream` for raw bytes
@@ -18,7 +22,8 @@
 
 use crate::sandbox::{
     FcActionStart, FcBootSource, FcDriveConfig, FcMachineConfig, FcNetworkInterface,
-    FcVsockConfig, SandboxConfig, VSOCK_CONTROL_PORT, VSOCK_STDERR_PORT, VSOCK_STDOUT_PORT,
+    FcVsockConfig, SandboxConfig, VSOCK_CONTROL_PORT, VSOCK_SPEC_PORT, VSOCK_STDERR_PORT,
+    VSOCK_STDOUT_PORT,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::net::Ipv4Addr;
@@ -99,9 +104,11 @@ pub async fn start_firecracker(
         .await
         .context("create workspace ext4")?;
 
-    // 3. Create vsock listener UDS for stdout and stderr BEFORE starting VM,
-    //    because the guest connects immediately after init runs.
+    // 3. Create vsock listener UDS for spec, stdout and stderr BEFORE starting
+    //    VM, because the guest connects immediately after init runs.
     eprintln!("[fc] binding vsock listeners at {}", vsock_path.display());
+    let spec_listener = UnixListener::bind(vsock_socket_path(&vsock_path, VSOCK_SPEC_PORT))
+        .context("bind spec vsock listener")?;
     let stdout_listener = UnixListener::bind(vsock_socket_path(&vsock_path, VSOCK_STDOUT_PORT))
         .context("bind stdout vsock listener")?;
     let stderr_listener = UnixListener::bind(vsock_socket_path(&vsock_path, VSOCK_STDERR_PORT))
@@ -149,7 +156,24 @@ pub async fn start_firecracker(
         .context("Firecracker InstanceStart")?;
     eprintln!("[fc] VM started — waiting for guest to connect vsock…");
 
-    // 7. Accept stdout and stderr connections from the guest (30 s timeout each).
+    // 7. Send the RunSpec to the guest over the spec channel (port 5000): the
+    //    guest connects, the host writes the full spec JSON, then half-closes
+    //    the write side so the guest's read-to-EOF returns the complete spec.
+    let (mut spec_stream, _) = timeout(Duration::from_secs(30), spec_listener.accept())
+        .await
+        .context("timeout waiting for guest spec vsock connection")?
+        .context("accept spec vsock")?;
+    spec_stream
+        .write_all(config.spec_json.as_bytes())
+        .await
+        .context("write spec JSON to guest")?;
+    spec_stream
+        .shutdown()
+        .await
+        .context("half-close spec vsock so guest reads to EOF")?;
+    eprintln!("[fc] spec sent to guest ({} bytes)", config.spec_json.len());
+
+    // 8. Accept stdout and stderr connections from the guest (30 s timeout each).
     let (stdout, _) = timeout(Duration::from_secs(30), stdout_listener.accept())
         .await
         .context("timeout waiting for guest stdout vsock connection")?
@@ -162,7 +186,7 @@ pub async fn start_firecracker(
         .context("accept stderr vsock")?;
     eprintln!("[fc] stderr vsock connected");
 
-    // 8. Connect host→guest for control (send CONNECT {port}\n).
+    // 9. Connect host→guest for control (send CONNECT {port}\n).
     eprintln!("[fc] connecting control vsock…");
     let control = connect_host_to_guest(&vsock_path, VSOCK_CONTROL_PORT)
         .await
@@ -201,8 +225,9 @@ async fn configure_vm(
     )
     .await?;
 
-    // Boot source.
-    let boot_args = crate::sandbox::build_boot_args(&config.spec_json);
+    // Boot source. The spec is delivered over the vsock spec channel, not the
+    // cmdline.
+    let boot_args = crate::sandbox::build_boot_args();
     fc_put(
         api_socket,
         "/boot-source",
