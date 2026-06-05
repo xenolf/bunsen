@@ -2,6 +2,12 @@
 
 use serde_json::{json, Value};
 
+// TODO(oci): pin digest once image is published
+// Run `./adapters/pi/build-rootfs.sh --push` to build and push the image,
+// then replace the placeholder digest below with the one it prints.
+pub const OCI_IMAGE: &str =
+    "ghcr.io/xenolf/bunsen/bunsen-adapter-pi@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
 /// Accumulated model_usage across all turns in a session.
 #[derive(Default)]
 struct SessionAccumulator {
@@ -214,6 +220,22 @@ fn extract_flag_value(cmd: &[String], flag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oci_cache::OciImageRef;
+
+    // OCI_IMAGE must be a valid OciImageRef::parse input — a placeholder
+    // sentinel is acceptable as long as the format is digest-pinned and
+    // points at the published GHCR repository. Pin the real digest after
+    // running `./adapters/pi/build-rootfs.sh --push`.
+    #[test]
+    fn oci_image_is_valid_oci_ref() {
+        let r = OciImageRef::parse(OCI_IMAGE).unwrap_or_else(|e| {
+            panic!("pi OCI_IMAGE failed to parse: {e}")
+        });
+        assert_eq!(r.registry, "ghcr.io");
+        assert_eq!(r.name, "xenolf/bunsen/bunsen-adapter-pi");
+        assert!(r.digest.starts_with("sha256:"));
+        assert_eq!(r.digest_hex().len(), 64);
+    }
 
     fn parse_fixture() -> Vec<(String, Value)> {
         let fixture = include_str!("testdata/pi_fixture.ndjson");
