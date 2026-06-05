@@ -140,6 +140,13 @@ pub fn build_sandbox_spec_json(
     for (k, v) in &spec.secrets {
         env.insert(k.clone(), v.clone());
     }
+    // Pi writes its session store to ~/.pi/agent/ by default; redirect into
+    // the workspace so the session tree is capturable after the run.
+    // User-supplied env (or secrets) takes precedence — only inject when key is absent.
+    if spec.adapter == "pi" {
+        env.entry("PI_CODING_AGENT_DIR".to_string())
+            .or_insert_with(|| "/workspace/.pi".to_string());
+    }
     if let Some(addr) = proxy_addr {
         let url = format!("http://{addr}");
         // Force the proxy variables — the agent must not be able to opt out.
@@ -417,6 +424,42 @@ mod tests {
         assert_eq!(v["env"]["HTTPS_PROXY"], "http://169.254.1.1:8080");
         assert_eq!(v["network"]["host-ip"], "169.254.1.1");
         assert_eq!(v["network"]["guest-ip"], "169.254.1.2");
+    }
+
+    // ── Pi adapter: PI_CODING_AGENT_DIR injection ─────────────────────────
+
+    #[test]
+    fn build_sandbox_spec_json_pi_injects_pi_coding_agent_dir() {
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "pi",
+            "cmd": ["pi", "--mode", "json", "-p", "task"]
+        }"#).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, None, None)).unwrap();
+        assert_eq!(v["env"]["PI_CODING_AGENT_DIR"], "/workspace/.pi");
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_pi_user_env_wins_over_injection() {
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "pi",
+            "cmd": ["pi", "--mode", "json", "-p", "task"],
+            "env": {"PI_CODING_AGENT_DIR": "/custom/path"}
+        }"#).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, None, None)).unwrap();
+        assert_eq!(v["env"]["PI_CODING_AGENT_DIR"], "/custom/path");
+    }
+
+    #[test]
+    fn build_sandbox_spec_json_non_pi_does_not_inject_pi_dir() {
+        let spec = crate::run_spec::RunSpec::from_json(r#"{
+            "adapter": "claude-code",
+            "cmd": ["claude"]
+        }"#).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&build_sandbox_spec_json(&spec, None, None)).unwrap();
+        assert!(v["env"].get("PI_CODING_AGENT_DIR").is_none());
     }
 
     // ── Cycle 4: vsock path derivation ────────────────────────────────────

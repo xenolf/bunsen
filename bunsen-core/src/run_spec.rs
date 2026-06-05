@@ -125,6 +125,7 @@ impl RunSpec {
                 }
             }
             "codex" => crate::codex_adapter::EGRESS_ENDPOINTS,
+            "pi" => crate::pi_adapter::egress_endpoints_for_cmd(&self.cmd),
             _ => &[],
         };
         EgressPolicy::compose(adapter_declared, &self.egress_endpoints)
@@ -348,6 +349,40 @@ mod tests {
         let policy = spec.effective_egress_policy();
         assert!(policy.allows("pypi.org"));
         assert!(!policy.allows("api.anthropic.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_pi_with_anthropic_model_includes_anthropic() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"pi","cmd":["pi","--mode","json","--model","anthropic/claude-sonnet-4-6","-p","task"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.anthropic.com"));
+        assert!(!policy.allows("api.openai.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_pi_with_openai_provider_includes_openai() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"pi","cmd":["pi","--mode","json","--provider","openai","--model","gpt-4o","-p","task"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.openai.com"));
+        assert!(!policy.allows("api.anthropic.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_pi_with_local_model_is_user_only() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"pi","cmd":["pi","--model","ollama/llama3","-p","task"],"egress-endpoints":["localhost"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("localhost"));
+        assert!(!policy.allows("api.anthropic.com"));
+        assert!(!policy.allows("api.openai.com"));
     }
 
     // ── Slice 06: typed branching strategy ────────────────────────────────

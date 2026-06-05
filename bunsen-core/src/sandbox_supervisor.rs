@@ -16,6 +16,7 @@ use crate::aider_adapter::AiderParser;
 use crate::claude_code_adapter::ClaudeCodeParser;
 use crate::codex_adapter::CodexParser;
 use crate::egress::DenialEvent;
+use crate::pi_adapter::PiParser;
 use crate::egress_proxy;
 use crate::encoder::Encoder;
 use crate::firecracker::FirecrackerHandle;
@@ -45,6 +46,7 @@ enum AdapterParser {
     ClaudeCode(ClaudeCodeParser),
     Aider(AiderParser),
     Codex(CodexParser),
+    Pi(PiParser),
     BlackBox,
 }
 
@@ -54,6 +56,7 @@ impl AdapterParser {
             AdapterParser::ClaudeCode(p) => p.parse_line(line),
             AdapterParser::Aider(p) => p.parse_line(line),
             AdapterParser::Codex(p) => p.parse_line(line),
+            AdapterParser::Pi(p) => p.parse_line(line),
             AdapterParser::BlackBox => vec![(
                 "output".into(),
                 BlackBoxAdapter::output_event("stdout", line.as_bytes()),
@@ -105,6 +108,7 @@ pub async fn run(
         "claude-code" => AdapterParser::ClaudeCode(ClaudeCodeParser::new()),
         "aider" => AdapterParser::Aider(AiderParser::new()),
         "codex" => AdapterParser::Codex(CodexParser::new()),
+        "pi" => AdapterParser::Pi(PiParser::new()),
         _ => AdapterParser::BlackBox,
     };
 

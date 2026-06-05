@@ -62,6 +62,9 @@ pub fn agent_history_subpaths(adapter: &str) -> &'static [&'static str] {
         "aider" => AIDER_HISTORY_SUBPATHS,
         // codex is invoked with --ephemeral; there is no native history to preserve.
         "codex" => &[],
+        // pi writes its session tree under .pi/agent/sessions/; auth.json and
+        // settings.json at the .pi/agent/ level are deliberately excluded.
+        "pi" => &[".pi/agent/sessions"],
         // claude-code stores everything under `.claude/`; unknown adapters
         // fall back to the same convention so they keep working without a
         // per-adapter entry.
@@ -761,6 +764,44 @@ mod tests {
     #[test]
     fn agent_history_subpaths_unknown_adapter_falls_back_to_dot_claude() {
         assert_eq!(agent_history_subpaths("black-box"), &[".claude"]);
+    }
+
+    #[test]
+    fn agent_history_subpaths_pi_returns_session_tree_only() {
+        assert_eq!(agent_history_subpaths("pi"), &[".pi/agent/sessions"]);
+    }
+
+    #[test]
+    fn copy_agent_history_narrow_pi_copies_sessions_not_auth() {
+        let src = make_temp_dir("ah-pi-src");
+        let dst = make_temp_dir("ah-pi-dst");
+        // Create the session tree.
+        std::fs::create_dir_all(src.join(".pi").join("agent").join("sessions").join("ses1")).unwrap();
+        std::fs::write(
+            src.join(".pi").join("agent").join("sessions").join("ses1").join("events.jsonl"),
+            b"session data",
+        ).unwrap();
+        // Create files that must NOT be copied (auth.json and settings.json).
+        std::fs::write(src.join(".pi").join("agent").join("auth.json"), b"secret").unwrap();
+        std::fs::write(src.join(".pi").join("agent").join("settings.json"), b"cfg").unwrap();
+
+        copy_agent_history_narrow("pi", &src, &dst).unwrap();
+
+        // Session data must be present.
+        assert_eq!(
+            std::fs::read(
+                dst.join(".pi").join("agent").join("sessions").join("ses1").join("events.jsonl")
+            ).unwrap(),
+            b"session data",
+        );
+        // Credential and config files must NOT be copied.
+        assert!(!dst.join(".pi").join("agent").join("auth.json").exists(),
+            "auth.json must not be copied");
+        assert!(!dst.join(".pi").join("agent").join("settings.json").exists(),
+            "settings.json must not be copied");
+
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&dst).ok();
     }
 
     #[test]
