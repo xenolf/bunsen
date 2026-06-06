@@ -1,12 +1,23 @@
 name: Images
 
-# Builds the canonical bunsen-base rootfs (adapters/base/Dockerfile) as a
-# multi-arch OCI image, publishes it to GHCR, and opens an automated PR
-# updating DEFAULT_ROOTFS_IMAGE in bunsen-core/src/oci_cache.rs with the
-# new manifest digest.
+# Builds the bunsen guest rootfs images as multi-arch OCI images, publishes
+# them to GHCR, and opens a SINGLE automated PR pinning every image that was
+# (re)built during the run to its new manifest digest.
 #
-# Decoupled from the wheel release lifecycle: triggers on the base-image
-# Dockerfile changing on main, plus manual dispatch. See ADR-0012.
+# Images:
+#   - bunsen-base            (adapters/base/Dockerfile)   → DEFAULT_ROOTFS_IMAGE
+#   - bunsen-adapter-codex   (adapters/codex/Dockerfile)  → codex_adapter::OCI_IMAGE
+#   - bunsen-adapter-pi      (adapters/pi/Dockerfile)     → pi_adapter::OCI_IMAGE
+#
+# Build rules (see `changes` job):
+#   - base is built when adapters/base/Dockerfile changes
+#   - an adapter is built when the base is rebuilt (its FROM digest moves) OR
+#     when that adapter's own Dockerfile changes
+#
+# The auto-PR aggregates ALL digest updates from one run into one PR: three
+# images rebuilt → three pins updated in the PR; one image rebuilt → one pin.
+#
+# Decoupled from the wheel release lifecycle. See ADR-0012.
 
 on:
   push:
@@ -14,7 +25,22 @@ on:
       - main
     paths:
       - 'adapters/base/Dockerfile'
+      - 'adapters/codex/Dockerfile'
+      - 'adapters/pi/Dockerfile'
   workflow_dispatch:
+    inputs:
+      base:
+        description: 'Rebuild bunsen-base (forces both adapters to rebuild)'
+        type: boolean
+        default: true
+      codex:
+        description: 'Rebuild bunsen-adapter-codex'
+        type: boolean
+        default: true
+      pi:
+        description: 'Rebuild bunsen-adapter-pi'
+        type: boolean
+        default: true
 
 permissions:
   contents: write       # auto-PR creates the digest-update branch
@@ -23,11 +49,99 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: xenolf/bunsen/bunsen-base
+  BASE_IMAGE_NAME: xenolf/bunsen/bunsen-base
 
 jobs:
-  build:
-    name: Build ${{ matrix.platform }}
+  # ── Decide what to build ────────────────────────────────────────────────────
+  changes:
+    name: Detect changed images
+    runs-on: ubuntu-latest
+    outputs:
+      build_base: ${{ steps.decide.outputs.build_base }}
+      build_codex: ${{ steps.decide.outputs.build_codex }}
+      build_pi: ${{ steps.decide.outputs.build_pi }}
+      any_adapter: ${{ steps.decide.outputs.any_adapter }}
+      adapter_matrix: ${{ steps.decide.outputs.adapter_matrix }}
+      current_base_digest: ${{ steps.decide.outputs.current_base_digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Per-Dockerfile change detection for push events. For workflow_dispatch
+      # there is no diff, so the manual inputs drive the decision instead.
+      - name: Detect Dockerfile changes
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            base:
+              - 'adapters/base/Dockerfile'
+            codex:
+              - 'adapters/codex/Dockerfile'
+            pi:
+              - 'adapters/pi/Dockerfile'
+
+      - name: Decide build set
+        id: decide
+        env:
+          DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+          IN_BASE: ${{ inputs.base }}
+          IN_CODEX: ${{ inputs.codex }}
+          IN_PI: ${{ inputs.pi }}
+          F_BASE: ${{ steps.filter.outputs.base }}
+          F_CODEX: ${{ steps.filter.outputs.codex }}
+          F_PI: ${{ steps.filter.outputs.pi }}
+        run: |
+          set -euo pipefail
+
+          if [ "$DISPATCH" = "true" ]; then
+            base_changed="$IN_BASE"
+            codex_changed="$IN_CODEX"
+            pi_changed="$IN_PI"
+          else
+            base_changed="${F_BASE:-false}"
+            codex_changed="${F_CODEX:-false}"
+            pi_changed="${F_PI:-false}"
+          fi
+
+          # A new base digest forces every adapter to rebuild on top of it.
+          build_base="$base_changed"
+          build_codex=false
+          if [ "$base_changed" = "true" ] || [ "$codex_changed" = "true" ]; then build_codex=true; fi
+          build_pi=false
+          if [ "$base_changed" = "true" ] || [ "$pi_changed" = "true" ]; then build_pi=true; fi
+
+          {
+            echo "build_base=$build_base"
+            echo "build_codex=$build_codex"
+            echo "build_pi=$build_pi"
+          } >> "$GITHUB_OUTPUT"
+
+          # Dynamic matrix of only the adapters that need building.
+          adapters=()
+          if [ "$build_codex" = "true" ]; then adapters+=(codex); fi
+          if [ "$build_pi" = "true" ]; then adapters+=(pi); fi
+          if [ "${#adapters[@]}" -gt 0 ]; then
+            matrix=$(printf '%s\n' "${adapters[@]}" | jq -R . | jq -sc '{include: map({adapter: .})}')
+            echo "any_adapter=true" >> "$GITHUB_OUTPUT"
+          else
+            matrix='{"include":[]}'
+            echo "any_adapter=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "adapter_matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+          # Base digest currently pinned in source — adapters build FROM this
+          # when the base itself is not being rebuilt this run.
+          cur=$(grep -oE 'bunsen-base@sha256:[0-9a-f]{64}' bunsen-core/src/oci_cache.rs | head -1 | sed 's/.*@//' || true)
+          echo "current_base_digest=$cur" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::build_base=$build_base build_codex=$build_codex build_pi=$build_pi"
+
+  # ── Base image (multi-arch, push-by-digest matrix) ──────────────────────────
+  build-base:
+    name: Build base ${{ matrix.platform }}
+    needs: changes
+    if: needs.changes.outputs.build_base == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -101,7 +215,7 @@ jobs:
           context: build-context
           platforms: ${{ matrix.platform }}
           provenance: false
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         run: |
@@ -112,14 +226,15 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ matrix.arch }}
+          name: digest-base-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
-  publish:
-    name: Publish multi-arch manifest
-    needs: [build]
+  publish-base:
+    name: Publish base manifest
+    needs: [changes, build-base]
+    if: needs.changes.outputs.build_base == 'true'
     runs-on: ubuntu-latest
     outputs:
       manifest_digest: ${{ steps.inspect.outputs.digest }}
@@ -129,7 +244,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digest-*
+          pattern: digest-base-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -161,7 +276,7 @@ jobs:
             ${refs}
         env:
           REGISTRY: ${{ env.REGISTRY }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_NAME: ${{ env.BASE_IMAGE_NAME }}
           SHORT_SHA: ${{ steps.sha.outputs.short }}
 
       - name: Inspect manifest digest
@@ -177,59 +292,184 @@ jobs:
           echo "Manifest digest: ${digest}"
         env:
           REGISTRY: ${{ env.REGISTRY }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_NAME: ${{ env.BASE_IMAGE_NAME }}
 
+  # ── Adapter images (multi-arch in a single buildx push per adapter) ─────────
+  build-adapters:
+    name: Build adapter ${{ matrix.adapter }}
+    needs: [changes, publish-base]
+    # Runs once publish-base has concluded (success when base is rebuilt,
+    # skipped otherwise). Never blocked by a skipped base publish.
+    if: ${{ !cancelled() && needs.changes.outputs.any_adapter == 'true' && needs.publish-base.result != 'failure' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.adapter_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build FROM the base digest published this run (if base was rebuilt) or
+      # the digest currently pinned in source (adapter-only change).
+      - name: Resolve base digest
+        id: base
+        env:
+          BUILD_BASE: ${{ needs.changes.outputs.build_base }}
+          NEW_BASE: ${{ needs.publish-base.outputs.manifest_digest }}
+          CUR_BASE: ${{ needs.changes.outputs.current_base_digest }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_BASE" = "true" ]; then digest="$NEW_BASE"; else digest="$CUR_BASE"; fi
+          if [ -z "$digest" ]; then echo "::error::could not resolve base digest"; exit 1; fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Pin base in adapter Dockerfile
+        env:
+          BASE_DIGEST: ${{ steps.base.outputs.digest }}
+        run: |
+          set -euo pipefail
+          df="adapters/${{ matrix.adapter }}/Dockerfile"
+          sed -i -E "s|bunsen-base@sha256:[0-9a-f]{64}|bunsen-base@${BASE_DIGEST}|" "$df"
+          grep -n '^FROM' "$df"
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (multi-arch)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: adapters/${{ matrix.adapter }}
+          file: adapters/${{ matrix.adapter }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/xenolf/bunsen/bunsen-adapter-${{ matrix.adapter }}:latest
+            ${{ env.REGISTRY }}/xenolf/bunsen/bunsen-adapter-${{ matrix.adapter }}:${{ steps.sha.outputs.short }}
+
+      # Stash the resulting manifest digest under a per-adapter filename so the
+      # single auto-PR job can pin every adapter that was built this run.
+      - name: Record digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DIGEST" ]; then echo "::error::build produced no digest"; exit 1; fi
+          mkdir -p "${{ runner.temp }}/adigest"
+          printf '%s' "$DIGEST" > "${{ runner.temp }}/adigest/${{ matrix.adapter }}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: adapter-digest-${{ matrix.adapter }}
+          path: ${{ runner.temp }}/adigest/${{ matrix.adapter }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── One PR aggregating every digest pin updated this run ────────────────────
   auto-pr:
-    name: Update DEFAULT_ROOTFS_IMAGE
-    needs: [publish]
+    name: Update image digest pins (single PR)
+    needs: [changes, publish-base, build-adapters]
+    if: ${{ !cancelled() && (needs.changes.outputs.build_base == 'true' || needs.changes.outputs.any_adapter == 'true') && needs.publish-base.result != 'failure' && needs.build-adapters.result != 'failure' }}
     runs-on: ubuntu-latest
     steps:
       # Always target main: workflow_dispatch may run from a branch but the
-      # digest update belongs on main (the source of truth that gets shipped
-      # in the wheel).
+      # digest updates belong on main (the source of truth shipped in the wheel).
       - uses: actions/checkout@v4
         with:
           ref: main
 
-      - name: Rewrite DEFAULT_ROOTFS_IMAGE
+      - name: Download adapter digests
+        if: needs.changes.outputs.any_adapter == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: adapter-digests
+          pattern: adapter-digest-*
+          merge-multiple: true
+
+      - name: Apply digest pins
+        id: apply
         env:
-          DIGEST: ${{ needs.publish.outputs.manifest_digest }}
+          BUILD_BASE: ${{ needs.changes.outputs.build_base }}
+          BASE_DIGEST: ${{ needs.publish-base.outputs.manifest_digest }}
         run: |
           set -euo pipefail
-          file=bunsen-core/src/oci_cache.rs
-          sed -i -E \
-            's|"ghcr\.io/xenolf/bunsen/bunsen-base@sha256:[0-9a-f]{64}"|"ghcr.io/xenolf/bunsen/bunsen-base@'"${DIGEST}"'"|' \
-            "${file}"
-          if git diff --quiet -- "${file}"; then
-            echo "::notice::DEFAULT_ROOTFS_IMAGE already at ${DIGEST}; no PR needed"
-            echo "changed=false" >> "$GITHUB_ENV"
-          else
-            echo "changed=true" >> "$GITHUB_ENV"
-            git --no-pager diff -- "${file}"
+          summary=""
+
+          # Base → DEFAULT_ROOTFS_IMAGE, and propagate into adapter FROM pins so
+          # the committed adapter Dockerfiles reflect the base they were built on.
+          if [ "$BUILD_BASE" = "true" ]; then
+            if [ -z "$BASE_DIGEST" ]; then echo "::error::base built but no digest"; exit 1; fi
+            sed -i -E 's|"ghcr\.io/xenolf/bunsen/bunsen-base@sha256:[0-9a-f]{64}"|"ghcr.io/xenolf/bunsen/bunsen-base@'"$BASE_DIGEST"'"|' \
+              bunsen-core/src/oci_cache.rs
+            for a in codex pi; do
+              sed -i -E "s|bunsen-base@sha256:[0-9a-f]{64}|bunsen-base@${BASE_DIGEST}|" "adapters/$a/Dockerfile"
+            done
+            summary="${summary}- \`bunsen-base\` → \`${BASE_DIGEST}\`"$'\n'
           fi
 
+          # Each adapter built this run → its OCI_IMAGE constant.
+          if [ -d adapter-digests ]; then
+            for f in adapter-digests/*; do
+              [ -e "$f" ] || continue
+              adapter=$(basename "$f")
+              digest=$(cat "$f")
+              rust="bunsen-core/src/${adapter}_adapter.rs"
+              sed -i -E "s|\"ghcr\\.io/xenolf/bunsen/bunsen-adapter-${adapter}@sha256:[0-9a-f]{64}\"|\"ghcr.io/xenolf/bunsen/bunsen-adapter-${adapter}@${digest}\"|" "$rust"
+              summary="${summary}- \`bunsen-adapter-${adapter}\` → \`${digest}\`"$'\n'
+            done
+          fi
+
+          if git diff --quiet; then
+            echo "::notice::all targeted pins already current; no PR needed"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git --no-pager diff
+          fi
+
+          # Multi-line PR body for the single aggregated PR.
+          {
+            echo "PR_BODY<<PRBODY_EOF"
+            echo "Auto-generated by \`.github/workflows/images.yml\` after publishing one or more guest images."
+            echo ""
+            echo "Updated digest pins:"
+            printf '%s' "$summary"
+            echo ""
+            echo "Source commit: ${GITHUB_SHA}"
+            echo ""
+            echo "See ADR-0012 for why these constants are digest-pinned and updated via an automated PR rather than at runtime."
+            echo "PRBODY_EOF"
+          } >> "$GITHUB_ENV"
+
       - name: Open auto-PR
-        if: env.changed == 'true'
+        if: steps.apply.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           base: main
-          branch: ci/update-default-rootfs-digest
+          branch: ci/update-image-digests
           delete-branch: true
           commit-message: |
-            Update DEFAULT_ROOTFS_IMAGE to ${{ needs.publish.outputs.manifest_digest }}
+            Update guest image digest pins
 
-            Auto-generated by .github/workflows/images.yml after publishing
-            ghcr.io/xenolf/bunsen/bunsen-base:${{ needs.publish.outputs.short_sha }}
-            from ${{ github.sha }}.
-          title: "Update DEFAULT_ROOTFS_IMAGE digest"
-          body: |
-            Auto-generated by `.github/workflows/images.yml` after a successful
-            multi-arch publish of `ghcr.io/xenolf/bunsen/bunsen-base`.
-
-            - **New manifest digest:** `${{ needs.publish.outputs.manifest_digest }}`
-            - **Tags pushed:** `latest`, `${{ needs.publish.outputs.short_sha }}`
-            - **Source commit:** ${{ github.sha }}
-
-            See ADR-0012 for why this constant is digest-pinned and updated via
-            an automated PR rather than at runtime.
+            Auto-generated by .github/workflows/images.yml after publishing the
+            image(s) rebuilt for ${{ github.sha }}.
+          title: "Update guest image digest pins"
+          body: ${{ env.PR_BODY }}
