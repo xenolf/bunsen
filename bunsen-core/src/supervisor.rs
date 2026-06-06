@@ -11,7 +11,9 @@ use tokio::time::{sleep, Duration};
 use crate::adapter::BlackBoxAdapter;
 use crate::aider_adapter::AiderParser;
 use crate::claude_code_adapter::ClaudeCodeParser;
+use crate::codex_adapter::CodexParser;
 use crate::encoder::Encoder;
+use crate::pi_adapter::PiParser;
 use crate::run_spec::RunSpec;
 
 /// Per-adapter line parser dispatch. Each branch owns whatever state
@@ -20,6 +22,8 @@ use crate::run_spec::RunSpec;
 enum AdapterParser {
     ClaudeCode(ClaudeCodeParser),
     Aider(AiderParser),
+    Codex(CodexParser),
+    Pi(PiParser),
     BlackBox,
 }
 
@@ -28,6 +32,8 @@ impl AdapterParser {
         match self {
             AdapterParser::ClaudeCode(p) => p.parse_line(line),
             AdapterParser::Aider(p) => p.parse_line(line),
+            AdapterParser::Codex(p) => p.parse_line(line),
+            AdapterParser::Pi(p) => p.parse_line(line),
             AdapterParser::BlackBox => vec![(
                 "output".into(),
                 BlackBoxAdapter::output_event("stdout", line.as_bytes()),
@@ -84,12 +90,24 @@ fn signal_pgid(pgid: Pid, sig: Signal) {
 ///   `.aider.llm.history`) plus cache state under `.aider.tags.cache.v3/`
 ///   that callers don't want to retain. We copy only the user-facing
 ///   history files.
+/// - `pi` writes its session tree under `.pi/agent/sessions/`; we copy
+///   only that subtree to exclude `auth.json` and `settings.json`.
 /// - Anything else falls back to the claude-code behavior so existing
 ///   adapters keep working; unknown adapters that have no `.claude/`
 ///   simply produce an empty `agent-history/`, which is correct.
 fn copy_agent_history(adapter: &str, workspace: &Path, dst: &Path) -> std::io::Result<()> {
     match adapter {
         "aider" => copy_aider_history(workspace, dst),
+        // codex is invoked with --ephemeral; the normalised transcript is the sole record.
+        "codex" => Ok(()),
+        "pi" => {
+            let pi_sessions = workspace.join(".pi").join("agent").join("sessions");
+            if pi_sessions.exists() {
+                let dst_sessions = dst.join(".pi").join("agent").join("sessions");
+                copy_dir_all(&pi_sessions, &dst_sessions)?;
+            }
+            Ok(())
+        }
         _ => {
             let dot_claude = workspace.join(".claude");
             if dot_claude.exists() {
@@ -140,6 +158,8 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
     let mut parser = match spec.adapter.as_str() {
         "claude-code" => AdapterParser::ClaudeCode(ClaudeCodeParser::new()),
         "aider" => AdapterParser::Aider(AiderParser::new()),
+        "codex" => AdapterParser::Codex(CodexParser::new()),
+        "pi" => AdapterParser::Pi(PiParser::new()),
         _ => AdapterParser::BlackBox,
     };
 
@@ -151,6 +171,13 @@ pub async fn run(spec: &RunSpec, _run_id: &str, encoder: &mut Encoder, workspace
         .stderr(Stdio::piped())
         // Child gets its own stdin (closed/null) — bunsen-core's stdin is for control commands
         .stdin(Stdio::null());
+
+    // Pi writes its session store to ~/.pi/agent/ by default; redirect into
+    // the workspace so the session tree is capturable after the run.
+    // User-supplied env takes precedence — only inject when key is absent.
+    if spec.adapter == "pi" && !spec.env.contains_key("PI_CODING_AGENT_DIR") {
+        cmd.env("PI_CODING_AGENT_DIR", workspace_path.join(".pi"));
+    }
 
     // Place child in its own process group
     unsafe {
@@ -425,6 +452,18 @@ mod tests {
     }
 
     #[test]
+    fn copy_agent_history_codex_creates_no_files() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dst_path = dst.path().join("agent-history");
+        // Even with a .claude/ present, codex must not copy it.
+        std::fs::create_dir_all(workspace.path().join(".claude")).unwrap();
+        std::fs::write(workspace.path().join(".claude/session.json"), "sess").unwrap();
+        copy_agent_history("codex", workspace.path(), &dst_path).unwrap();
+        assert!(!dst_path.exists(), "codex history copy must be a no-op");
+    }
+
+    #[test]
     fn copy_agent_history_falls_back_to_claude_layout_for_other_adapters() {
         let workspace = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
@@ -438,5 +477,47 @@ mod tests {
             std::fs::read_to_string(dst_path.join("session.json")).unwrap(),
             "sess"
         );
+    }
+
+    #[test]
+    fn copy_pi_history_copies_sessions_not_credentials() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dst_path = dst.path().join("agent-history");
+
+        // Create the pi session tree.
+        std::fs::create_dir_all(
+            workspace.path().join(".pi").join("agent").join("sessions").join("ses1"),
+        ).unwrap();
+        std::fs::write(
+            workspace.path().join(".pi").join("agent").join("sessions").join("ses1").join("events.jsonl"),
+            "session data",
+        ).unwrap();
+        // Files that must NOT be copied.
+        std::fs::write(workspace.path().join(".pi").join("agent").join("auth.json"), "secret").unwrap();
+        std::fs::write(workspace.path().join(".pi").join("agent").join("settings.json"), "cfg").unwrap();
+
+        copy_agent_history("pi", workspace.path(), &dst_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(
+                dst_path.join(".pi").join("agent").join("sessions").join("ses1").join("events.jsonl")
+            ).unwrap(),
+            "session data",
+        );
+        assert!(!dst_path.join(".pi").join("agent").join("auth.json").exists(),
+            "auth.json must not be copied");
+        assert!(!dst_path.join(".pi").join("agent").join("settings.json").exists(),
+            "settings.json must not be copied");
+    }
+
+    #[test]
+    fn copy_pi_history_noop_when_sessions_absent() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dst_path = dst.path().join("agent-history");
+
+        copy_agent_history("pi", workspace.path(), &dst_path).unwrap();
+        assert!(!dst_path.exists(), "no pi sessions → no agent-history/");
     }
 }

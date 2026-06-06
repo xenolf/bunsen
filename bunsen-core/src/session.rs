@@ -352,9 +352,9 @@ async fn resolve_sandbox_inputs(
     let rootfs = match backend.rootfs.clone() {
         Some(p) => p,
         None => {
-            let oci_ref = spec.oci_image.as_deref().ok_or_else(|| SessionError::Git {
+            let oci_ref = spec.resolve_oci_image().ok_or_else(|| SessionError::Git {
                 context: "resolve_sandbox_inputs".into(),
-                stderr: "sandbox mode requires either RunBackend.rootfs or RunSpec.oci_image"
+                stderr: "sandbox mode requires a rootfs: set RunBackend.rootfs, RunSpec.oci_image, or use an adapter that declares an OCI image"
                     .into(),
             })?;
             crate::oci_cache::resolve_rootfs(oci_ref)

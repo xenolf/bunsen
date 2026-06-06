@@ -2,8 +2,7 @@
 //!
 //! Boot sequence:
 //!   1. Mount /proc /sys /dev /tmp
-//!   2. Obtain spec: from kernel cmdline `bunsen_spec=` if present
-//!      (backward-compat fallback), else read from the host over vsock port 5000
+//!   2. Read the spec from the host over vsock port 5000
 //!   3. Mount /dev/vdb (workspace ext4) at /workspace
 //!   4. Connect stdout/stderr vsock sockets to the host (ports 5001 / 5002)
 //!   5. Listen on vsock port 5003; accept one control connection from the host
@@ -87,12 +86,10 @@ pub fn run() -> ! {
     if crate::cmdline::debug_enabled(&cmdline) {
         DEBUG_ENABLED.store(true, Ordering::Relaxed);
     }
-    // Obtain the spec. For backward-compat, prefer the kernel cmdline
-    // (`bunsen_spec=<base64-json>`) if present; otherwise read it from the host
-    // over vsock port 5000. The cmdline path is being retired because
-    // Firecracker caps the cmdline at ~4 KiB and large agent prompts overflow it.
-    let spec_json = crate::cmdline::extract_spec(&cmdline)
-        .unwrap_or_else(read_spec_from_vsock);
+    // Read the spec from the host over vsock port 5000. It is not embedded in
+    // the kernel cmdline: Firecracker caps the cmdline at ~4 KiB and large agent
+    // prompts overflow it.
+    let spec_json = read_spec_from_vsock();
     let spec: InitSpec = serde_json::from_str(&spec_json)
         .expect("invalid spec JSON");
 
@@ -359,9 +356,9 @@ fn fork_exec(spec: &InitSpec) -> (pid_t, RawFd, RawFd) {
         }
     }
     for (k, v) in std::env::vars() {
-        // bunsen_spec is a base64 blob containing secrets; never forward to
-        // the agent. Other kernel-cmdline-derived vars are filtered defensively.
-        if k == "bunsen_spec" || k.starts_with("bunsen_") {
+        // The kernel turns cmdline `key=value` tokens (e.g. bunsen_init_debug)
+        // into env vars; never forward bunsen-internal ones to the agent.
+        if k.starts_with("bunsen_") {
             continue;
         }
         if seen.insert(k.clone()) {

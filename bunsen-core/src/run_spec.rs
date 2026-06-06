@@ -124,9 +124,39 @@ impl RunSpec {
                     None => &[],
                 }
             }
+            "codex" => crate::codex_adapter::EGRESS_ENDPOINTS,
+            "pi" => crate::pi_adapter::egress_endpoints_for_cmd(&self.cmd),
             _ => &[],
         };
         EgressPolicy::compose(adapter_declared, &self.egress_endpoints)
+    }
+
+    /// Resolve the guest rootfs OCI image for this Run.
+    ///
+    /// Precedence: an explicit `oci_image` on the spec, else the Adapter's
+    /// declared default image (ADR-0008 — e.g. `codex` boots the codex
+    /// rootfs). Returns `None` for adapters that declare no image of their own
+    /// (black-box, claude-code, aider) when no explicit image was supplied;
+    /// callers then fall back to [`crate::oci_cache::DEFAULT_ROOTFS_IMAGE`]
+    /// (CLI) or surface an error (Session), preserving prior behaviour.
+    ///
+    /// This governs *which* image boots, not *whether* a sandbox is used —
+    /// sandbox intent is still driven by an explicit kernel/rootfs/oci_image.
+    pub fn resolve_oci_image(&self) -> Option<&str> {
+        self.oci_image
+            .as_deref()
+            .or_else(|| adapter_default_image(&self.adapter))
+    }
+}
+
+/// The digest-pinned OCI image an Adapter declares for its guest rootfs
+/// (ADR-0008). `None` for adapters that ship no image of their own and rely on
+/// an explicit `oci_image`/`--rootfs` or the base default.
+pub fn adapter_default_image(adapter: &str) -> Option<&'static str> {
+    match adapter {
+        "codex" => Some(crate::codex_adapter::OCI_IMAGE),
+        "pi" => Some(crate::pi_adapter::OCI_IMAGE),
+        _ => None,
     }
 }
 
@@ -248,6 +278,54 @@ mod tests {
         assert!(spec.oci_image.is_none());
     }
 
+    // ── Adapter-declared image resolution (ADR-0008) ──────────────────────
+
+    #[test]
+    fn resolve_oci_image_prefers_explicit_over_adapter_default() {
+        const HEX64: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let json = format!(
+            r#"{{"adapter":"codex","cmd":["codex"],"oci-image":"ghcr.io/x/y@sha256:{HEX64}"}}"#
+        );
+        let spec = RunSpec::from_json(&json).unwrap();
+        assert_eq!(
+            spec.resolve_oci_image(),
+            Some(&format!("ghcr.io/x/y@sha256:{HEX64}") as &str)
+        );
+    }
+
+    #[test]
+    fn resolve_oci_image_uses_codex_default_when_unset() {
+        let spec = RunSpec::from_json(r#"{"adapter":"codex","cmd":["codex"]}"#).unwrap();
+        assert_eq!(spec.resolve_oci_image(), Some(crate::codex_adapter::OCI_IMAGE));
+    }
+
+    #[test]
+    fn resolve_oci_image_uses_pi_default_when_unset() {
+        let spec = RunSpec::from_json(r#"{"adapter":"pi","cmd":["pi"]}"#).unwrap();
+        assert_eq!(spec.resolve_oci_image(), Some(crate::pi_adapter::OCI_IMAGE));
+    }
+
+    #[test]
+    fn resolve_oci_image_none_for_adapters_without_declared_image() {
+        for adapter in ["black-box", "claude-code", "aider"] {
+            let json = format!(r#"{{"adapter":"{adapter}","cmd":["x"]}}"#);
+            let spec = RunSpec::from_json(&json).unwrap();
+            assert_eq!(
+                spec.resolve_oci_image(),
+                None,
+                "{adapter} declares no image, so resolution must be None without an explicit oci_image"
+            );
+        }
+    }
+
+    #[test]
+    fn adapter_default_image_maps_known_adapters() {
+        assert_eq!(adapter_default_image("codex"), Some(crate::codex_adapter::OCI_IMAGE));
+        assert_eq!(adapter_default_image("pi"), Some(crate::pi_adapter::OCI_IMAGE));
+        assert_eq!(adapter_default_image("black-box"), None);
+        assert_eq!(adapter_default_image("unknown"), None);
+    }
+
     // ── Slice 10a: egress endpoints ───────────────────────────────────────
 
     #[test]
@@ -328,6 +406,17 @@ mod tests {
     }
 
     #[test]
+    fn effective_policy_for_codex_includes_openai() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"codex","cmd":["codex","exec","--json","--ephemeral","do the thing"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.openai.com"));
+        assert!(!policy.allows("api.anthropic.com"));
+    }
+
+    #[test]
     fn effective_policy_for_unknown_adapter_is_user_only() {
         let spec = RunSpec::from_json(
             r#"{"adapter":"black-box","cmd":["x"],"egress-endpoints":["pypi.org"]}"#,
@@ -336,6 +425,40 @@ mod tests {
         let policy = spec.effective_egress_policy();
         assert!(policy.allows("pypi.org"));
         assert!(!policy.allows("api.anthropic.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_pi_with_anthropic_model_includes_anthropic() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"pi","cmd":["pi","--mode","json","--model","anthropic/claude-sonnet-4-6","-p","task"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.anthropic.com"));
+        assert!(!policy.allows("api.openai.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_pi_with_openai_provider_includes_openai() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"pi","cmd":["pi","--mode","json","--provider","openai","--model","gpt-4o","-p","task"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("api.openai.com"));
+        assert!(!policy.allows("api.anthropic.com"));
+    }
+
+    #[test]
+    fn effective_policy_for_pi_with_local_model_is_user_only() {
+        let spec = RunSpec::from_json(
+            r#"{"adapter":"pi","cmd":["pi","--model","ollama/llama3","-p","task"],"egress-endpoints":["localhost"]}"#,
+        )
+        .unwrap();
+        let policy = spec.effective_egress_policy();
+        assert!(policy.allows("localhost"));
+        assert!(!policy.allows("api.anthropic.com"));
+        assert!(!policy.allows("api.openai.com"));
     }
 
     // ── Slice 06: typed branching strategy ────────────────────────────────
