@@ -166,9 +166,16 @@ ghcr.io/<org>/bunsen-adapter-<name>@sha256:<64 hex chars>
 
 `oci_cache::OciImageRef::parse` enforces this — tags are rejected. Rebuild and re-pin the digest whenever the agent version or its dependencies change.
 
-### Local override
+### Image resolution
 
-Both `--rootfs /path/to/custom.ext4` (host CLI) and a `oci-image` field on the RunSpec are honoured. `--rootfs` wins when both are supplied; otherwise the spec's `oci-image` is resolved through the OCI cache. Local development typically uses `--rootfs` pointing at `target/<name>-rootfs.ext4` built by the adapter's `build-rootfs.sh`.
+When a sandbox boots, the guest rootfs is chosen by this precedence (see `RunSpec::resolve_oci_image` in `run_spec.rs`):
+
+1. `--rootfs /path/to/custom.ext4` (host CLI) — wins outright when supplied.
+2. The RunSpec `oci-image` field — resolved through the OCI cache.
+3. The **Adapter's declared default image** — `adapter_default_image(&spec.adapter)` maps the adapter name to its `OCI_IMAGE` constant (e.g. `codex` boots the codex rootfs), so selecting an adapter that ships an image needs no explicit `oci-image`.
+4. The base default `DEFAULT_ROOTFS_IMAGE` (CLI) — adapters that declare no image (black-box, claude-code, aider) fall through to the bare base; the Session path instead errors if nothing resolves.
+
+This precedence governs *which* image boots, not *whether* a sandbox is used — sandbox intent is still driven by an explicit kernel/rootfs/`oci-image`. Local development typically uses `--rootfs` pointing at `target/<name>-rootfs.ext4` built by the adapter's `build-rootfs.sh`.
 
 ## Implementing a custom Adapter
 
@@ -177,7 +184,7 @@ Both `--rootfs /path/to/custom.ext4` (host CLI) and a `oci-image` field on the R
 3. Add an `AdapterParser` variant in `supervisor.rs` and dispatch on the `spec.adapter` string at the top of `supervisor::run`.
 4. Wire native-history preservation into `supervisor::copy_agent_history` — an explicit allowlist of paths is preferred over a glob.
 5. Declare a `pub const EGRESS_ENDPOINTS: &[&str]`. If endpoints are model-derived, expose an `egress_endpoints_for_model(&str) -> &[&str]` helper and add the dispatch branch in `RunSpec::effective_egress_policy` (`run_spec.rs`).
-6. Build and publish an OCI image as above; record the digest-pinned reference.
+6. Build and publish an OCI image as above; record the digest-pinned reference. Declare it as `pub const OCI_IMAGE: &str` in `<name>_adapter.rs` and add the dispatch branch in `adapter_default_image` (`run_spec.rs`) so the adapter resolves to its own rootfs without an explicit `oci-image`.
 7. Capture an output fixture under `bunsen-core/src/testdata/<name>_fixture.txt` and assert the expected event sequence in unit tests.
 
 See `bunsen-core/src/claude_code_adapter.rs` and `bunsen-core/src/aider_adapter.rs` for complete reference implementations.

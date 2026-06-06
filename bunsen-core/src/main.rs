@@ -323,8 +323,7 @@ async fn run_with_backend(
             Some(p) => p,
             None => {
                 let oci_ref = spec
-                    .oci_image
-                    .as_deref()
+                    .resolve_oci_image()
                     .unwrap_or(oci_cache::DEFAULT_ROOTFS_IMAGE);
                 oci_cache::resolve_rootfs(oci_ref)
                     .await
