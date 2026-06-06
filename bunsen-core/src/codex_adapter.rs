@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 /// Built from adapters/codex/Dockerfile on top of bunsen-base.
 // TODO(oci): pin digest once image is published
 pub const OCI_IMAGE: &str =
-    "ghcr.io/xenolf/bunsen/bunsen-adapter-codex@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    "ghcr.io/xenolf/bunsen/bunsen-adapter-codex@sha256:95e6c78c68b13bd9b01775a22a2db8ab41c3f1b4048126fe9f0f314780fd874e";
 
 /// Declared egress endpoints required by the codex adapter.
 pub const EGRESS_ENDPOINTS: &[&str] = &["api.openai.com"];

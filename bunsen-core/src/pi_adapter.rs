@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 // Run `./adapters/pi/build-rootfs.sh --push` to build and push the image,
 // then replace the placeholder digest below with the one it prints.
 pub const OCI_IMAGE: &str =
-    "ghcr.io/xenolf/bunsen/bunsen-adapter-pi@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    "ghcr.io/xenolf/bunsen/bunsen-adapter-pi@sha256:8e0d06f7727f2130737d3144d34abf3193f25a34077a9ccc3fdc6ab45a361a3d";
 
 /// Accumulated model_usage across all turns in a session.
 #[derive(Default)]
